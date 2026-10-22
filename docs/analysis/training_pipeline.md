@@ -170,29 +170,37 @@ flowchart TD
 
 要点：
 
-- **动作映射**（论文附录A）：q_sp = α·a + q⁰；α = 0.25 × 力矩上限 / 刚度，取自mjlab内置G1配置。
-  实现把关节标定偏置Δq⁰同时加在目标和观测上：机器人以为自己在q − Δq⁰，这正是“标定误差”的含义。
+- **动作映射**（论文附录A）： $q^{\mathrm{sp}} = \alpha a + q^0$ ，其中 $\alpha = 0.25\, \tau_{\max} / K_p$ （力矩上限除以刚度），取自mjlab内置G1配置。
+  实现把关节标定偏置 $\Delta q^0$ 同时加在目标和观测上，即 $q^{\mathrm{sp}} = q^0 + \Delta q^0 + \alpha a$ ，
+  观测为 $q - q^0 - \Delta q^0$ ：机器人以为自己在 $q - \Delta q^0$ ，这正是“标定误差”的含义。
 - **奖励**（论文表A.2，`MDP.reward`）：
 
-  ```text
-  r = Δt · [ e^{−ē_pos/0.3²} + e^{−ē_ori/0.4²} + e^{−ē_lv/1.0²} + e^{−ē_av/3.14²}
-           + 0.5·e^{−e_rp/0.3²} + 0.5·e^{−e_ro/0.4²}
-           − 0.1·‖a − a_prev‖² − 2·Σ_j 超出软限位的量 ]
-  ```
+  $$
+  r_{t+1} = \Delta t \left( r^{\mathrm{track}} + r^{\mathrm{reg}} \right), \quad \Delta t = 0.02
+  $$
 
-  ē为14个跟踪身体的平均平方误差；Δt = 0.02，单步最大奖励0.1。
+  $$
+  r^{\mathrm{track}} = e^{-\bar{e}_{\mathrm{pos}}/0.3^2} + e^{-\bar{e}_{\mathrm{ori}}/0.4^2} + e^{-\bar{e}_{\mathrm{lv}}/1.0^2} + e^{-\bar{e}_{\mathrm{av}}/3.14^2} + 0.5\, e^{-e_{\mathrm{rp}}/0.3^2} + 0.5\, e^{-e_{\mathrm{ro}}/0.4^2}
+  $$
+
+  $$
+  r^{\mathrm{reg}} = -0.1 \lVert a_t - a_{t-1} \rVert^2 - 2 \sum_j \left[ \max(0, q_j - q_j^{\max}) + \max(0, q_j^{\min} - q_j) \right]
+  $$
+
+  $\bar{e}$ 为14个跟踪身体的平均平方误差（位置、朝向测地角、线速度、角速度）， $e_{\mathrm{rp}}$ 、 $e_{\mathrm{ro}}$ 为根的位置与朝向误差；
+  $q_j^{\max}$ 、 $q_j^{\min}$ 是按0.9系数收缩后的软限位。追踪项满分5，所以单步最大奖励为 $5 \Delta t = 0.1$ 。
   身体位置与朝向误差先把参考身体“重新锚定”到机器人根的水平位置和偏航（BeyondMimic做法），
   所以只惩罚姿态和相对位置，不惩罚整体平移漂移；全局漂移由根位置项惩罚。
-- **终止**（论文附录A）：|z_ref − z| > 0.25 m，或 |R_ref[2,2] − R[2,2]| > 0.8。
+- **终止**（论文附录A）： $e_z = \lvert z_{\mathrm{ref}} - z \rvert > 0.25\ \mathrm{m}$ ，或 $e_{\mathrm{tilt}} = \lvert (R_{\mathrm{ref}})_{33} - R_{33} \rvert > 0.8$ 。
   后者正是“参考与机器人根系中重力方向z分量之差”，直立参考下约78°。
 - **超时**：到达段末或回合满500步（10 s）。超时不是失败。
 - **分箱回报估计**：回合结束时，用折扣回报更新起始分箱：
 
-  ```text
-  G = Σ γᵗ r_t + [超时时] γᵀ · (平均每步奖励) / (1 − γ)
-  G_b ← 0.8·G_b + 0.2·G
-  ```
+  $$
+  G = \sum_{t=0}^{T-1} \gamma^t r_{t+1} + \mathbb{1}_{\mathrm{timeout}} \cdot \frac{\gamma^T \bar{r}}{1 - \gamma}, \qquad G_b \leftarrow 0.8\, G_b + 0.2\, G
+  $$
 
+  $T$ 为回合步数， $\bar{r}$ 为该回合平均每步奖励；超时时 $\mathbb{1}_{\mathrm{timeout}} = 1$ ，终止时为0。
   超时的回合用平均奖励把回报外推到无穷远，避免短回合的分箱被误判为“难”。
 - **多卡采样**：每卡只跑本地环境，`sim_steps`按全局环境数累计；回合结束统计在记日志时跨卡汇总，并按结束回合数加权。
 
@@ -209,7 +217,15 @@ flowchart TD
     DR --> WRITE["sim.reset → scene.reset → 写根位姿、根速度、关节状态与关节目标"]
 ```
 
-- G_b越低（越难），soft权重越大；系数−25让分布很尖锐，难点会被集中练习。
+抽样分布：
+
+$$
+P(b) = \frac{0.5}{N_{\mathrm{bin}}} + 0.4\, \mathrm{softmax}_b\left( -25\, \frac{G_b}{G_{\max}} \right) + 0.1\, \frac{\bar{w}_b}{\sum_{b'} \bar{w}_{b'}}, \qquad G_{\max} = \frac{0.1}{1 - 0.99} = 10
+$$
+
+其中 $\bar{w}_b \leftarrow 0.999\, \bar{w}_b + 0.001\, \mathrm{softmax}_b(\cdot)$ 是历史权重。
+
+- $G_b$ 越低（越难），softmax权重越大；系数−25让分布很尖锐，难点会被集中练习。
 - 10%的历史权重让学会之后的难点仍保留一定练习量，防止遗忘。
 - 多卡时softmax的max与分母、历史权重的EMA都按全局归约计算，但每卡只在本地分片的分箱上按条件分布抽样；
   这样各卡同步更新，却不保证与单卡全库自适应采样、回放轨迹或随机序列逐步等价。
@@ -242,14 +258,16 @@ flowchart TD
 
 网络不直接输出下一状态，而是输出在机器人局部坐标系中的增量，再积分回世界系：
 
-```text
-p'  = p  + H_yaw · Δp        （水平用偏航系，与朝向无关）
-R'  = R  · exp(Δθ)           （根系中的旋转增量）
-v'  = v  + R · Δv            （根系速度增量）
-w'  = w  + R · Δw
-q'  = q  + Δq
-q̇'  = q̇  + Δq̇
-```
+$$
+p' = p + H_{\mathrm{yaw}}\, \Delta p, \qquad R' = R \exp\left( [\Delta\theta]_\times \right)
+$$
+
+$$
+v' = v + R\, \Delta v, \qquad w' = w + R\, \Delta w, \qquad q' = q + \Delta q, \qquad \dot{q}' = \dot{q} + \Delta \dot{q}
+$$
+
+$H_{\mathrm{yaw}}$ 是只保留偏航的旋转（水平位移在偏航系中表示，与朝向无关）； $\Delta\theta$ 是根坐标系中的旋转向量，
+$[\cdot]_\times$ 为反对称矩阵； $\Delta v$ 、 $\Delta w$ 是根坐标系中的速度增量。
 
 这样做的好处：
 
@@ -262,6 +280,12 @@ q̇'  = q̇  + Δq̇
 - 误差在上一状态的局部坐标系中计算，与目标增量的定义一致。
 - 每个分量除以输出增量的标准差，并设下限：位置3 mm、朝向0.005 rad、线速度0.02 m/s、角速度0.05 rad/s、
   q 3 mrad、q̇ 0.05 rad/s。下限防止几乎不变的分量（例如静止关节）被除以极小的数而主导损失。
+- 写成公式（ $B$ 个窗口， $m_{ij}$ 为掩码， $e_{ij} \in \mathbb{R}^{70}$ 为第 $i$ 个窗口第 $j$ 步的局部坐标系误差， $\sigma$ 为输出增量标准差， $\epsilon$ 为上述下限）：
+
+  $$
+  \mathcal{L} = \frac{1}{B} \sum_{i=1}^{B} \sum_{j=1}^{k} m_{ij} \cdot \frac{1}{70} \sum_{d=1}^{70} \left( \frac{e_{ij,d}}{\max(\sigma_d, \epsilon_d)} \right)^2
+  $$
+
 - 论文式(1)还有奖励、观测、终止三项；本实现三者都是解析头，所以只有状态项。
 - 日志里的`wm_err8`是窗口最后一步（第8步）的归一化误差，对应论文图3(c)的指标形式，但“名义误差”的定义不同。
 
@@ -310,24 +334,35 @@ flowchart TD
 ```
 
 “冻结”指参数不求梯度（`requires_grad=False`），但梯度仍然穿过它们对输入的雅可比。
-对θ的梯度沿三条路径回传：
+对 $\theta$ 的梯度沿三条路径回传：
 
-1. **动作 → 动力学**：a_t → f_ω → Ŝ_{t+1} → 之后所有奖励和终止。
-2. **状态 → 观测 → 策略**：Ŝ_t → obs → π → a_t。策略看到的观测本身取决于它之前的动作。
-3. **动作平滑项**：奖励里的‖a_t − a_{t−1}‖²直接连着相邻两步的动作。
+1. **动作 → 动力学**： $a_t \to f_\omega \to \hat{S}_{t+1} \to$ 之后所有奖励和终止。
+2. **状态 → 观测 → 策略**： $\hat{S}_t \to \mathrm{obs} \to \pi_\theta \to a_t$ 。策略看到的观测本身取决于它之前的动作。
+3. **动作平滑项**：奖励里的 $\lVert a_t - a_{t-1} \rVert^2$ 直接连着相邻两步的动作。
 
 ### 6.3 目标函数的计算
 
 实现先只展开动力学，32步结束后再把所有 (H × B) 个状态一次性批量算奖励和软终止，因为奖励不会回灌到动力学：
 
-```text
-d̂_t   = 1 − (1 − σ((e_z − 0.25)/0.02)) · (1 − σ((e_tilt − 0.8)/0.04))     （软终止，sigmoid平滑硬阈值）
-ĉ_{t+1} = Π_{i≤t} (1 − d̂_i)                                              （存活权重，累乘）
-Ĵ     = Σ_{t=0}^{31} 0.99ᵗ · ĉ_t · r̂_{t+1}  +  0.99³² · ĉ₃₂ · V_ψ(Ŝ₃₂, g₃₂, ξ)
-loss  = −mean(Ĵ)
-```
+软终止（用sigmoid平滑两个硬阈值， $\sigma$ 为sigmoid， $e_z$ 、 $e_{\mathrm{tilt}}$ 由 $\hat{S}_{t+1}$ 与参考帧 $f_{t+1}$ 算出）：
 
-更新步骤：反向传播 → 跨卡按本地样本数加权平均 → 全局范数裁剪1.0 → 逐元素裁剪到±0.1 → 范数为有限值时才执行Adam(β = 0.9, 0.95)。
+$$
+\hat{d}_{t+1} = 1 - \left( 1 - \sigma\left( \frac{e_z - 0.25}{0.02} \right) \right) \left( 1 - \sigma\left( \frac{e_{\mathrm{tilt}} - 0.8}{0.04} \right) \right)
+$$
+
+存活权重累乘：
+
+$$
+\hat{c}_0 = 1, \qquad \hat{c}_{t+1} = \hat{c}_t \left( 1 - \hat{d}_{t+1} \right)
+$$
+
+目标与损失（ $\hat{r}_{t+1}$ 由 $\hat{S}_{t+1}$ 、 $a_t$ 、 $a_{t-1}$ 算出）：
+
+$$
+\hat{J} = \sum_{t=0}^{31} 0.99^t\, \hat{c}_t\, \hat{r}_{t+1} + 0.99^{32}\, \hat{c}_{32}\, V_\psi(\hat{S}_{32}, g_{32}, \xi), \qquad \mathrm{loss} = -\mathrm{mean}(\hat{J})
+$$
+
+更新步骤：反向传播 → 跨卡按本地样本数加权平均 → 全局范数裁剪1.0 → 逐元素裁剪到±0.1 → 范数为有限值时才执行Adam（ $\beta = (0.9, 0.95)$ ）。
 
 ## 7. ③' Critic更新
 
@@ -339,6 +374,16 @@ flowchart TD
     GAE --> FIX["目标固定，展平为 H×B 样本<br/>（默认全局32 × 4096）"]
     FIX --> EP["5轮：每轮打乱后分4个小批<br/>MSE → 跨卡加权平均 → 全局范数裁剪1.0 → Adam"]
 ```
+
+GAE目标（论文式3，从 $t = 31$ 反向递推到0）：
+
+$$
+\hat{R}_{32} = V_{32}, \qquad \hat{R}_t = \hat{r}_{t+1} + \gamma \left( 1 - \hat{d}_{t+1} \right) \left[ (1 - \lambda) V_{t+1} + \lambda \hat{R}_{t+1} \right], \qquad \gamma = 0.99,\ \lambda = 0.95
+$$
+
+$$
+\mathcal{L}_V(\psi) = \mathrm{mean}_{t, b} \left( V_\psi(X_{t,b}) - \hat{R}_{t,b} \right)^2
+$$
 
 - 只用想象转移训练，目标在本次推演内算一次后固定；没有目标网络（论文§3.3）。
 - critic在本次迭代里先被策略目标用来自举，然后才更新，所以策略总是用上一版critic。
@@ -389,6 +434,14 @@ flowchart TD
     E4 --> E5["两种汇总：各段平均、按帧数加权"]
     E3 --> E6["失败 = 段末之前触发训练终止条件"]
 ```
+
+第 $c$ 段动作长 $L_c$ 帧，评估时最多走 $L_c - 1$ 步：
+
+$$
+\mathrm{NR}_c = \frac{\sum_t r_t}{(L_c - 1) \times 0.1}, \qquad
+\mathrm{NR}_{\mathrm{mean}} = \frac{1}{C} \sum_c \mathrm{NR}_c, \qquad
+\mathrm{NR}_{\mathrm{frame}} = \frac{\sum_c \sum_t r_t}{0.1 \sum_c (L_c - 1)}
+$$
 
 - 触发终止之后该环境不再计入回报，所以提前失败的动作得分低，与论文“提前终止得分低”的定义一致。
 - 两种汇总对应规划L-EVAL-2的未决项：论文没有说明跨动作如何汇总。
