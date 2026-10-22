@@ -5,7 +5,7 @@ Each motion plays once from its first frame with friction 1.0, no domain randomi
 observation or action noise. A motion fails if the rollout triggers the training termination.
 Normalized return is the undiscounted reward sum divided by its maximum attainable value.
 
-Run as a watcher: ``python supermimic/evaluate.py --run_dir logs/<run> --watch``.
+Run as a watcher: ``python -m supermimic.scripts.evaluate --run_dir logs/<run> --watch``.
 """
 
 from __future__ import annotations
@@ -16,8 +16,9 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = str(Path(__file__).resolve().parents[2])
 sys.path.insert(0, REPO)
 
 parser = argparse.ArgumentParser()
@@ -33,19 +34,18 @@ args = parser.parse_args()
 import numpy as np
 import torch
 
-import supermimic.networks as networks
-from supermimic.env import TrackingSim
-from supermimic.kinematics import G1Kinematics
-from supermimic.mdp import MAX_STEP_REWARD, OBS_DIM, MDP
-from supermimic.motion import MotionLib
-from supermimic.networks import Policy
-from supermimic.robot import default_joint_pos_list
+import supermimic.tasks.tracking.rl.networks as networks
+from supermimic.tasks.tracking.env import TrackingSim
+from supermimic.tasks.tracking.mdp import MAX_STEP_REWARD, OBS_DIM, MDP
+from supermimic.tasks.tracking.motion import MotionLib
+from supermimic.tasks.tracking.rl.networks import Policy
+from supermimic.utils.kinematics import G1Kinematics
 
 torch.backends.cuda.matmul.allow_tf32 = True
 dev = args.device
 kin = G1Kinematics(dev)
 motion = MotionLib.from_dir(args.motion_dir, kin, dev)
-mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
+mdp = MDP(kin, motion, kin.default_q)
 C = len(motion.names)
 
 
@@ -73,7 +73,7 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
         a = pi(hist, motion.goal(env.f, K))
         alive = ~env.done_eval.clone()
         if record:
-            from supermimic.rotations import mat_to_quat
+            from supermimic.utils.rotations import mat_to_quat
 
             traj["root_p"].append(S[0].cpu()), traj["root_quat"].append(mat_to_quat(S[1]).cpu())
             traj["q"].append(S[4].cpu()), traj["f"].append(env.f.cpu()), traj["alive"].append(alive.cpu())
@@ -96,14 +96,14 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     return res
 
 
-def make_env(ck_args: dict) -> TrackingSim:
-    return TrackingSim(C, motion, mdp, dev, eval_mode=True, self_collision=ck_args.get("self_collision", False))
+def make_env() -> TrackingSim:
+    return TrackingSim(C, motion, mdp, dev, eval_mode=True)
 
 
 env = None
 if args.ckpt:
     ck = torch.load(args.ckpt, map_location=dev)
-    env = make_env(ck["args"])
+    env = make_env()
     res = evaluate(env, ck, args.record)
     print(json.dumps({k: v for k, v in res.items() if k != "per_clip"}, indent=1))
     sys.exit(0)
@@ -120,7 +120,7 @@ while True:
     for c in todo:
         it = int(os.path.basename(c)[5:11])
         ck = torch.load(c, map_location=dev)
-        env = env or make_env(ck["args"])
+        env = env or make_env()
         t0 = time.time()
         res = evaluate(env, ck)
         line = f"{it},{ck['wall_time'] / 3600:.4f},{ck['saved_at']},{time.strftime('%Y-%m-%d %H:%M:%S')},{res['norm_return']:.4f},{res['norm_return_framew']:.4f},{res['n_failed']},{'|'.join(res['failed'])}\n"

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import torch
 
-from .mdp import STATE_DIM, XI_DIM
+from supermimic.tasks.tracking.mdp import STATE_DIM, XI_DIM
 
 FIELDS = {
     "s": (STATE_DIM, torch.float32),

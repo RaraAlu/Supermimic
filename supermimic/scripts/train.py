@@ -9,8 +9,9 @@ import math
 import os
 import sys
 import time
+from pathlib import Path
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = str(Path(__file__).resolve().parents[2])
 sys.path.insert(0, REPO)
 
 parser = argparse.ArgumentParser()
@@ -43,7 +44,6 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 parser.add_argument("--compile", type=str, default="auto", choices=["auto", "on", "off"], help="torch.compile (auto: only if triton is installed)")
-parser.add_argument("--self_collision", action="store_true", help="enable G1 self-collisions in the simulator")
 parser.add_argument("--device", type=str, default="cuda:0")
 args = parser.parse_args()
 
@@ -52,14 +52,13 @@ import importlib.util
 import torch
 import torch.nn as nn
 
-from supermimic.buffer import ReplayBuffer
-from supermimic.env import TrackingSim
-from supermimic.kinematics import G1Kinematics
-from supermimic.mdp import CRITIC_EXTRA, INV_DIM, MDP, OBS_DIM, invariant_features, normalize_xi, unflatten_state
-from supermimic.motion import MotionLib
-import supermimic.networks as networks
-from supermimic.networks import Critic, Policy, WorldModel
-from supermimic.robot import default_joint_pos_list
+from supermimic.tasks.tracking.env import TrackingSim
+from supermimic.tasks.tracking.mdp import CRITIC_EXTRA, INV_DIM, MDP, OBS_DIM, invariant_features, normalize_xi, unflatten_state
+from supermimic.tasks.tracking.motion import MotionLib
+import supermimic.tasks.tracking.rl.networks as networks
+from supermimic.tasks.tracking.rl.buffer import ReplayBuffer
+from supermimic.tasks.tracking.rl.networks import Critic, Policy, WorldModel
+from supermimic.utils.kinematics import G1Kinematics
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -71,7 +70,7 @@ json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent
 
 kin = G1Kinematics(dev)
 motion = MotionLib.from_dir(args.motion_dir, kin, dev)
-mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
+mdp = MDP(kin, motion, kin.default_q)
 K, Hh, HZ = args.goal_frames, args.hist, args.horizon
 GOAL_DIM = 73 * K
 CRITIC_IN = INV_DIM + CRITIC_EXTRA + GOAL_DIM
@@ -263,7 +262,7 @@ def policy_update():
 
 
 # ------------------------------------------------------------------------------------------------
-env = TrackingSim(args.num_envs, motion, mdp, dev, gamma=args.gamma, self_collision=args.self_collision)
+env = TrackingSim(args.num_envs, motion, mdp, dev, gamma=args.gamma)
 buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev)
 obs_hist = torch.zeros(args.num_envs, Hh, OBS_DIM, device=dev)
 

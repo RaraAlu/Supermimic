@@ -11,15 +11,22 @@ from __future__ import annotations
 import mujoco
 import numpy as np
 import torch
+from mjlab.asset_zoo.robots.unitree_g1.g1_constants import get_g1_robot_cfg
+from mjlab.entity import Entity
+from mjlab.utils.lab_api.string import resolve_matching_names_values
 
-from .robot import G1_JOINT_NAMES, TRACKED_BODIES, compile_robot_model
-from .rotations import axis_angle_to_mat, quat_to_mat
+from supermimic.tasks.tracking.constants import G1_JOINT_NAMES, TRACKED_BODIES
+from supermimic.utils.rotations import axis_angle_to_mat, quat_to_mat
 
 
 class G1Kinematics:
     def __init__(self, device: str, tracked: list[str] = TRACKED_BODIES, model: mujoco.MjModel | None = None):
-        m = compile_robot_model() if model is None else model
+        cfg = get_g1_robot_cfg()
+        m = Entity(cfg).compile() if model is None else model
         self.device = device
+        self.default_q = torch.zeros(len(G1_JOINT_NAMES), dtype=torch.float32, device=device)
+        ids, _, values = resolve_matching_names_values(cfg.init_state.joint_pos, G1_JOINT_NAMES)
+        self.default_q[ids] = torch.tensor(values, dtype=torch.float32, device=device)
         jname_to_idx = {n: i for i, n in enumerate(G1_JOINT_NAMES)}
         # bodies in tree order (mujoco orders parents before children); world (id 0) is skipped
         bodies, parent, joint_idx, axes, offs_p, offs_R = [], [], [], [], [], []

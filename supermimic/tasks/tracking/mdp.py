@@ -11,9 +11,9 @@ from dataclasses import dataclass
 
 import torch
 
-from .kinematics import G1Kinematics
-from .motion import CONTROL_DT, MotionLib
-from .rotations import mat_to_6d, quat_to_mat, mat_to_quat, rot_angle_sq, yaw_mat
+from supermimic.tasks.tracking.motion import CONTROL_DT, MotionLib
+from supermimic.utils.kinematics import G1Kinematics
+from supermimic.utils.rotations import mat_to_6d, quat_to_mat, mat_to_quat, rot_angle_sq, yaw_mat
 
 STATE_DIM = 71
 OBS_DIM = 29 + 29 + 3 + 3 + 29 + 6

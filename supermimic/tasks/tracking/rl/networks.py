@@ -6,8 +6,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .mdp import INV_DIM, NUM_J, XI_DIM, invariant_features
-from .rotations import so3_exp, yaw_mat
+from supermimic.tasks.tracking.mdp import INV_DIM, NUM_J, XI_DIM, invariant_features
+from supermimic.utils.rotations import so3_exp, yaw_mat
 
 
 def mlp(inp: int, hidden: list[int], out: int, act=nn.ELU, layer_norm: bool = False) -> nn.Sequential:
@@ -83,7 +83,7 @@ class WorldModel(nn.Module):
     @staticmethod
     def targets(S, S1):
         """Frame-local increments from S to S1 (the regression targets)."""
-        from .rotations import so3_log
+        from supermimic.utils.rotations import so3_log
 
         p, R, v, w, q, qd = S
         p1, R1, v1, w1, q1, qd1 = S1
@@ -116,7 +116,7 @@ class WorldModel(nn.Module):
     @staticmethod
     def state_error(S_hat, S):
         """Frame-local state error components (same layout as ``targets``)."""
-        from .rotations import so3_log
+        from supermimic.utils.rotations import so3_log
 
         p, R, v, w, q, qd = S
         ph, Rh, vh, wh, qh, qdh = S_hat

@@ -9,8 +9,8 @@ import os
 import numpy as np
 import torch
 
-from .kinematics import G1Kinematics
-from .rotations import mat_to_6d, quat_slerp, quat_to_mat, so3_log, yaw_mat
+from supermimic.utils.kinematics import G1Kinematics
+from supermimic.utils.rotations import mat_to_6d, quat_slerp, quat_to_mat, so3_log, yaw_mat
 
 CONTROL_DT = 0.02
 BIN_FRAMES = 50  # 1 s bins for return-based reset sampling

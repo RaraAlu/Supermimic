@@ -3,7 +3,7 @@
 
 The environment is a thin batched wrapper over mjlab's ``Scene`` and ``Simulation``: it applies the
 joint setpoint, steps MuJoCo Warp, labels the transition with the analytic reward/termination of
-:mod:`supermimic.mdp`, and resets episodes to reference-motion states drawn by return-based bin
+:mod:`supermimic.tasks.tracking.mdp`, and resets episodes to reference-motion states drawn by return-based bin
 sampling (paper Appendix D.1). mjlab's manager-based env is not used, because SuperMimic needs
 raw state access, arbitrary state resets and its own replay buffer.
 """
@@ -11,15 +11,17 @@ raw state access, arbitrary state resets and its own replay buffer.
 from __future__ import annotations
 
 import torch
+from mjlab.asset_zoo.robots.unitree_g1.g1_constants import G1_ACTION_SCALE, get_g1_robot_cfg
 from mjlab.managers.event_manager import RecomputeLevel
 from mjlab.scene import Scene, SceneCfg
 from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
+from mjlab.utils.lab_api.string import resolve_matching_names_values
 
-from .mdp import MAX_STEP_REWARD, MDP, flatten_state
-from .motion import CONTROL_DT, MotionLib
-from .robot import FOOT_GEOMS, G1_JOINT_NAMES, action_scale, robot_cfg
-from .rotations import mat_to_quat, quat_to_mat, so3_exp
+from supermimic.tasks.tracking.constants import FOOT_GEOMS, G1_JOINT_NAMES
+from supermimic.tasks.tracking.mdp import MAX_STEP_REWARD, MDP, flatten_state
+from supermimic.tasks.tracking.motion import CONTROL_DT, MotionLib
+from supermimic.utils.rotations import mat_to_quat, quat_to_mat, so3_exp
 
 NUM_SUBSTEPS = 4
 PHYSICS_DT = CONTROL_DT / NUM_SUBSTEPS  # 5 ms
@@ -41,14 +43,13 @@ class TrackingSim:
     """Batched G1 motion-tracking simulator."""
 
     def __init__(self, num_envs: int, motion: MotionLib, mdp: MDP, device: str, gamma: float = 0.99,
-                 eval_mode: bool = False, max_episode_steps: int = 500, reset_noise: bool = True,
-                 self_collision: bool = False):  # fmt: skip
+                 eval_mode: bool = False, max_episode_steps: int = 500, reset_noise: bool = True):  # fmt: skip
         self.device = dev = device
         scene_cfg = SceneCfg(
             num_envs=num_envs,
             env_spacing=0.0,
             terrain=TerrainEntityCfg(terrain_type="plane"),
-            entities={"robot": robot_cfg(self_collision)},
+            entities={"robot": get_g1_robot_cfg()},
         )
         self.scene = Scene(scene_cfg, device=dev)
         self.sim = Simulation(num_envs=num_envs, cfg=make_sim_cfg(), spec=self.scene.spec, device=dev)
@@ -71,7 +72,10 @@ class TrackingSim:
         self.max_episode_steps = max_episode_steps if not eval_mode else 10**9
         self.reset_noise = reset_noise and not eval_mode
         self.default_q = self.robot.data.default_joint_pos[0].clone()
-        self.alpha = torch.tensor([action_scale(n) for n in G1_JOINT_NAMES], device=dev)
+        ids, _, scales = resolve_matching_names_values(G1_ACTION_SCALE, G1_JOINT_NAMES)
+        if ids != list(range(len(G1_JOINT_NAMES))):
+            raise RuntimeError("mjlab G1 action scales do not cover every motion-data joint")
+        self.alpha = torch.tensor(scales, device=dev)
 
         # ---- sim context xi = [friction, joint offsets(29), torso com offset(3)] ----
         self.xi = torch.zeros(self.N, 33, device=dev)

@@ -1,6 +1,6 @@
 # Third-party notices
 
-The files under `supermimic/` and `tools/test_env.py` marked "Ported from zita-ch/supermimic_vibed" are derived from
+The files under `supermimic/` and `scripts/check_env.py` marked "Ported from zita-ch/supermimic_vibed" are derived from
 https://github.com/zita-ch/supermimic_vibed (Isaac Lab 3 implementation), ported here to mjlab.
 The original license follows.
 

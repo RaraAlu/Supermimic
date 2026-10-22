@@ -6,7 +6,8 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--num_envs", type=int, default=64)
@@ -15,19 +16,19 @@ args = parser.parse_args()
 
 import torch
 
-from supermimic.env import TrackingSim
-from supermimic.kinematics import G1Kinematics
-from supermimic.mdp import MDP
-from supermimic.motion import MotionLib
-from supermimic.robot import TRACKED_BODIES, default_joint_pos_list
-from supermimic.rotations import quat_to_mat, rot_angle_sq
+from supermimic.tasks.tracking.constants import TRACKED_BODIES
+from supermimic.tasks.tracking.env import TrackingSim
+from supermimic.tasks.tracking.mdp import MDP
+from supermimic.tasks.tracking.motion import MotionLib
+from supermimic.utils.kinematics import G1Kinematics
+from supermimic.utils.rotations import quat_to_mat, rot_angle_sq
 
 dev = args.device
 kin = G1Kinematics(dev)
 t0 = time.time()
-motion = MotionLib.from_dir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "lafan1_g1"), kin, dev)
+motion = MotionLib.from_dir(os.path.join(REPO, "data", "lafan1_g1"), kin, dev)
 print(f"motion: {len(motion.names)} clips, {motion.num_frames} frames ({motion.num_frames * 0.02 / 3600:.2f} h), bins {motion.num_bins}, load {time.time() - t0:.1f}s")
-mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
+mdp = MDP(kin, motion, kin.default_q)
 t0 = time.time()
 env = TrackingSim(args.num_envs, motion, mdp, dev, eval_mode=True)
 print(f"sim init {time.time() - t0:.1f}s, cuda graphs: {env.sim.use_cuda_graph}")
