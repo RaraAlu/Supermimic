@@ -12,6 +12,11 @@ sys.path.insert(0, REPO)
 parser = argparse.ArgumentParser()
 parser.add_argument("--num_envs", type=int, default=64)
 parser.add_argument("--device", type=str, default="cuda:0")
+source = parser.add_mutually_exclusive_group()
+source.add_argument("--motion_dir", default=None)
+source.add_argument("--motion_index", default=None)
+parser.add_argument("--motion_root", default=None)
+parser.add_argument("--motion_limit", type=int, default=None)
 args = parser.parse_args()
 
 import torch
@@ -19,20 +24,22 @@ import torch
 from supermimic.tasks.tracking.constants import TRACKED_BODIES
 from supermimic.tasks.tracking.env import TrackingSim
 from supermimic.tasks.tracking.mdp import MDP
-from supermimic.tasks.tracking.motion import MotionLib
+from supermimic.tasks.tracking.motion import MotionLib, resolve_motion_args
 from supermimic.utils.kinematics import G1Kinematics
 from supermimic.utils.rotations import quat_to_mat, rot_angle_sq
 
 dev = args.device
 kin = G1Kinematics(dev)
 t0 = time.time()
-motion = MotionLib.from_dir(os.path.join(REPO, "data", "lafan1_g1"), kin, dev)
+resolve_motion_args(args)
+motion = MotionLib.from_args(args, kin, dev)
 print(f"motion: {len(motion.names)} clips, {motion.num_frames} frames ({motion.num_frames * 0.02 / 3600:.2f} h), bins {motion.num_bins}, load {time.time() - t0:.1f}s")
 mdp = MDP(kin, motion, kin.default_q)
 t0 = time.time()
 env = TrackingSim(args.num_envs, motion, mdp, dev, eval_mode=True)
 print(f"sim init {time.time() - t0:.1f}s, cuda graphs: {env.sim.use_cuda_graph}")
-frames = motion.clip_start[torch.arange(args.num_envs, device=dev) % len(motion.names)] + 100
+clips = torch.arange(args.num_envs, device=dev) % len(motion.names)
+frames = torch.minimum(motion.clip_start[clips] + 100, motion.clip_end[clips] - 1)
 env.reset(torch.arange(args.num_envs, device=dev), frames)
 env.refresh()
 S = env.state()
@@ -58,6 +65,7 @@ for t in range(150):
     f1 = env.f + 1
     a = (motion.q[f1] - env.default_q) / env.alpha
     out = env.step(a)
+    env.f = torch.minimum(env.f, motion.clip_end[clips] - 1)
     rs.append(out["r"].mean().item() / 0.1)
     if t % 25 == 0:
         print(t, "norm reward", rs[-1], "term frac", env.failed_eval.float().mean().item(), "e_body_pos", out["terms"]["e_body_pos"].mean().item())

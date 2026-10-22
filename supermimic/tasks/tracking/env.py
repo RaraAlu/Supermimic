@@ -43,8 +43,10 @@ class TrackingSim:
     """Batched G1 motion-tracking simulator."""
 
     def __init__(self, num_envs: int, motion: MotionLib, mdp: MDP, device: str, gamma: float = 0.99,
-                 eval_mode: bool = False, max_episode_steps: int = 500, reset_noise: bool = True):  # fmt: skip
+                 eval_mode: bool = False, max_episode_steps: int = 500, reset_noise: bool = True,
+                 parallel=None):  # fmt: skip
         self.device = dev = device
+        self.parallel = parallel if parallel is not None and parallel.enabled else None
         scene_cfg = SceneCfg(
             num_envs=num_envs,
             env_spacing=0.0,
@@ -108,9 +110,12 @@ class TrackingSim:
         self.ep_ret = torch.zeros(self.N, device=dev)
         self.G_max = MAX_STEP_REWARD / (1 - gamma)
         self.bin_G = torch.full((motion.num_bins,), 0.0, device=dev)
-        self.bin_w_avg = torch.full((motion.num_bins,), 1.0 / motion.num_bins, device=dev)
+        num_bins = motion.global_num_bins if self.parallel else motion.num_bins
+        self.bin_w_avg = torch.full((motion.num_bins,), 1.0 / num_bins, device=dev)
         self.done_eval = torch.zeros(self.N, dtype=torch.bool, device=dev)
         self.failed_eval = torch.zeros(self.N, dtype=torch.bool, device=dev)
+        if self.parallel:
+            self.prepare_sampling(True)
         self.reset(torch.arange(self.N, device=dev))
 
     # ------------------------------------------------------------------ state
@@ -124,11 +129,22 @@ class TrackingSim:
         return (root[:, :3].clone(), R, rvel[:, :3].clone(), w, qpos[:, self._jq_adr].clone(), qvel[:, self._jv_adr].clone())
 
     # ------------------------------------------------------------------ reset
+    def prepare_sampling(self, active):
+        # Every rank participates, even when only another rank has completed episodes.
+        from supermimic.utils.distributed import global_bin_probabilities
+
+        if bool(self.parallel.reduce(int(active))):
+            self.bin_probs = global_bin_probabilities(self.bin_G, self.bin_w_avg, self.G_max,
+                                                      self.motion.global_num_bins, self.parallel)
+
     def sample_frames(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
         m = self.motion
-        soft = torch.softmax(-25.0 * self.bin_G / self.G_max, 0)
-        self.bin_w_avg.mul_(0.999).add_(0.001 * soft)
-        probs = 0.5 / m.num_bins + 0.4 * soft + 0.1 * self.bin_w_avg / self.bin_w_avg.sum()
+        if self.parallel:
+            probs = self.bin_probs
+        else:
+            soft = torch.softmax(-25.0 * self.bin_G / self.G_max, 0)
+            self.bin_w_avg.mul_(0.999).add_(0.001 * soft)
+            probs = 0.5 / m.num_bins + 0.4 * soft + 0.1 * self.bin_w_avg / self.bin_w_avg.sum()
         bins = torch.multinomial(probs, n, replacement=True)
         start = m.bin_start[bins]
         end = torch.minimum(start + 50, m.clip_end[m.bin_clip[bins]])  # keep >= 1 step before the clip end
@@ -227,5 +243,7 @@ class TrackingSim:
             self.bin_G.index_put_((b,), 0.8 * self.bin_G[b] + 0.2 * G)
             out["ep_len"] = T
             out["ep_ret_norm"] = self.ep_ret[ids] / (T * MAX_STEP_REWARD)
-            self.reset(ids)
+        if self.parallel:
+            self.prepare_sampling(len(ids) > 0)
+        self.reset(ids)
         return out

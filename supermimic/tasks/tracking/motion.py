@@ -1,10 +1,13 @@
 # Ported from zita-ch/supermimic_vibed (MIT, Copyright (c) 2026 ETH Zurich, Chong Zhang); see THIRD_PARTY_NOTICES.md.
-"""Reference motion library: LAFAN1 G1 retargets resampled to 50 Hz, with FK of tracked bodies."""
+"""Full-clip 50 Hz references, derivatives and FK for the built-in mjlab G1."""
 
 from __future__ import annotations
 
 import glob
+import hashlib
+import json
 import os
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -16,16 +19,47 @@ CONTROL_DT = 0.02
 BIN_FRAMES = 50  # 1 s bins for return-based reset sampling
 
 
+def resolve_motion_args(args, saved=None):
+    """Restore a run's selection unless the caller explicitly selects another source."""
+    saved = saved or {}
+    if args.motion_dir is None and args.motion_index is None:
+        args.motion_dir = saved.get("motion_dir")
+        args.motion_index = saved.get("motion_index")
+        if args.motion_limit is None:
+            args.motion_limit = saved.get("motion_limit")
+        if args.motion_root is None:
+            args.motion_root = saved.get("motion_root")
+    if args.motion_dir is None and args.motion_index is None:
+        args.motion_dir = str(Path(__file__).resolve().parents[3] / "data" / "lafan1_g1")
+    if args.motion_root is not None and args.motion_index is None:
+        raise ValueError("--motion_root requires --motion_index")
+    for key in ("motion_dir", "motion_index", "motion_root"):
+        value = getattr(args, key)
+        if value is not None:
+            setattr(args, key, str(Path(value).expanduser().resolve()))
+
+
+def check_reference(current, saved):
+    if saved and current["fingerprint"] != saved["fingerprint"]:
+        raise ValueError("reference fingerprint mismatch: index, source or selection differs from the checkpoint/run")
+
+
 class MotionLib:
-    def __init__(self, files: list[str], kin: G1Kinematics, device: str, src_fps: float = 30.0):
-        self.device = device
-        self.names = [os.path.splitext(os.path.basename(f))[0] for f in files]
-        ps, qs, js = [], [], []
-        lens = []
+    def __init__(self, files: list[str], kin: G1Kinematics, device: str, src_fps: float = 30.0,
+                 rank=0, world_size=1):
+        from supermimic.tasks.tracking.motion_hdf5 import file_sha256, validate_pose_arrays
+
+        if not files or src_fps <= 0:
+            raise ValueError("need at least one CSV motion and a positive source FPS")
+        names = [os.path.splitext(os.path.basename(f))[0] for f in files]
+        clips = []
         for f in files:
-            raw = torch.tensor(np.loadtxt(f, delimiter=","), dtype=torch.float32)
+            raw = torch.tensor(np.loadtxt(f, delimiter=",", ndmin=2), dtype=torch.float32)
+            if raw.shape[1] < 36:
+                raise ValueError(f"{f}: expected at least 36 CSV columns")
             p, q_xyzw, j = raw[:, :3], raw[:, 3:7], raw[:, 7:36]
             quat = torch.cat((q_xyzw[:, 3:4], q_xyzw[:, :3]), -1)
+            validate_pose_arrays(p.numpy(), quat.numpy(), j.numpy(), f)
             # resample to 50 Hz
             T_src = raw.shape[0]
             dur = (T_src - 1) / src_fps
@@ -36,16 +70,69 @@ class MotionLib:
             p = p[i0] * (1 - a[:, None]) + p[i0 + 1] * a[:, None]
             j = j[i0] * (1 - a[:, None]) + j[i0 + 1] * a[:, None]
             quat = quat_slerp(quat[i0], quat[i0 + 1], a)
-            ps.append(p), qs.append(quat), js.append(j)
-            lens.append(n)
-        self.clip_len = torch.tensor(lens, device=device)
-        self.clip_start = torch.cumsum(torch.cat((torch.zeros(1, dtype=torch.long), torch.tensor(lens[:-1], dtype=torch.long))), 0).to(device)  # dtype: one clip gives an empty (float) tensor
-        self.clip_end = self.clip_start + self.clip_len - 1  # last valid frame (inclusive)
-        self.num_frames = int(sum(lens))
-        self.clip_id = torch.cat([torch.full((n,), i, dtype=torch.long) for i, n in enumerate(lens)]).to(device)
+            clips.append((p, quat, j))
+        digest = hashlib.sha256(json.dumps(
+            {"csv": [(os.path.basename(f), file_sha256(Path(f))) for f in files], "fps": src_fps},
+            sort_keys=True,
+        ).encode()).hexdigest()
+        self.description = {"format": "csv", "source_fps": src_fps, "fps": 50,
+                            "selected_clips": len(clips), "fingerprint": digest}
+        lens = [len(p) for p, _, _ in clips]
+        ids = self._select(lens, rank, world_size)
+        self._build([names[i] for i in ids], [lens[i] for i in ids], (clips[i] for i in ids), kin, device)
 
-        root_p, root_R, root_v, root_w, jq, jqd = [], [], [], [], [], []
-        for p, quat, j in zip(ps, qs, js):
+    def _select(self, lens, rank, world_size):
+        from supermimic.tasks.tracking.motion_hdf5 import partition_clips
+
+        if not 0 <= rank < world_size:
+            raise ValueError("rank must be within world_size")
+        groups = partition_clips(lens, world_size)
+        ids = groups[rank]
+        self.global_description = dict(self.description, selected_frames=sum(lens),
+                                       frame_hours=sum(lens) / 50 / 3600,
+                                       shorter_than_33_frames=sum(n < 33 for n in lens))
+        self.partition = {"algorithm": "full_clip_lpt_v1", "rank": rank, "world_size": world_size,
+                          "clip_indices": ids,
+                          "frames_per_rank": [sum(lens[i] for i in group) for group in groups],
+                          "clips_per_rank": [len(group) for group in groups]}
+        self.global_num_bins = sum((n + BIN_FRAMES - 2) // BIN_FRAMES for n in lens)
+        frames = sum(lens[i] for i in ids)
+        self.description = dict(self.global_description, selected_clips=len(ids), selected_frames=frames,
+                                frame_hours=frames / 50 / 3600,
+                                shorter_than_33_frames=sum(lens[i] < 33 for i in ids), partition=self.partition)
+        return ids
+
+    def _build(self, names, lens, clips, kin, device):
+        self.device, self.names = device, names
+        self.num_frames = int(sum(lens))
+        tracked = len(kin.tracked_idx)
+        estimate = self.num_frames * (4 * (83 + 18 * tracked) + 16)
+        self.global_description["reference_tensor_bytes"] = self.global_description["selected_frames"] * (4 * (83 + 18 * tracked) + 16)
+        self.description.update(selected_frames=self.num_frames, reference_tensor_bytes=estimate)
+        if torch.device(device).type == "cuda":
+            free, _ = torch.cuda.mem_get_info(torch.device(device))
+            if estimate * 1.1 + 2 * 1024**3 > free:
+                raise MemoryError(
+                    f"Reference tensors need about {estimate / 1024**3:.2f} GiB before training; "
+                    f"only {free / 1024**3:.2f} GiB is free. Use an explicit --motion_limit for a smoke "
+                    "test, or a larger-memory device. No clips were silently discarded."
+                )
+        lengths = torch.tensor(lens, dtype=torch.long, device=device)
+        self.clip_len = lengths
+        self.clip_start = torch.cumsum(lengths, 0) - lengths
+        self.clip_end = self.clip_start + lengths - 1
+        self.clip_id = torch.repeat_interleave(torch.arange(len(lens), device=device), lengths)
+        for key, shape in (("root_p", (3,)), ("root_R", (3, 3)), ("root_v", (3,)),
+                           ("root_w", (3,)), ("q", (29,)), ("qd", (29,))):
+            setattr(self, key, torch.empty((self.num_frames, *shape), device=device))
+        offset = 0
+        for i, (p, quat, j) in enumerate(clips):
+            if i >= len(lens):
+                raise ValueError("source yielded extra clips")
+            expected = lens[i]
+            p, quat, j = (torch.as_tensor(x, dtype=torch.float32, device="cpu") for x in (p, quat, j))
+            if len(p) != expected:
+                raise ValueError("source clip length changed during reference loading")
             R = quat_to_mat(quat)
             v = _gradient(p, CONTROL_DT)
             qd = _gradient(j, CONTROL_DT)
@@ -54,43 +141,67 @@ class MotionLib:
             w[1:-1] = so3_log(R[2:] @ R[:-2].transpose(-1, -2)) / (2 * CONTROL_DT)
             w[0] = so3_log(R[1] @ R[0].T) / CONTROL_DT
             w[-1] = so3_log(R[-1] @ R[-2].T) / CONTROL_DT
-            root_p.append(p), root_R.append(R), root_v.append(v), root_w.append(w), jq.append(j), jqd.append(qd)
-        cat = lambda xs: torch.cat(xs).to(device)  # noqa: E731
-        self.root_p, self.root_R, self.root_v, self.root_w = cat(root_p), cat(root_R), cat(root_v), cat(root_w)
-        self.q, self.qd = cat(jq), cat(jqd)
+            part = slice(offset, offset + expected)
+            for key, value in (("root_p", p), ("root_R", R), ("root_v", v), ("root_w", w), ("q", j), ("qd", qd)):
+                getattr(self, key)[part] = value.to(device)
+            offset += expected
+        if offset != self.num_frames:
+            raise ValueError("source did not yield every selected clip")
+        for key, shape in (("body_p", (tracked, 3)), ("body_R", (tracked, 3, 3)),
+                           ("body_v", (tracked, 3)), ("body_w", (tracked, 3))):
+            setattr(self, key, torch.empty((self.num_frames, *shape), device=device))
         with torch.no_grad():
-            bp, bR, bv, bw = [], [], [], []
             for s in range(0, self.num_frames, 65536):
                 e = min(s + 65536, self.num_frames)
                 out = kin.forward(self.root_p[s:e], self.root_R[s:e], self.root_v[s:e], self.root_w[s:e], self.q[s:e], self.qd[s:e])
-                bp.append(out[0]), bR.append(out[1]), bv.append(out[2]), bw.append(out[3])
-            self.body_p, self.body_R, self.body_v, self.body_w = torch.cat(bp), torch.cat(bR), torch.cat(bv), torch.cat(bw)
+                for key, value in zip(("body_p", "body_R", "body_v", "body_w"), out):
+                    getattr(self, key)[s:e] = value
         # per-frame static goal parts: q, qd, root velocities in the root frame
         Rt = self.root_R.transpose(-1, -2)
         self.root_v_local = (Rt @ self.root_v.unsqueeze(-1)).squeeze(-1)
         self.root_w_local = (Rt @ self.root_w.unsqueeze(-1)).squeeze(-1)
         self.root_gz = self.root_R[:, 2, 2]  # -(projected gravity z) of the reference root: g_b = R^T (0,0,-1)
-        # 1 s bins
-        bin_clip, bin_start = [], []
-        for c in range(len(lens)):
-            nb = int(np.ceil(lens[c] / BIN_FRAMES))
-            for b in range(nb):
-                bin_clip.append(c)
-                bin_start.append(int(self.clip_start[c]) + b * BIN_FRAMES)
-        self.bin_clip = torch.tensor(bin_clip, device=device)
-        self.bin_start = torch.tensor(bin_start, device=device)
-        self.num_bins = len(bin_start)
-        self.frame_bin = torch.zeros(self.num_frames, dtype=torch.long, device=device)
-        for b in range(self.num_bins):
-            c = bin_clip[b]
-            s = bin_start[b]
-            e = min(s + BIN_FRAMES, int(self.clip_end[c]) + 1)
-            self.frame_bin[s:e] = b
+        # Storage windows never participate in these source-clip time-axis bins.
+        # The final frame is a target, never a reset start (there must be a next frame).
+        counts = (lengths + BIN_FRAMES - 2) // BIN_FRAMES
+        first_bin = torch.cumsum(counts, 0) - counts
+        self.bin_clip = torch.repeat_interleave(torch.arange(len(lens), device=device), counts)
+        self.num_bins = int(counts.sum())
+        local_bin = torch.arange(self.num_bins, device=device) - first_bin[self.bin_clip]
+        self.bin_start = self.clip_start[self.bin_clip] + local_bin * BIN_FRAMES
+        self.frame_bin = torch.empty(self.num_frames, dtype=torch.long, device=device)
+        for start in range(0, self.num_frames, 65536):
+            end = min(start + 65536, self.num_frames)
+            ids = self.clip_id[start:end]
+            local = (torch.arange(start, end, device=device) - self.clip_start[ids]) // BIN_FRAMES
+            self.frame_bin[start:end] = first_bin[ids] + torch.minimum(local, counts[ids] - 1)
 
     @staticmethod
-    def from_dir(path: str, kin: G1Kinematics, device: str) -> MotionLib:
+    def from_dir(path: str, kin: G1Kinematics, device: str, limit: int | None = None,
+                 rank=0, world_size=1) -> MotionLib:
+        if limit is not None and limit < 1:
+            raise ValueError("motion_limit must be positive")
         files = sorted(glob.glob(os.path.join(path, "*.csv")))
-        return MotionLib(files, kin, device)
+        return MotionLib(files if limit is None else files[:limit], kin, device, rank=rank, world_size=world_size)
+
+    @classmethod
+    def from_index(cls, path, kin, device, source_root=None, limit=None, rank=0, world_size=1):
+        from supermimic.tasks.tracking.motion_hdf5 import IndexedG1Dataset
+
+        dataset = IndexedG1Dataset(path, source_root, limit)
+        instance = cls.__new__(cls)
+        instance.description = dataset.summary()
+        ids = instance._select([c.length for c in dataset.clips], rank, world_size)
+        dataset.clips = [dataset.clips[i] for i in ids]
+        instance._build([c.name for c in dataset.clips], [c.length for c in dataset.clips],
+                        dataset.iter_clips(), kin, device)
+        return instance
+
+    @classmethod
+    def from_args(cls, args, kin, device, rank=0, world_size=1):
+        if args.motion_index:
+            return cls.from_index(args.motion_index, kin, device, args.motion_root, args.motion_limit, rank, world_size)
+        return cls.from_dir(args.motion_dir, kin, device, args.motion_limit, rank, world_size)
 
     def future_frames(self, f: torch.Tensor, K: int) -> torch.Tensor:
         """Frames f+1..f+K clamped to the clip's last frame, shape (B, K)."""

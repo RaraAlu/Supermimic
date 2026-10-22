@@ -7,6 +7,7 @@ dependencies = [
     "mjlab==1.6.0",
     "torch>=2.7.0",
     "numpy",
+    "h5py>=3.12,<4",
 ]
 
 [tool.uv]

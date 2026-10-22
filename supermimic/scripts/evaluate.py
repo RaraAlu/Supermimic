@@ -26,10 +26,17 @@ parser.add_argument("--run_dir", type=str, required=True)
 parser.add_argument("--watch", action="store_true")
 parser.add_argument("--ckpt", type=str, default=None, help="evaluate one checkpoint")
 parser.add_argument("--record", type=str, default=None, help="save trajectories (npz) for rendering")
-parser.add_argument("--motion_dir", type=str, default=os.path.join(REPO, "data", "lafan1_g1"))
+source = parser.add_mutually_exclusive_group()
+source.add_argument("--motion_dir", type=str, default=None)
+source.add_argument("--motion_index", type=str, default=None)
+parser.add_argument("--motion_root", type=str, default=None)
+parser.add_argument("--motion_limit", type=int, default=None)
+parser.add_argument("--eval_batch_size", type=int, default=256)
 parser.add_argument("--every", type=int, default=1, help="evaluate every n-th checkpoint")
 parser.add_argument("--device", type=str, default="cuda:0")
 args = parser.parse_args()
+if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+    parser.error("evaluation is single-process and batched; run without torchrun")
 
 import numpy as np
 import torch
@@ -37,56 +44,73 @@ import torch
 import supermimic.tasks.tracking.rl.networks as networks
 from supermimic.tasks.tracking.env import TrackingSim
 from supermimic.tasks.tracking.mdp import MAX_STEP_REWARD, OBS_DIM, MDP
-from supermimic.tasks.tracking.motion import MotionLib
+from supermimic.tasks.tracking.motion import MotionLib, check_reference, resolve_motion_args
 from supermimic.tasks.tracking.rl.networks import Policy
 from supermimic.utils.kinematics import G1Kinematics
 
 torch.backends.cuda.matmul.allow_tf32 = True
 dev = args.device
+if args.eval_batch_size < 1:
+    raise ValueError("eval_batch_size must be positive")
+initial_ck = torch.load(args.ckpt, map_location="cpu") if args.ckpt else None
+run_args = Path(args.run_dir) / "args.json"
+saved_args = initial_ck["args"] if initial_ck else json.loads(run_args.read_text(encoding="utf-8"))
+resolve_motion_args(args, saved_args)
 kin = G1Kinematics(dev)
-motion = MotionLib.from_dir(args.motion_dir, kin, dev)
+motion = MotionLib.from_args(args, kin, dev)
 mdp = MDP(kin, motion, kin.default_q)
 C = len(motion.names)
+if args.record and C > args.eval_batch_size:
+    raise ValueError("trajectory recording requires a single evaluation batch; explicitly increase --eval_batch_size")
 
 
 @torch.no_grad()
 def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
+    check_reference(motion.description, ck.get("reference"))
     a_ = ck["args"]
     K, Hh = a_["goal_frames"], a_["hist"]
     networks.AMP_DTYPE = torch.bfloat16 if a_.get("amp", "none") == "bf16" else None
     pi = Policy(OBS_DIM, 73 * K, hist=Hh).to(dev)
     pi.load_state_dict(ck["pi"])
     pi.eval()
-    ids = torch.arange(C, device=dev)
-    env.done_eval[:] = False
-    env.failed_eval[:] = False
-    env.reset(ids, motion.clip_start.clone())
-    clip_end = motion.clip_end.clone()
+    ids = torch.arange(env.N, device=dev)
     ret = torch.zeros(C, device=dev)
-    steps = torch.zeros(C, device=dev)
-    hist = None
+    failed = torch.zeros(C, dtype=torch.bool, device=dev)
     traj = {"root_p": [], "root_quat": [], "q": [], "f": [], "alive": []}
-    while not bool(env.done_eval.all()):
-        S = env.state()
-        o = mdp.obs(S, env.a_prev, env.xi, env.f)
-        hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
-        a = pi(hist, motion.goal(env.f, K))
-        alive = ~env.done_eval.clone()
-        if record:
-            from supermimic.utils.rotations import mat_to_quat
+    for start in range(0, C, env.N):
+        count = min(env.N, C - start)
+        # Pad the last batch with an inactive duplicate; it never enters the scores.
+        clips = (ids + start).clamp(max=C - 1)
+        env.done_eval[:] = False
+        env.failed_eval[:] = False
+        env.reset(ids, motion.clip_start[clips].clone())
+        env.done_eval[count:] = True
+        clip_end = motion.clip_end[clips]
+        batch_ret = torch.zeros(env.N, device=dev)
+        hist = None
+        while not bool(env.done_eval.all()):
+            S = env.state()
+            o = mdp.obs(S, env.a_prev, env.xi, env.f)
+            hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
+            a = pi(hist, motion.goal(env.f, K))
+            alive = ~env.done_eval.clone()
+            if record:
+                from supermimic.utils.rotations import mat_to_quat
 
-            traj["root_p"].append(S[0].cpu()), traj["root_quat"].append(mat_to_quat(S[1]).cpu())
-            traj["q"].append(S[4].cpu()), traj["f"].append(env.f.cpu()), traj["alive"].append(alive.cpu())
-        out = env.step(a)
-        ret += torch.where(alive, out["r"], 0.0)
-        steps += alive.float()
-        env.f = torch.minimum(env.f, clip_end - 1)  # finished clips keep stepping; keep f+1 in range
+                traj["root_p"].append(S[0].cpu()), traj["root_quat"].append(mat_to_quat(S[1]).cpu())
+                traj["q"].append(S[4].cpu()), traj["f"].append(env.f.cpu()), traj["alive"].append(alive.cpu())
+            out = env.step(a)
+            batch_ret += torch.where(alive, out["r"], 0.0)
+            env.f = torch.minimum(env.f, clip_end - 1)
+        ret[start:start + count] = batch_ret[:count]
+        failed[start:start + count] = env.failed_eval[:count]
     norm = ret / ((motion.clip_len - 1).float() * MAX_STEP_REWARD)
     res = {
         "norm_return": norm.mean().item(),
         "norm_return_framew": (ret.sum() / ((motion.clip_len - 1).sum() * MAX_STEP_REWARD)).item(),
-        "n_failed": int(env.failed_eval.sum().item()),
-        "failed": [motion.names[i] for i in env.failed_eval.nonzero().flatten().tolist()],
+        "n_failed": int(failed.sum().item()),
+        "failed": [motion.names[i] for i in failed.nonzero().flatten().tolist()],
+        "reference": motion.description,
         "per_clip": {motion.names[i]: round(norm[i].item(), 4) for i in range(C)},
     }
     if record:
@@ -97,17 +121,27 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
 
 
 def make_env() -> TrackingSim:
-    return TrackingSim(C, motion, mdp, dev, eval_mode=True)
+    return TrackingSim(min(C, args.eval_batch_size), motion, mdp, dev, eval_mode=True)
 
 
 env = None
 if args.ckpt:
-    ck = torch.load(args.ckpt, map_location=dev)
+    ck = initial_ck
+    check_reference(motion.description, ck.get("reference"))
     env = make_env()
     res = evaluate(env, ck, args.record)
+    result_path = str(Path(args.ckpt).with_suffix("")) + "_eval.json"
+    Path(result_path).write_text(json.dumps(res, indent=1, ensure_ascii=False), encoding="utf-8")
     print(json.dumps({k: v for k, v in res.items() if k != "per_clip"}, indent=1))
     sys.exit(0)
 out_csv = os.path.join(args.run_dir, "eval.csv")
+eval_reference = Path(args.run_dir) / "eval_reference.json"
+if eval_reference.exists():
+    check_reference(motion.description, json.loads(eval_reference.read_text(encoding="utf-8")))
+elif Path(out_csv).exists():
+    raise ValueError("existing eval.csv has no reference provenance; use a separate evaluation run_dir")
+else:
+    eval_reference.write_text(json.dumps(motion.description, indent=2, ensure_ascii=False), encoding="utf-8")
 done = set()
 if os.path.exists(out_csv):
     done = {int(l.split(",")[0]) for l in open(out_csv, encoding="utf-8").read().strip().splitlines()[1:]}
@@ -120,6 +154,7 @@ while True:
     for c in todo:
         it = int(os.path.basename(c)[5:11])
         ck = torch.load(c, map_location=dev)
+        check_reference(motion.description, ck.get("reference"))
         env = env or make_env()
         t0 = time.time()
         res = evaluate(env, ck)

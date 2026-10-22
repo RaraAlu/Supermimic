@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from supermimic.tasks.tracking.mdp import INV_DIM, NUM_J, XI_DIM, invariant_features
 from supermimic.utils.rotations import so3_exp, yaw_mat
+from supermimic.utils.distributed import global_moments
 
 
 def mlp(inp: int, hidden: list[int], out: int, act=nn.ELU, layer_norm: bool = False) -> nn.Sequential:
@@ -37,8 +38,7 @@ class RunningNorm(nn.Module):
         x = x.reshape(-1, x.shape[-1]).float()
         if self.count >= self.max_count:
             return
-        n = x.shape[0]
-        m, v = x.mean(0), x.var(0, unbiased=False)
+        n, m, v = global_moments(x)
         tot = self.count + n
         delta = m - self.mean
         self.mean += delta * n / tot

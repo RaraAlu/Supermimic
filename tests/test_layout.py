@@ -71,8 +71,17 @@ class LayoutTests(unittest.TestCase):
                     if option in ("--motion_dir", "--log_dir"):
                         default = next(k.value for k in node.keywords if k.arg == "default")
                         value = eval(compile(ast.Expression(default), str(path), "eval"), namespace)
-                        expected = REPO / ("data/lafan1_g1" if option == "--motion_dir" else "logs/run")
-                        self.assertEqual(Path(value), expected)
+                        if option == "--motion_dir":
+                            self.assertIsNone(value)  # Resolved after restoring checkpoint selection.
+                        else:
+                            self.assertEqual(Path(value), REPO / "logs/run")
+
+    def test_data_checker_help_without_dependencies(self):
+        result = subprocess.run([sys.executable, "-B", str(REPO / "scripts/check_data.py"), "--help"],
+                                cwd="/" if os.name != "nt" else tempfile.gettempdir(),
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--verify_frames", result.stdout)
 
     def test_cli_help_by_path_outside_repository(self):
         with tempfile.TemporaryDirectory() as cwd:
