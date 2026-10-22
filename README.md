@@ -243,6 +243,8 @@ uv run --frozen python -B -m unittest discover -s tests -v
 | --- | --- |
 | [docs/planning/plan.md](docs/planning/plan.md) | 主张、证据帐本、依赖、显存估算、验收标准、里程碑 |
 | [docs/planning/rubric.json](docs/planning/rubric.json) | 加权评分树，叶子引用验收标准与帐本ID |
+| [docs/analysis/algorithm.md](docs/analysis/algorithm.md) | 论文算法分析：问题设定、世界模型、一阶策略梯度、critic、加速来源与风险 |
+| [docs/analysis/training_pipeline.md](docs/analysis/training_pipeline.md) | 训练流程图与算法细节：采样、重置采样、世界模型拟合、想象推演BPTT、critic、评估、实现与论文差异 |
 | [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) | 第三方代码许可与出处 |
 
 ## 使用约束
