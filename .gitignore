@@ -1,0 +1,6 @@
+# 数据集与检查点不入库
+data/
+checkpoints/
+runs/
+*.npz
+*.pt
