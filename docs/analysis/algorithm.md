@@ -2,7 +2,7 @@
 
 - 论文：arXiv:2610.28480v1（CoRL 2026），正文9页与附录A–G全文通读；阅读日期2026-10-22
 - 范围：算法部分。引用处标注论文节号；标“推断”的段落是本文的判断，不是论文原文。
-- 相关：复现规划见[../planning/plan.md](../planning/plan.md)；训练流程图与逐步实现细节见[training_pipeline.md](training_pipeline.md)；性能瓶颈与优化项见[optimization.md](optimization.md)
+- 相关：复现规划见[../planning/plan.md](../planning/plan.md)；训练流程图与逐步实现细节见[training_pipeline.md](training_pipeline.md)；性能瓶颈与优化项见[optimization.md](optimization.md)；每个公式的逐项拆解、通俗解释与数值算例见[formulas.md](formulas.md)
 
 ## 0. 定位
 
@@ -68,6 +68,9 @@ $$
 $$
 
 窗口从记录的状态 $\hat{s}_0 = s_0$ 出发，按记录的动作自回归推进 $k = 8$ 步。
+
+通俗地说：让世界模型拿自己的预测接着往下猜 $k$ 步，每一步猜出的状态、奖励、观测和终止都要和仿真记录一致；能用公式直接算的项不用学，也就不计损失。逐项拆解见[formulas.md](formulas.md)第5节。
+
 每个预测头可以学习，也可以解析计算；解析头不计损失。
 
 ### 3.2 三个要点
@@ -109,6 +112,8 @@ $$
 a_t = \pi_\theta(\hat{\bar{o}}_t + \eta_t, g_t), \quad \eta_t \sim \rho_\eta
 $$
 
+通俗地说：在世界模型里“做梦” $H$ 步，把这 $H$ 步拿到的分加起来（越可能摔倒，后面的分打折越多），再加上critic估计的“ $H$ 步以后还能拿多少分”。按满分估算，后一部分约占目标的73%，所以critic不可或缺（[formulas.md](formulas.md)第6.2节）。
+
 起点从缓冲区抽样，带着真实的 $\xi$ 和真实状态分布。梯度沿两条路径流动：
 
 - 动作路径： $\theta \to a_t \to \hat{s}_{t+1} \to$ 之后所有奖励；
@@ -120,6 +125,9 @@ $$
 $$
 \prod_{t} \left( \frac{\partial f}{\partial \hat{s}} + \frac{\partial f}{\partial a} \frac{\partial \pi}{\partial o} \frac{\partial g}{\partial \hat{s}} \right)
 $$
+
+通俗地说：每多想象一步，梯度就要多乘一个这样的因子。它略大于1，梯度就会爆炸（ $1.1^{32} \approx 21$ ）；
+略小于1，远处的影响几乎消失（ $0.9^{32} \approx 0.034$ ）。两步情形的完整链式法则见[formulas.md](formulas.md)第6.3–6.4节。
 
 
 | 时域 | 后果 |
@@ -161,6 +169,8 @@ $$
 $$
 
 其中 $V_t = V_\psi(\hat{s}_t, g_t, \xi)$ 。
+
+通俗地说：critic的训练目标是“这一步的分 + 之后的估分”。“之后的估分”在critic自己的估计和后面实际想象到的分之间按 $\lambda$ 混合：$\lambda = 0$ 时只信自己，偏差大； $\lambda = 1$ 时只信想象的结果，方差大（[formulas.md](formulas.md)第7节）。
 
 - 只在想象转移上训练；GAE目标每次推演算一次后固定；没有指数滑动平均的目标网络。
   这与SHAC不同，SHAC是硬终止且有目标网络。
