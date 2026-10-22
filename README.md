@@ -25,7 +25,10 @@ Windows与Linux（x86_64，NVIDIA GPU）共用同一份`pyproject.toml`、`uv.lo
 | --- | --- | --- |
 | 环境 | `uv sync --frozen` | `uv sync --frozen` |
 | `torch.compile` | 关闭（PyTorch在Windows无Triton，`--compile auto`自动跳过） | 开启（Triton随torch安装） |
-| 已验证 | RTX 4070 Ti SUPER，CUDA | 仅CPU（`--device cpu`）；GPU待在5080/H100上验证 |
+| 已验证 | RTX 4070 Ti SUPER，CUDA | RTX 5080，CUDA，`--compile off`；LAFAN1小规模回归通过 |
+
+Linux本次回归使用Python 3.12.3，运行64个环境、4次迭代，验证训练、检查点保存与加载、40条LAFAN1动作评估，以及中文目录中的UTF-8 JSON/CSV读写。
+该结果仅验证运行兼容性，不代表训练质量达标；`--compile auto/on`开启编译的路径与H100尚未验证。
 
 同一目录被两个系统共享（例如虚拟机挂载宿主机磁盘）时，两边不能共用`.venv`：
 `.venv`内的解释器路径与目录结构按系统生成，在一边执行`uv sync`或`uv run`会重建另一边的环境。
