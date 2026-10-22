@@ -8,3 +8,5 @@ runs/
 logs/
 .cache/
 __pycache__/
+.codegraph/
+.vscode/
