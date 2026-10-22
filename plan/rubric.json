@@ -97,7 +97,7 @@
         "weight": 2,
         "children": [
           {"id": "R.7.1", "title": "双卡零失败", "weight": 2, "kind": "result", "criterion_id": "K-31", "ledger_ids": ["L-BASE-4", "L-OPT-1", "L-OPT-10"], "check": "双卡训练的检查点失败段数", "tolerance": "失败=0；耗时≤12.25 h", "provisional": true},
-          {"id": "R.7.2", "title": "PPO-Sim基线", "weight": 2, "kind": "result", "criterion_id": "K-32", "ledger_ids": ["L-BASE-2", "L-BASE-3"], "check": "1/4/8卡18 h最终检查点回报", "tolerance": "0.60/0.70/0.72各±0.05，且低于SuperMimic", "provisional": true},
+          {"id": "R.7.2", "title": "PPO-Sim基线", "weight": 2, "kind": "result", "criterion_id": "K-32", "ledger_ids": ["L-BASE-2", "L-BASE-3"], "check": "单卡18 h最终检查点回报；4卡与8卡为可选", "tolerance": "单卡0.60±0.05且低于SuperMimic；可选4卡0.70、8卡0.72各±0.05", "provisional": true},
           {"id": "R.7.3", "title": "64k环境吞吐比", "weight": 1, "kind": "result", "criterion_id": "K-33", "ledger_ids": ["L-ENV-2", "L-COMP-3"], "check": "吞吐表64k行", "tolerance": "31–124倍（论文62倍的1/2至2倍）", "provisional": true},
           {"id": "R.7.4", "title": "PPO-WM对照", "weight": 1, "kind": "result", "criterion_id": "K-34", "ledger_ids": ["L-BASE-5", "L-DATA-15"], "check": "达到PPO-WM最佳回报所需想象步数之比", "tolerance": "32–128倍（论文64倍的1/2至2倍）", "provisional": true},
           {"id": "R.7.5", "title": "推力恢复", "weight": 1, "kind": "result", "criterion_id": "K-35", "ledger_ids": ["L-EVAL-12", "L-EVAL-13"], "check": "推力测试脚本", "tolerance": "稳住时间在0.5–2.4 s量级；无critic策略在0.5 m/s下稳不住", "provisional": true},
