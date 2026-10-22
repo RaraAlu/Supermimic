@@ -204,7 +204,7 @@ class IndexedMotionTests(unittest.TestCase):
         self.assertEqual(args.motion_limit, 2)
         args = SimpleNamespace(motion_dir=None, motion_index=None, motion_root=None, motion_limit=None)
         resolve_motion_args(args)
-        self.assertTrue(args.motion_dir.endswith("data/lafan1_g1"))
+        self.assertTrue(Path(args.motion_dir).as_posix().endswith("data/lafan1_g1"))
 
     def test_shards_cover_whitelist_without_splitting_sources(self):
         full = MotionLib.from_index(self.index, self.kin, "cpu")
