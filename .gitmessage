@@ -1,0 +1,12 @@
+# 提交信息格式（git 会自动去掉以 # 开头的行）
+# <类型>(<范围>): <简述>
+#
+# **变更内容**
+# - ...
+#
+# **验证**
+# - ...
+#
+# 默认署名尾注：未实际参与的提交请删除对应行
+Co-authored-by: Claude <81847+claude@users.noreply.github.com>
+Co-authored-by: DeepSeek <noreply@deepseek.com>

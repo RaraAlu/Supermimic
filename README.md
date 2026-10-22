@@ -260,6 +260,7 @@ uv run --frozen python -B -m unittest discover -s tests -v
 | [docs/analysis/training_pipeline.md](docs/analysis/training_pipeline.md) | 训练流程图与算法细节：采样、重置采样、世界模型拟合、想象推演BPTT、critic、评估、实现与论文差异 |
 | [docs/analysis/optimization.md](docs/analysis/optimization.md) | 性能优化分析：剖析方法与实测、瓶颈（kernel发射）、按优先级的优化项与验证顺序 |
 | [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) | 第三方代码许可与出处 |
+| [CONTRIBUTORS.md](CONTRIBUTORS.md) | 贡献者名单、AI 编码代理署名与提交模板约定 |
 
 ## 使用约束
 
@@ -269,3 +270,8 @@ uv run --frozen python -B -m unittest discover -s tests -v
 - AMASS：需注册，仅限非商用研究，不得再分发。
 - 论文项目页的网页演示受专有许可约束。
   它只能人工浏览，不能下载、抓取或用作对照。
+
+## 贡献
+
+贡献者与 AI 编码代理的署名方式见 [CONTRIBUTORS.md](CONTRIBUTORS.md)。提交模板 `.gitmessage` 默认带
+`Co-authored-by` 尾注，安装：`git config commit.template .gitmessage`。
