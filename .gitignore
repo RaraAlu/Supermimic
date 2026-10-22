@@ -4,3 +4,7 @@ checkpoints/
 runs/
 *.npz
 *.pt
+.venv/
+logs/
+.cache/
+__pycache__/
