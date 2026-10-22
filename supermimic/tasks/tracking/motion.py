@@ -12,11 +12,30 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from supermimic.tasks.tracking.motion_hdf5 import reference_bytes_per_frame
 from supermimic.utils.kinematics import G1Kinematics
-from supermimic.utils.rotations import mat_to_6d, quat_slerp, quat_to_mat, so3_log, yaw_mat
+from supermimic.utils.rotations import mat_to_6d, mat_to_quat, quat_slerp, quat_to_mat, so3_log, yaw_mat
 
 CONTROL_DT = 0.02
 BIN_FRAMES = 50  # 1 s bins for return-based reset sampling
+FK_CHUNK = 65536
+
+
+class RotationView:
+    """Rotations stored as wxyz quaternions and indexed as matrices, so callers keep ``lib.root_R[f]``."""
+
+    def __init__(self, quat: torch.Tensor):
+        self.quat = quat
+
+    def __getitem__(self, idx) -> torch.Tensor:
+        return quat_to_mat(self.quat[idx])
+
+    def __len__(self) -> int:
+        return len(self.quat)
+
+    @property
+    def shape(self) -> torch.Size:
+        return self.quat.shape[:-1] + (3, 3)
 
 
 def resolve_motion_args(args, saved=None):
@@ -106,8 +125,9 @@ class MotionLib:
         self.device, self.names = device, names
         self.num_frames = int(sum(lens))
         tracked = len(kin.tracked_idx)
-        estimate = self.num_frames * (4 * (83 + 18 * tracked) + 16)
-        self.global_description["reference_tensor_bytes"] = self.global_description["selected_frames"] * (4 * (83 + 18 * tracked) + 16)
+        per_frame = reference_bytes_per_frame(tracked)
+        estimate = self.num_frames * per_frame
+        self.global_description["reference_tensor_bytes"] = self.global_description["selected_frames"] * per_frame
         self.description.update(selected_frames=self.num_frames, reference_tensor_bytes=estimate)
         if torch.device(device).type == "cuda":
             free, _ = torch.cuda.mem_get_info(torch.device(device))
@@ -122,7 +142,7 @@ class MotionLib:
         self.clip_start = torch.cumsum(lengths, 0) - lengths
         self.clip_end = self.clip_start + lengths - 1
         self.clip_id = torch.repeat_interleave(torch.arange(len(lens), device=device), lengths)
-        for key, shape in (("root_p", (3,)), ("root_R", (3, 3)), ("root_v", (3,)),
+        for key, shape in (("root_p", (3,)), ("root_quat", (4,)), ("root_v", (3,)),
                            ("root_w", (3,)), ("q", (29,)), ("qd", (29,))):
             setattr(self, key, torch.empty((self.num_frames, *shape), device=device))
         offset = 0
@@ -142,25 +162,29 @@ class MotionLib:
             w[0] = so3_log(R[1] @ R[0].T) / CONTROL_DT
             w[-1] = so3_log(R[-1] @ R[-2].T) / CONTROL_DT
             part = slice(offset, offset + expected)
-            for key, value in (("root_p", p), ("root_R", R), ("root_v", v), ("root_w", w), ("q", j), ("qd", qd)):
+            for key, value in (("root_p", p), ("root_quat", mat_to_quat(R)), ("root_v", v), ("root_w", w), ("q", j), ("qd", qd)):
                 getattr(self, key)[part] = value.to(device)
             offset += expected
         if offset != self.num_frames:
             raise ValueError("source did not yield every selected clip")
-        for key, shape in (("body_p", (tracked, 3)), ("body_R", (tracked, 3, 3)),
-                           ("body_v", (tracked, 3)), ("body_w", (tracked, 3))):
+        for key, shape in (("body_p", (tracked, 3)), ("body_quat", (tracked, 4)),
+                           ("body_v", (tracked, 3)), ("body_w", (tracked, 3)),
+                           ("root_v_local", (3,)), ("root_w_local", (3,))):
             setattr(self, key, torch.empty((self.num_frames, *shape), device=device))
+        # Matrices exist only per chunk; the resident library keeps quaternions.
+        self.root_R = RotationView(self.root_quat)
+        self.body_R = RotationView(self.body_quat)
         with torch.no_grad():
-            for s in range(0, self.num_frames, 65536):
-                e = min(s + 65536, self.num_frames)
-                out = kin.forward(self.root_p[s:e], self.root_R[s:e], self.root_v[s:e], self.root_w[s:e], self.q[s:e], self.qd[s:e])
-                for key, value in zip(("body_p", "body_R", "body_v", "body_w"), out):
-                    getattr(self, key)[s:e] = value
-        # per-frame static goal parts: q, qd, root velocities in the root frame
-        Rt = self.root_R.transpose(-1, -2)
-        self.root_v_local = (Rt @ self.root_v.unsqueeze(-1)).squeeze(-1)
-        self.root_w_local = (Rt @ self.root_w.unsqueeze(-1)).squeeze(-1)
-        self.root_gz = self.root_R[:, 2, 2]  # -(projected gravity z) of the reference root: g_b = R^T (0,0,-1)
+            for s in range(0, self.num_frames, FK_CHUNK):
+                e = min(s + FK_CHUNK, self.num_frames)
+                R = self.root_R[s:e]
+                out = kin.forward(self.root_p[s:e], R, self.root_v[s:e], self.root_w[s:e], self.q[s:e], self.qd[s:e])
+                for key, value in zip(("body_p", "body_quat", "body_v", "body_w"), out):
+                    getattr(self, key)[s:e] = mat_to_quat(value) if key == "body_quat" else value
+                # per-frame static goal parts: root velocities in the root frame
+                Rt = R.transpose(-1, -2)
+                self.root_v_local[s:e] = (Rt @ self.root_v[s:e].unsqueeze(-1)).squeeze(-1)
+                self.root_w_local[s:e] = (Rt @ self.root_w[s:e].unsqueeze(-1)).squeeze(-1)
         # Storage windows never participate in these source-clip time-axis bins.
         # The final frame is a target, never a reset start (there must be a next frame).
         counts = (lengths + BIN_FRAMES - 2) // BIN_FRAMES

@@ -18,6 +18,11 @@ INDEX_FORMAT = "mjbones_human23_g1_nominal_hdf5_v1_index"
 ARRAY_SHAPES = {"root_pos": 3, "root_quat_w": 4, "joint_pos": 29}
 
 
+def reference_bytes_per_frame(tracked: int) -> int:
+    """Resident reference bytes per frame: root p/quat/v/w, q, qd, root-frame v/w, per-body p/quat/v/w, two int64 maps."""
+    return 4 * (3 + 4 + 3 + 3 + 29 + 29 + 3 + 3 + tracked * (3 + 4 + 3 + 3)) + 16
+
+
 def partition_clips(lengths, world_size):
     """Deterministic longest-first packing, preserving whole source clips."""
     if world_size < 1 or len(lengths) < world_size or any(n < 2 for n in lengths):

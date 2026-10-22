@@ -88,11 +88,13 @@ uv run --frozen python -m supermimic.scripts.evaluate --run_dir logs/index_smoke
 不足 33 帧的动作仍保留，但不能提供完整的默认 32 步想象起点；没有合法起点时会明确报错，不无限重采样。
 
 训练在 `reference.json` 和检查点保存数据指纹，恢复与评估时验证一致性。
-评估默认最多同时运行 256 个环境，逐检查点结果保存为 `*_eval.json`；
+评估默认每批最多 4096 个环境（论文每卡环境数）；多于一批时按段长从长到短分批，
+使同批动作长度接近，减少等待最长段的空转。逐检查点结果保存为 `*_eval.json`；
 轨迹录制仅支持单个评估批次，需显式设置足够的 `--eval_batch_size`。
 已有 `eval.csv` 若没有 `eval_reference.json`，需归档旧结果后再运行，不能混入未标识数据集的历史分数。
 
-当前参考张量仍完整驻留在所选设备，不是流式 GPU 缓存。全量约 50.08 GiB，
+当前参考张量仍完整驻留在所选设备，不是流式 GPU 缓存。根与身体朝向存为四元数，按帧索引时才转成旋转矩阵，
+每帧 1,052 字节（存矩阵时为 1,356）。本索引全量约 38.85 GiB，论文全量 BONES-SEED（264.56 h）约 46.66 GiB，
 还不含仿真、网络、优化器和回放缓冲；显存不足会在分配前报错，不会自动缩减数据。
 开发卡用显式 `--motion_limit`，全量训练前仍需在目标设备检查总显存预算。
 
@@ -128,13 +130,23 @@ uv run --frozen python scripts/check_data.py --motion_index INDEX --num_shards 8
 
 完整动作按帧数从长到短确定性装入当前最小分片，不复制、不丢弃、不拆段；
 每个进程只读取自己动作的帧、计算其速度/FK，并在分配前检查本卡参考显存。
-当前全量 8 分片为每卡 4,956,608～4,956,633 帧，参考张量估算每卡约 6.26 GiB，
+当前全量 8 分片为每卡 4,956,608～4,956,633 帧，参考张量估算每卡约 4.86 GiB，
 不含仿真、回放缓冲、模型、优化器、梯度同步临时张量和 CUDA 工作区。
 CSV 也支持相同的分片规则，但会先在 CPU 解析/重采样所选 CSV。
 
-`--num_envs`、`--wm_batch`、`--pi_batch` 始终是**全局总量**，除法余数按 rank 顺序分配，
+默认 `--batch_scope global`：`--num_envs`、`--wm_batch`、`--pi_batch` 是**全局总量**，除法余数按 rank 顺序分配，
 严格保持总量，梯度按实际本地样本数加权；总量小于进程数时直接报错。
 默认 8 卡对应每卡 512 环境、256 世界模型样本、512 策略样本；3/5/6/7 卡也无需手工整除批大小。
+
+论文表 A.5 的多卡口径不同：每卡 4096 环境、每卡 10×2048 世界模型窗口和 4096 条想象推演，
+数据并行，双卡学习率乘 √2。用 `--batch_scope per_gpu` 把三个批量参数解释为每卡大小，
+用 `--lr_scaling sqrt` 把学习率乘以 √WORLD_SIZE（双卡即论文的 √2；更多卡时是按同一规则外推，论文未给出）：
+
+```bash
+# 论文双卡配置（附录 F.2 的 9.8 h 零失败实验）
+uv run --frozen torchrun --standalone --nproc-per-node=2 -m supermimic.scripts.train --motion_index INDEX --batch_scope per_gpu --lr_scaling sqrt --log_dir logs/two_gpu
+```
+
 每卡动作数和帧数无需整除；动作不足以覆盖各进程，或某分片没有完整想象起点时会协调报错。
 `--motion_limit` 在分片前作用于全局选择，不是每卡各取该数量。
 
@@ -199,6 +211,7 @@ scripts/
   download_data.py
   check_env.py
   check_data.py
+  profile_train.py
 tests/
   test_layout.py
   test_g1_defaults.py
@@ -223,7 +236,7 @@ docs/planning/
 | `supermimic/utils/distributed.py` | 进程/设备绑定、协调错误、梯度平均与全局统计同步 |
 | `supermimic/tasks/tracking/constants.py` | 动作数据关节顺序与跟踪目标，不定义机器人配置 |
 | `supermimic/scripts/evaluate.py` | 附录F.1评估：逐原始段首帧播放、失败计数、两种归一化回报 |
-| `scripts/` | 数据下载、离线数据验证与显式仿真自检 |
+| `scripts/` | 数据下载、离线数据验证、显式仿真自检与训练剖析（`profile_train.py`） |
 | `tests/` | 无GPU的结构、HDF5/FK数值、数据选择与分批评估回归；数值测试使用项目依赖 |
 
 在仓库根目录运行上述命令；也可用`python supermimic/scripts/train.py`或
@@ -245,6 +258,7 @@ uv run --frozen python -B -m unittest discover -s tests -v
 | [docs/planning/rubric.json](docs/planning/rubric.json) | 加权评分树，叶子引用验收标准与帐本ID |
 | [docs/analysis/algorithm.md](docs/analysis/algorithm.md) | 论文算法分析：问题设定、世界模型、一阶策略梯度、critic、加速来源与风险 |
 | [docs/analysis/training_pipeline.md](docs/analysis/training_pipeline.md) | 训练流程图与算法细节：采样、重置采样、世界模型拟合、想象推演BPTT、critic、评估、实现与论文差异 |
+| [docs/analysis/optimization.md](docs/analysis/optimization.md) | 性能优化分析：剖析方法与实测、瓶颈（kernel发射）、按优先级的优化项与验证顺序 |
 | [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) | 第三方代码许可与出处 |
 
 ## 使用约束

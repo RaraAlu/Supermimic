@@ -98,8 +98,11 @@ class IndexedMotionTests(unittest.TestCase):
         torch.testing.assert_close(lib.root_v[:, 0], torch.ones(1085), atol=5e-4, rtol=0)
         torch.testing.assert_close(lib.root_w, torch.zeros_like(lib.root_w))
         torch.testing.assert_close(lib.qd, torch.zeros_like(lib.qd))
-        for key in ("body_p", "body_R", "body_v", "body_w"):
+        for key in ("body_p", "body_v", "body_w"):
             self.assertTrue(torch.isfinite(getattr(lib, key)).all())
+        body_R = lib.body_R[:]
+        self.assertTrue(torch.isfinite(body_R).all())
+        torch.testing.assert_close(body_R @ body_R.transpose(-1, -2), torch.eye(3).expand_as(body_R), atol=1e-5, rtol=0)
         # Both sides of the source's 1024-frame storage split remain one time axis.
         f = lib.clip_start[1] + 1023
         self.assertEqual(lib.future_frames(f[None], 3).tolist(), [[1028, 1029, 1030]])
@@ -194,7 +197,7 @@ class IndexedMotionTests(unittest.TestCase):
         np.savetxt(csv, raw, delimiter=",")
         lib = MotionLib.from_dir(str(self.root), self.kin, "cpu")
         torch.testing.assert_close(lib.root_p[:, 0], torch.arange(6) * 0.02)
-        torch.testing.assert_close(lib.root_R, torch.eye(3).expand(6, 3, 3))
+        torch.testing.assert_close(lib.root_R[:], torch.eye(3).expand(6, 3, 3))
 
     def test_selection_restoration(self):
         args = SimpleNamespace(motion_dir=None, motion_index=None, motion_root=None, motion_limit=None)

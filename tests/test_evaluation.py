@@ -90,6 +90,14 @@ class EvaluationTests(unittest.TestCase):
                 self.assertAlmostEqual(batched["norm_return"], (4 + 0.04) / 5, places=6)
                 self.assertAlmostEqual(batched["norm_return_framew"], 13 / 61, places=6)
 
+    def test_batches_take_longest_clips_first(self):
+        single = FakeEnv(5, self.motion)
+        self.evaluate(single, self.ck)
+        self.assertEqual(single.batches, [[0, 1, 2, 3, 4]])
+        batched = FakeEnv(2, self.motion)
+        self.evaluate(batched, self.ck)
+        self.assertEqual(batched.batches, [[1, 4], [2, 3], [0, 0]])
+
     def test_checkpoint_mismatch_rejected(self):
         self.ck["reference"] = {"fingerprint": "different"}
         with self.assertRaisesRegex(ValueError, "fingerprint mismatch"):

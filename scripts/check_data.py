@@ -18,14 +18,14 @@ parser.add_argument("--report", default=None)
 parser.add_argument("--num_shards", type=int, default=1, help="metadata-only planning for the intended world size")
 args = parser.parse_args()
 
-from supermimic.tasks.tracking.motion_hdf5 import IndexedG1Dataset, partition_clips
+from supermimic.tasks.tracking.motion_hdf5 import IndexedG1Dataset, partition_clips, reference_bytes_per_frame
 from supermimic.tasks.tracking.constants import TRACKED_BODIES
 
 dataset = IndexedG1Dataset(args.motion_index, args.motion_root, args.motion_limit,
                            verify_hashes=args.verify_hashes)
 result = dataset.summary()
 groups = partition_clips([c.length for c in dataset.clips], args.num_shards)
-bytes_per_frame = 4 * (83 + 18 * len(TRACKED_BODIES)) + 16
+bytes_per_frame = reference_bytes_per_frame(len(TRACKED_BODIES))
 result["partition_plan"] = {
     "algorithm": "full_clip_lpt_v1", "world_size": args.num_shards,
     "clips_per_rank": [len(group) for group in groups],

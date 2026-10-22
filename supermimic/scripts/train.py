@@ -49,6 +49,10 @@ parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 parser.add_argument("--compile", type=str, default="auto", choices=["auto", "on", "off"], help="torch.compile (auto: only if triton is installed)")
 parser.add_argument("--device", type=str, default="cuda:0")
+parser.add_argument("--batch_scope", type=str, default="global", choices=["global", "per_gpu"],
+                    help="--num_envs/--wm_batch/--pi_batch are global totals split across ranks, or per-GPU sizes (paper Table A.5)")
+parser.add_argument("--lr_scaling", type=str, default="none", choices=["none", "sqrt"],
+                    help="multiply --lr by sqrt(WORLD_SIZE); the paper uses sqrt(2) x for two GPUs")
 parser.add_argument("--local-rank", "--local_rank", type=int, default=None, help=argparse.SUPPRESS)
 args = parser.parse_args()
 
@@ -75,9 +79,12 @@ dev = parallel.device
 with parallel.coordinated("argument validation"):
     resume_ck = torch.load(args.resume, map_location="cpu") if args.resume else None
     resolve_motion_args(args, resume_ck["args"] if resume_ck else None)
-    local_envs = parallel.local_size(args.num_envs, "num_envs")
-    local_wm_batch = parallel.local_size(args.wm_batch, "wm_batch")
-    local_pi_batch = parallel.local_size(args.pi_batch, "pi_batch")
+    scope = parallel.world_size if args.batch_scope == "per_gpu" else 1
+    global_envs = args.num_envs * scope
+    local_envs = parallel.local_size(global_envs, "num_envs")
+    local_wm_batch = parallel.local_size(args.wm_batch * scope, "wm_batch")
+    local_pi_batch = parallel.local_size(args.pi_batch * scope, "pi_batch")
+    base_lr = args.lr * (math.sqrt(parallel.world_size) if args.lr_scaling == "sqrt" else 1.0)
     if args.buffer_steps < args.wm_window or args.warmup_steps < args.wm_window:
         raise ValueError("buffer_steps and warmup_steps must be at least wm_window")
     if not args.no_critic and local_pi_batch * args.horizon < args.critic_minibatches:
@@ -104,7 +111,8 @@ with parallel.coordinated("run metadata"):
 with parallel.coordinated("shard manifest"):
     shard_path = Path(args.log_dir) / "shards" / f"world_{parallel.world_size}" / f"rank_{parallel.rank:04d}.json"
     local_reference = {**motion.description, "runtime": {"device": dev, "local_envs": local_envs,
-                        "local_wm_batch": local_wm_batch, "local_pi_batch": local_pi_batch}}
+                        "local_wm_batch": local_wm_batch, "local_pi_batch": local_pi_batch,
+                        "batch_scope": args.batch_scope, "global_envs": global_envs, "base_lr": base_lr}}
     shard_path.write_text(json.dumps(local_reference, indent=2, ensure_ascii=False), encoding="utf-8")
 print(f"rank {parallel.rank}/{parallel.world_size} on {dev}: {len(motion.names)} full clips, "
       f"{motion.num_frames} local frames, reference {motion.description['reference_tensor_bytes'] / 1024**3:.3f} GiB", flush=True)
@@ -116,9 +124,9 @@ CRITIC_IN = INV_DIM + CRITIC_EXTRA + GOAL_DIM
 wm = WorldModel().to(dev)
 pi = Policy(OBS_DIM, GOAL_DIM, hist=Hh).to(dev)
 critic = Critic(CRITIC_IN).to(dev)
-opt_wm = torch.optim.Adam(wm.parameters(), lr=args.lr)
-opt_pi = torch.optim.Adam(pi.parameters(), lr=args.lr, betas=(0.9, 0.95))
-opt_v = torch.optim.Adam(critic.parameters(), lr=args.lr)
+opt_wm = torch.optim.Adam(wm.parameters(), lr=base_lr)
+opt_pi = torch.optim.Adam(pi.parameters(), lr=base_lr, betas=(0.9, 0.95))
+opt_v = torch.optim.Adam(critic.parameters(), lr=base_lr)
 start_it, wall_offset, sim_steps = 0, 0.0, 0
 if args.resume:
     ck = resume_ck
@@ -181,13 +189,19 @@ print(f"torch.compile: {'on' if USE_COMPILE else 'off'}", flush=True)
 
 def lr_at(it: int) -> float:
     if it >= args.lr_decay_iters:
-        return args.lr * 0.03
-    return args.lr * (0.03 + 0.97 * 0.5 * (1 + math.cos(math.pi * it / args.lr_decay_iters)))
+        return base_lr * 0.03
+    return base_lr * (0.03 + 0.97 * 0.5 * (1 + math.cos(math.pi * it / args.lr_decay_iters)))
 
 
 def set_requires_grad(m: nn.Module, flag: bool):
     for p in m.parameters():
         p.requires_grad_(flag)
+
+
+# Non-finite world-model/critic gradients are flagged on the GPU and checked once per iteration:
+# a host sync after each of the 10 world-model and 20 critic updates stalls the GPU queue.
+# The check runs before logging and checkpointing, so a corrupted step aborts without being saved.
+nonfinite = torch.zeros(2, dtype=torch.bool, device=dev)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -199,8 +213,7 @@ def wm_update():
     loss.backward()
     average_gradients(wm, local_wm_batch)
     grad_norm = nn.utils.clip_grad_norm_(wm.parameters(), 1.0)
-    if not bool(torch.isfinite(grad_norm)):
-        raise FloatingPointError("non-finite globally averaged world-model gradient")
+    nonfinite[0].logical_or_(~torch.isfinite(grad_norm))
     opt_wm.step()
     m = w["mask"][:, -1]
     error = parallel.reduce(torch.stack(((e_last.detach() * m).sum(), m.sum())))
@@ -305,8 +318,7 @@ def policy_update():
                 v_loss.backward()
                 average_gradients(critic, len(idx))
                 grad_norm = nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
-                if not bool(torch.isfinite(grad_norm)):
-                    raise FloatingPointError("non-finite globally averaged critic gradient")
+                nonfinite[1].logical_or_(~torch.isfinite(grad_norm))
                 opt_v.step()
     if PROFILE:
         torch.cuda.synchronize()
@@ -338,7 +350,7 @@ def collect(n_steps: int, stats: dict):
         S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
         wm.in_norm.update(wm.inputs(S0, out["a"], normalize_xi(out["xi"])))
         wm.out_norm.update(wm.targets(S0, S1))
-        sim_steps += args.num_envs
+        sim_steps += global_envs
         stats["r"].append(out["r"].mean() / 0.1)
         if "ep_len" in out:
             stats["ep_len"].append(out["ep_len"].sum())
@@ -381,6 +393,9 @@ for it in range(start_it, args.iterations):
             torch.cuda.synchronize(); tp3 = time.time()
             print(f"[prof] collect {1e3*(tp1-tp0):.0f} ms ({n} steps) | wm {1e3*(tp2-tp1):.0f} ms | policy+critic {1e3*(tp3-tp2):.0f} ms", flush=True)
         agg["pi"].append(pl), agg["v"].append(vl), agg["ir"].append(ir), agg["gn"].append(gn), agg["surv"].append(surv)
+    if bool(nonfinite.any()):
+        which = [name for name, bad in zip(("world-model", "critic"), nonfinite.tolist()) if bad]
+        raise FloatingPointError(f"non-finite globally averaged {' and '.join(which)} gradient at iteration {it + 1}")
     if (it + 1) % args.log_every == 0:
         keys = list(agg) + ["r"]
         values = [agg[k] if k in agg else stats[k] for k in keys]

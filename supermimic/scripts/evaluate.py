@@ -31,7 +31,7 @@ source.add_argument("--motion_dir", type=str, default=None)
 source.add_argument("--motion_index", type=str, default=None)
 parser.add_argument("--motion_root", type=str, default=None)
 parser.add_argument("--motion_limit", type=int, default=None)
-parser.add_argument("--eval_batch_size", type=int, default=256)
+parser.add_argument("--eval_batch_size", type=int, default=4096, help="parallel environments per batch (paper: 4096 per GPU)")
 parser.add_argument("--every", type=int, default=1, help="evaluate every n-th checkpoint")
 parser.add_argument("--device", type=str, default="cuda:0")
 args = parser.parse_args()
@@ -77,10 +77,17 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     ret = torch.zeros(C, device=dev)
     failed = torch.zeros(C, dtype=torch.bool, device=dev)
     traj = {"root_p": [], "root_quat": [], "q": [], "f": [], "alive": []}
+    # A batch runs until its longest clip ends, so batches take clips longest-first to keep lengths
+    # similar. A single batch keeps library order (trajectory recording relies on it).
+    if C <= env.N:
+        order = torch.arange(C, device=dev)
+    else:
+        order = torch.argsort(motion.clip_len, descending=True, stable=True)
     for start in range(0, C, env.N):
         count = min(env.N, C - start)
+        selected = order[start:start + count]
         # Pad the last batch with an inactive duplicate; it never enters the scores.
-        clips = (ids + start).clamp(max=C - 1)
+        clips = torch.cat((selected, selected[-1:].expand(env.N - count)))
         env.done_eval[:] = False
         env.failed_eval[:] = False
         env.reset(ids, motion.clip_start[clips].clone())
@@ -102,8 +109,8 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
             out = env.step(a)
             batch_ret += torch.where(alive, out["r"], 0.0)
             env.f = torch.minimum(env.f, clip_end - 1)
-        ret[start:start + count] = batch_ret[:count]
-        failed[start:start + count] = env.failed_eval[:count]
+        ret[selected] = batch_ret[:count]
+        failed[selected] = env.failed_eval[:count]
     norm = ret / ((motion.clip_len - 1).float() * MAX_STEP_REWARD)
     res = {
         "norm_return": norm.mean().item(),
@@ -115,7 +122,7 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     }
     if record:
         np.savez_compressed(record, names=np.array(motion.names), **{k: torch.stack(v).numpy() for k, v in traj.items()},
-                            ref_root_p=motion.root_p.cpu().numpy(), ref_root_R=motion.root_R.cpu().numpy(), ref_q=motion.q.cpu().numpy(),
+                            ref_root_p=motion.root_p.cpu().numpy(), ref_root_R=motion.root_R[:].cpu().numpy(), ref_q=motion.q.cpu().numpy(),
                             clip_start=motion.clip_start.cpu().numpy(), clip_len=motion.clip_len.cpu().numpy())  # fmt: skip
     return res
 

@@ -2,7 +2,7 @@
 
 - 论文：arXiv:2610.28480v1（CoRL 2026），正文9页与附录A–G全文通读；阅读日期2026-10-22
 - 范围：算法部分。引用处标注论文节号；标“推断”的段落是本文的判断，不是论文原文。
-- 相关：复现规划见[../planning/plan.md](../planning/plan.md)；训练流程图与逐步实现细节见[training_pipeline.md](training_pipeline.md)
+- 相关：复现规划见[../planning/plan.md](../planning/plan.md)；训练流程图与逐步实现细节见[training_pipeline.md](training_pipeline.md)；性能瓶颈与优化项见[optimization.md](optimization.md)
 
 ## 0. 定位
 
