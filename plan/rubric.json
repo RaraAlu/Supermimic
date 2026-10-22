@@ -1,6 +1,6 @@
 {
   "paper": "arXiv:2610.28480v1",
-  "revision": "v2.1",
+  "revision": "v2.2",
   "target_tier": "T2",
   "tier_views": {
     "T1": ["R.1.1", "R.1.2", "R.1.3", "R.1.4", "R.1.5", "R.1.6", "R.1.7", "R.1.8", "R.1.10", "R.2.1", "R.2.2", "R.3.1", "R.3.2", "R.3.3", "R.3.4", "R.3.5", "R.3.6", "R.3.7", "R.4.1", "R.4.2", "R.5.1", "R.5.2", "R.5.3.1", "R.5.3.2", "R.5.5"],
@@ -25,7 +25,7 @@
           {"id": "R.1.6", "title": "域随机化", "weight": 1, "kind": "code-dev", "criterion_id": "K-6", "ledger_ids": ["L-DR-1", "L-DR-2", "L-DR-3", "L-DR-4", "L-DR-5", "L-DR-6"], "check": "统计1万回合采样；确认摩擦共享一个值、无推力事件", "tolerance": null, "provisional": false},
           {"id": "R.1.7", "title": "仿真时序", "weight": 1, "kind": "code-dev", "criterion_id": "K-7", "ledger_ids": ["L-ENV-2", "L-ENV-10"], "check": "读取运行配置：步长0.005 s，4子步，50 Hz；回合长度按L-ENV-10默认10 s并记录", "tolerance": null, "provisional": false},
           {"id": "R.1.8", "title": "数据过滤实现", "weight": 1, "kind": "code-dev", "criterion_id": "K-8", "ledger_ids": ["L-DATA-6", "L-DATA-7", "L-DATA-8", "L-DATA-9", "L-DATA-10"], "check": "代码审查名称过滤与三条可行性规则的阈值", "tolerance": null, "provisional": false},
-          {"id": "R.1.9", "title": "过滤段数", "weight": 1, "kind": "result", "criterion_id": "K-17", "ledger_ids": ["L-DATA-2", "L-DATA-3", "L-DATA-4"], "check": "运行过滤脚本分步计数：名称过滤去掉12,553段，可行性过滤再去153段", "tolerance": "分步精确：两阶段均须精确匹配；词表补齐后再议偏差", "provisional": false},
+          {"id": "R.1.9", "title": "过滤段数", "weight": 1, "kind": "result", "criterion_id": "K-17", "ledger_ids": ["L-DATA-2", "L-DATA-3", "L-DATA-4", "L-DATA-20"], "check": "运行D-官方的过滤脚本分步计数：名称过滤去掉12,553段，可行性过滤再去153段", "tolerance": "分步精确：两阶段均须精确匹配；词表补齐后再议偏差", "provisional": false},
           {"id": "R.1.10", "title": "LAFAN1子集", "weight": 1, "kind": "result", "criterion_id": "K-18", "ledger_ids": ["L-DATA-13", "L-DATA-14"], "check": "统计50 Hz下的段数与总时长", "tolerance": "段数精确；时长±0.05 h", "provisional": true}
         ]
       },
@@ -34,7 +34,7 @@
         "title": "世界模型",
         "weight": 3,
         "children": [
-          {"id": "R.2.1", "title": "结构与损失", "weight": 3, "kind": "code-dev", "criterion_id": "K-9", "ledger_ids": ["L-ARCH-1", "L-ARCH-2", "L-ARCH-3", "L-ARCH-4", "L-ARCH-5", "L-ARCH-6", "L-ARCH-12", "L-ARCH-13", "L-LOSS-1", "L-LOSS-2", "L-LOSS-3"], "check": "代码审查；单元测试k=8自回归窗口损失与跨回合裁剪；学习头默认共享主干线性头（L-ARCH-13），记录所选消融组合", "tolerance": null, "provisional": false},
+          {"id": "R.2.1", "title": "结构与损失", "weight": 3, "kind": "code-dev", "criterion_id": "K-9", "ledger_ids": ["L-ARCH-1", "L-ARCH-2", "L-ARCH-3", "L-ARCH-4", "L-ARCH-5", "L-ARCH-6", "L-ARCH-12", "L-ARCH-13", "L-DATA-19", "L-LOSS-1", "L-LOSS-2", "L-LOSS-3"], "check": "代码审查；单元测试k=8自回归窗口损失与跨边界裁剪（窗口边界=原始段边界=source_clip_*）；学习头默认共享主干线性头（L-ARCH-13），记录所选消融组合", "tolerance": null, "provisional": false},
           {"id": "R.2.2", "title": "优化配置", "weight": 1, "kind": "code-dev", "criterion_id": "K-10", "ledger_ids": ["L-OPT-1", "L-OPT-2", "L-OPT-3", "L-OPT-4", "L-COMP-3"], "check": "读取配置与日志：Adam、2e-4、10×2048窗口、全局范数1.0、TF32", "tolerance": null, "provisional": false}
         ]
       },
@@ -44,10 +44,10 @@
         "weight": 3,
         "children": [
           {"id": "R.3.1", "title": "策略结构", "weight": 1, "kind": "code-dev", "criterion_id": "K-11", "ledger_ids": ["L-ARCH-7", "L-ARCH-8", "L-ARCH-9", "L-ACT-4"], "check": "代码审查编码器、解码器与32维tanh潜变量", "tolerance": null, "provisional": false},
-          {"id": "R.3.2", "title": "想象推演与BPTT", "weight": 3, "kind": "code-dev", "criterion_id": "K-12", "ledger_ids": ["L-LOSS-4", "L-LOSS-5", "L-LOSS-6", "L-TERM-5", "L-SCHED-7", "L-OPT-6"], "check": "代码审查式(2)；梯度测试确认世界模型参数无梯度；构造跨回合样本验证观测历史与窗口裁剪", "tolerance": null, "provisional": false},
+          {"id": "R.3.2", "title": "想象推演与BPTT", "weight": 3, "kind": "code-dev", "criterion_id": "K-12", "ledger_ids": ["L-LOSS-4", "L-LOSS-5", "L-LOSS-6", "L-TERM-5", "L-DATA-19", "L-SCHED-7", "L-OPT-6"], "check": "代码审查式(2)；梯度测试确认世界模型参数无梯度；构造跨边界样本验证观测历史与窗口裁剪", "tolerance": null, "provisional": false},
           {"id": "R.3.3", "title": "策略优化", "weight": 1, "kind": "code-dev", "criterion_id": "K-13", "ledger_ids": ["L-OPT-5", "L-OPT-7", "L-OPT-8"], "check": "读取配置；单元测试裁剪顺序", "tolerance": null, "provisional": false},
           {"id": "R.3.4", "title": "Critic", "weight": 2, "kind": "code-dev", "criterion_id": "K-14", "ledger_ids": ["L-ARCH-10", "L-LOSS-7", "L-LOSS-8", "L-OPT-9"], "check": "单元测试对照手算GAE目标；代码审查无目标网络", "tolerance": "1e-6", "provisional": false},
-          {"id": "R.3.5", "title": "数据采集与重置采样", "weight": 1, "kind": "code-dev", "criterion_id": "K-15", "ledger_ids": ["L-SCHED-1", "L-ACT-3", "L-SCHED-3", "L-SCHED-8", "L-SCHED-9"], "check": "统计重置来源比例50/40/10", "tolerance": "比例±1%", "provisional": false},
+          {"id": "R.3.5", "title": "数据采集与重置采样", "weight": 1, "kind": "code-dev", "criterion_id": "K-15", "ledger_ids": ["L-SCHED-1", "L-ACT-3", "L-SCHED-3", "L-SCHED-8", "L-SCHED-9", "L-DATA-19"], "check": "统计重置来源比例50/40/10；1 s分箱按原始段时间轴计，窗口重叠不重复计权", "tolerance": "比例±1%", "provisional": false},
           {"id": "R.3.6", "title": "调度", "weight": 1, "kind": "code-dev", "criterion_id": "K-16", "ledger_ids": ["L-SCHED-2", "L-SCHED-4", "L-SCHED-5", "L-SCHED-6"], "check": "读取学习率与采样日志", "tolerance": null, "provisional": false},
           {"id": "R.3.7", "title": "闭环可运行", "weight": 1, "kind": "execution", "criterion_id": "K-19", "ledger_ids": [], "check": "连续1000次迭代，日志含世界模型损失、训练回报与失败数", "tolerance": null, "provisional": false}
         ]
@@ -57,7 +57,7 @@
         "title": "评估协议",
         "weight": 2,
         "children": [
-          {"id": "R.4.1", "title": "评估脚本", "weight": 2, "kind": "execution", "criterion_id": "K-20", "ledger_ids": ["L-EVAL-1", "L-EVAL-2", "L-EVAL-3", "L-EVAL-4"], "check": "代码审查附录F.1协议；LAFAN1 40段跑通并输出两种汇总；全基准由R.6.1记录", "tolerance": null, "provisional": false},
+          {"id": "R.4.1", "title": "评估脚本", "weight": 2, "kind": "execution", "criterion_id": "K-20", "ledger_ids": ["L-EVAL-1", "L-EVAL-2", "L-EVAL-3", "L-EVAL-4", "L-DATA-19"], "check": "代码审查附录F.1协议；以原始段（source_clip_*）为单位、从首帧播放、失败按原始段计数；LAFAN1 40段跑通并输出两种汇总；全基准由R.6.1记录", "tolerance": null, "provisional": false},
           {"id": "R.4.2", "title": "算力记录", "weight": 1, "kind": "execution", "criterion_id": "K-28", "ledger_ids": ["L-COMP-1", "L-COMP-4", "L-EVAL-9"], "check": "日志分列训练与评估GPU时，含GPU型号、迭代数与评估频率", "tolerance": null, "provisional": false}
         ]
       },
@@ -86,8 +86,8 @@
         "title": "T2主结果",
         "weight": 4,
         "children": [
-          {"id": "R.6.1", "title": "基准归一化回报>0.90", "weight": 3, "kind": "result", "criterion_id": "K-26", "ledger_ids": ["L-BASE-1", "L-EVAL-1", "L-EVAL-2", "L-EVAL-3"], "check": "K-20评估脚本，两种汇总都达标记为通过", "tolerance": "阈值>0.90", "provisional": false},
-          {"id": "R.6.2", "title": "基准失败段数≤179", "weight": 2, "kind": "result", "criterion_id": "K-27", "ledger_ids": ["L-BASE-1", "L-BASE-4", "L-EVAL-4"], "check": "K-20评估脚本的失败计数，按表A.8分组；挑战目标≤25", "tolerance": "阈值≤179", "provisional": false},
+          {"id": "R.6.1", "title": "基准归一化回报>0.90", "weight": 3, "kind": "result", "criterion_id": "K-26", "ledger_ids": ["L-BASE-1", "L-EVAL-1", "L-EVAL-2", "L-EVAL-3", "L-DATA-20"], "check": "K-20评估脚本，两种汇总都达标记为通过；仅D-官方结果与论文可比", "tolerance": "阈值>0.90", "provisional": false},
+          {"id": "R.6.2", "title": "基准失败段数≤179", "weight": 2, "kind": "result", "criterion_id": "K-27", "ledger_ids": ["L-BASE-1", "L-BASE-4", "L-EVAL-4", "L-DATA-20"], "check": "K-20评估脚本的失败计数，按表A.8分组；挑战目标≤25；仅D-官方结果与论文可比", "tolerance": "阈值≤179", "provisional": false},
           {"id": "R.6.3", "title": "单卡3 h耗时", "weight": 1, "kind": "result", "criterion_id": "K-30", "ledger_ids": ["L-COMP-2", "L-COMP-4"], "check": "不含评估的训练时间内达到K-26；3 h检查点约9.6万次迭代（L-SCHED-2假设A），学习率处于余弦前段约0.69×基准，属中途检查点", "tolerance": "≤3.75 h（论文3 h的1.25倍）", "provisional": true}
         ]
       },
