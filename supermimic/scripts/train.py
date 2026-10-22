@@ -66,7 +66,7 @@ torch.manual_seed(args.seed)
 networks.AMP_DTYPE = torch.bfloat16 if args.amp == "bf16" else None
 dev = args.device
 os.makedirs(args.log_dir, exist_ok=True)
-json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
+json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w", encoding="utf-8"), indent=2)
 
 kin = G1Kinematics(dev)
 motion = MotionLib.from_dir(args.motion_dir, kin, dev)
@@ -296,7 +296,7 @@ def collect(n_steps: int, stats: dict):
 stats = {"r": [], "ep_len": [], "ep_ret": [], "term": [], "done": []}
 if start_it == 0:
     collect(args.warmup_steps, stats)
-log_f = open(os.path.join(args.log_dir, "train_log.csv"), "a")
+log_f = open(os.path.join(args.log_dir, "train_log.csv"), "a", encoding="utf-8")
 if start_it == 0:
     log_f.write("iteration,wall_h,sim_steps,wm_loss,wm_err8,pi_loss,v_loss,imag_rew,pi_gradnorm,imag_survival,sim_rew,ep_len,ep_ret_norm,term_frac,it_per_s,lr\n")
 t_start = time.time() - wall_offset

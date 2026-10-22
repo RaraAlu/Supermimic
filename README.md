@@ -16,7 +16,30 @@
 - 数据：复用Bote_Teleopit的HDF5格式与MotionLib；观测与奖励按论文重写（D2已定）。
 - 数据/检查点/日志均不入库。
 
+## 平台
+
+Windows与Linux（x86_64，NVIDIA GPU）共用同一份`pyproject.toml`、`uv.lock`与`.python-version`（Python 3.12）；
+`uv sync --frozen`按平台自动选择mjlab、MuJoCo Warp与torch（cu130）的对应轮子，代码不分平台。
+
+| 项 | Windows | Linux |
+| --- | --- | --- |
+| 环境 | `uv sync --frozen` | `uv sync --frozen` |
+| `torch.compile` | 关闭（PyTorch在Windows无Triton，`--compile auto`自动跳过） | 开启（Triton随torch安装） |
+| 已验证 | RTX 4070 Ti SUPER，CUDA | 仅CPU（`--device cpu`）；GPU待在5080/H100上验证 |
+
+同一目录被两个系统共享（例如虚拟机挂载宿主机磁盘）时，两边不能共用`.venv`：
+`.venv`内的解释器路径与目录结构按系统生成，在一边执行`uv sync`或`uv run`会重建另一边的环境。
+此时由Windows使用默认`.venv`，Linux把环境放到共享目录之外：
+
+```bash
+export UV_PROJECT_ENVIRONMENT="$HOME/.venvs/supermimic"
+```
+
+分别克隆的仓库各自使用默认`.venv`即可。
+
 ## 快速开始
+
+以下命令在bash与PowerShell中写法相同，均在仓库根目录运行。
 
 ```bash
 # 数据：下载40段G1重定向LAFAN1（30 fps CSV）
@@ -26,14 +49,13 @@ uv run --frozen python scripts/download_data.py
 uv run --frozen python scripts/check_env.py --num_envs 64
 
 # 冒烟训练（1024 envs × 300 iters，约2.5 min，单卡）
-uv run --frozen python -m supermimic.scripts.train \
-  --num_envs 1024 --iterations 300 --buffer_steps 200 \
-  --warmup_steps 16 --wm_only_iters 50 --wm_batch 1024 --pi_batch 1024 \
-  --ckpt_every 300 --log_every 25 --log_dir logs/smoke
+uv run --frozen python -m supermimic.scripts.train --num_envs 1024 --iterations 300 --buffer_steps 200 --warmup_steps 16 --wm_only_iters 50 --wm_batch 1024 --pi_batch 1024 --ckpt_every 300 --log_every 25 --log_dir logs/smoke
 
 # 评估（附录F.1协议，逐检查点；--watch 常驻监视）
 uv run --frozen python -m supermimic.scripts.evaluate --run_dir logs/smoke --watch
 ```
+
+无GPU时各命令加`--device cpu`，只用于检查流程能否跑通，速度不具参考意义。
 
 ## 实现
 
@@ -98,7 +120,7 @@ docs/planning/
 离线结构检查（不下载数据，不启动仿真或训练）：
 
 ```bash
-python3 -B -m unittest discover -s tests -v
+uv run --frozen python -B -m unittest discover -s tests -v
 ```
 
 ## 文档

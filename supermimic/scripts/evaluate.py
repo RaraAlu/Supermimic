@@ -110,9 +110,9 @@ if args.ckpt:
 out_csv = os.path.join(args.run_dir, "eval.csv")
 done = set()
 if os.path.exists(out_csv):
-    done = {int(l.split(",")[0]) for l in open(out_csv).read().strip().splitlines()[1:]}
+    done = {int(l.split(",")[0]) for l in open(out_csv, encoding="utf-8").read().strip().splitlines()[1:]}
 else:
-    open(out_csv, "w").write("iteration,train_wall_h,saved_at,eval_at,norm_return,norm_return_framew,n_failed,failed\n")
+    open(out_csv, "w", encoding="utf-8").write("iteration,train_wall_h,saved_at,eval_at,norm_return,norm_return_framew,n_failed,failed\n")
 while True:
     ckpts = sorted(glob.glob(os.path.join(args.run_dir, "ckpt_*.pt")))
     todo = [c for c in ckpts if int(os.path.basename(c)[5:11]) not in done]
@@ -124,8 +124,8 @@ while True:
         t0 = time.time()
         res = evaluate(env, ck)
         line = f"{it},{ck['wall_time'] / 3600:.4f},{ck['saved_at']},{time.strftime('%Y-%m-%d %H:%M:%S')},{res['norm_return']:.4f},{res['norm_return_framew']:.4f},{res['n_failed']},{'|'.join(res['failed'])}\n"
-        open(out_csv, "a").write(line)
-        json.dump(res, open(c.replace(".pt", "_eval.json"), "w"), indent=1)
+        open(out_csv, "a", encoding="utf-8").write(line)
+        json.dump(res, open(c.replace(".pt", "_eval.json"), "w", encoding="utf-8"), indent=1)
         print(f"[eval] it {it} ({ck['wall_time'] / 3600:.2f} h): norm return {res['norm_return']:.4f}, failed {res['n_failed']}/{C} ({time.time() - t0:.0f}s)", flush=True)
         done.add(it)
     if not args.watch:
