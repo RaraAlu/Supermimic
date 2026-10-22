@@ -12,7 +12,7 @@
 - 阶段：实现v0.1.0（训练闭环、评估、数据/自检脚本），规划v2.2。
 - 目标层级：T2，即在129,514段基准上复现主结果；T3除实机外全部排期。
 - 算力：8卡H100服务器负责训练与评估；RTX 5080与RTX 4070 Ti SUPER负责开发。
-- 依赖版本：以`pyproject.toml`与`uv.lock`为准（mjlab 1.6.0、mujoco-warp 3.11.0、warp-lang 1.18.0、torch 2.14.1+cu130）；规划D4仍记1.4.0，待裁决同步。
+- 依赖版本：以`pyproject.toml`与`uv.lock`为准（mjlab 1.6.0、mujoco-warp 3.11.0、warp-lang 1.18.0、torch 2.14.1+cu130），规划D4已同步。
 - 数据：复用Bote_Teleopit的HDF5格式与MotionLib；观测与奖励按论文重写（D2已定）。
 - 数据/检查点/日志均不入库。
 
