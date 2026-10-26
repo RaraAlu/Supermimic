@@ -56,6 +56,8 @@ parser.add_argument("--cuda_graph", type=str, default="auto", choices=["auto", "
                          "(auto: single CUDA process without torch.compile or SM_PROFILE; multi-GPU needs on)")
 parser.add_argument("--cuda_graph_critic", type=str, default="on", choices=["on", "off"],
                     help="with CUDA graphs on, also replay the critic update (GAE targets and its minibatch steps)")
+parser.add_argument("--cuda_graph_env", type=str, default="on", choices=["on", "off"],
+                    help="with CUDA graphs on, also replay the simulator step's reward and termination")
 parser.add_argument("--device", type=str, default="cuda:0")
 parser.add_argument("--batch_scope", type=str, default="global", choices=["global", "per_gpu"],
                     help="--num_envs/--wm_batch/--pi_batch are global totals split across ranks, or per-GPU sizes (paper Table A.5)")
@@ -68,7 +70,6 @@ import importlib.util
 
 import torch
 import torch.nn as nn
-from torch.utils._pytree import tree_map
 
 from supermimic.tasks.tracking.env import TrackingSim
 from supermimic.tasks.tracking.mdp import CRITIC_EXTRA, INV_DIM, MDP, OBS_DIM, invariant_features, normalize_xi, unflatten_state
@@ -78,6 +79,7 @@ from supermimic.tasks.tracking.rl.buffer import ReplayBuffer
 from supermimic.tasks.tracking.rl.networks import Critic, Policy, WorldModel
 from supermimic.utils.kinematics import G1Kinematics
 from supermimic.utils.distributed import DistributedContext, average_gradients
+from supermimic.utils.cuda_graph import GraphedCall as CudaGraphCall
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -250,36 +252,9 @@ def set_requires_grad(m: nn.Module, flag: bool):
 nonfinite = torch.zeros(3, dtype=torch.bool, device=dev)
 
 
-class GraphedCall:
-    """Run fn eagerly for its first calls, then capture it once as a CUDA graph and replay it.
-
-    Tensor inputs are copied into static buffers before each replay and outputs are cloned, so a call
-    returns what the eager call would. fn must keep static shapes and must not sync with the host;
-    random ops draw from the default CUDA generator, which each replay advances like an eager call.
-    The eager calls are real updates that also warm up cuBLAS and the allocator before capture.
-    """
-
-    def __init__(self, fn, eager_calls: int = 3, enabled: bool | None = None):
-        self.fn, self.eager_calls, self.calls, self.graph = fn, eager_calls, 0, None
-        self.enabled = USE_GRAPH if enabled is None else enabled
-
-    def __call__(self, *inputs):
-        if not self.enabled or self.calls < self.eager_calls:
-            self.calls += 1
-            return self.fn(*inputs)
-        if self.graph is None:
-            self.static_in = tree_map(torch.clone, inputs)
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()  # return the eager calls' cached blocks before the graph takes its own pool
-            self.graph = torch.cuda.CUDAGraph()
-            # records only; the replay below performs this call. With NCCL, the communicator's watchdog thread
-            # keeps querying CUDA events during capture, so only this thread's calls are checked.
-            mode = "thread_local" if parallel.enabled else "global"
-            with torch.cuda.graph(self.graph, capture_error_mode=mode):
-                self.static_out = self.fn(*self.static_in)
-        tree_map(lambda dst, src: dst.copy_(src), self.static_in, inputs)
-        self.graph.replay()
-        return tree_map(torch.clone, self.static_out)
+def GraphedCall(fn, eager_calls: int = 3, enabled: bool | None = None):
+    """CUDA-graph replay of a training step (supermimic.utils.cuda_graph); enabled defaults to --cuda_graph."""
+    return CudaGraphCall(fn, eager_calls, USE_GRAPH if enabled is None else enabled, thread_local=parallel.enabled)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -449,7 +424,8 @@ def policy_update():
 
 
 # ------------------------------------------------------------------------------------------------
-env = TrackingSim(local_envs, motion, mdp, dev, gamma=args.gamma, parallel=parallel)
+env = TrackingSim(local_envs, motion, mdp, dev, gamma=args.gamma, parallel=parallel,
+                  graph_reward=USE_GRAPH and args.cuda_graph_env == "on")
 buffer = ReplayBuffer(args.buffer_steps, local_envs, dev)
 obs_hist = torch.zeros(local_envs, Hh, OBS_DIM, device=dev)
 

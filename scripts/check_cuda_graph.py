@@ -1,4 +1,5 @@
-"""Check that CUDA-graph replay of the world-model, policy and critic steps matches eager execution bitwise.
+"""Check that CUDA-graph replay of the world-model, policy and critic steps and of the simulator's reward and
+termination matches eager execution bitwise.
 
 Builds the training state with ``supermimic.scripts.train --iterations 0 --cuda_graph on`` (a short warmup
 collection only), then on each rank runs one eager step and one graph replay from identical model, optimizer
@@ -20,6 +21,7 @@ sys.path.insert(0, REPO)
 import torch
 from torch.utils._pytree import tree_map
 
+from supermimic.utils.cuda_graph import GraphedCall
 from supermimic.utils.distributed import DistributedContext
 
 # train.py tears down the process group when it finishes; keep it alive for the comparisons below
@@ -87,5 +89,16 @@ if g["GRAPH_CRITIC"]:
     sr(wm, True), sr(critic, True)
     rews, dones, xi_n, S_c, f_c, g_c = out[4:10]
     ok &= compare("critic_step", critic, g["opt_v"], (rews, dones, xi_n, S_c, f_c, g_c))
+env = g["env"]
+if env._reward_termination.enabled:
+    S1, f1 = env.state(), env.f + 1
+    a, a_prev = torch.randn(env.N, 29, device=env.device), env.a_prev.clone()
+    eager_out = env._reward_termination_eager(S1, f1, a, a_prev)
+    graphed = GraphedCall(env._reward_termination_eager, eager_calls=0, thread_local=g["parallel"].enabled)
+    graphed(S1, f1, a, a_prev)  # capture, then replay
+    graph_out = graphed(S1, f1, a, a_prev)
+    same = all(torch.equal(x, y) for x, y in zip(tensors(eager_out), tensors(graph_out)))
+    print(f"rank {rank} env reward/termination: outputs bitwise equal {same} ({len(tensors(eager_out))} tensors)", flush=True)
+    ok &= same
 close(g["parallel"])
 sys.exit(0 if ok else 1)

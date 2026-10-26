@@ -21,6 +21,7 @@ from mjlab.utils.lab_api.string import resolve_matching_names_values
 from supermimic.tasks.tracking.constants import FOOT_GEOMS, G1_JOINT_NAMES
 from supermimic.tasks.tracking.mdp import MAX_STEP_REWARD, MDP, flatten_state
 from supermimic.tasks.tracking.motion import CONTROL_DT, MotionLib
+from supermimic.utils.cuda_graph import GraphedCall
 from supermimic.utils.rotations import mat_to_quat, quat_to_mat, so3_exp
 
 NUM_SUBSTEPS = 4
@@ -44,7 +45,7 @@ class TrackingSim:
 
     def __init__(self, num_envs: int, motion: MotionLib, mdp: MDP, device: str, gamma: float = 0.99,
                  eval_mode: bool = False, max_episode_steps: int = 500, reset_noise: bool = True,
-                 parallel=None):  # fmt: skip
+                 parallel=None, graph_reward: bool = False):  # fmt: skip
         self.device = dev = device
         self.parallel = parallel if parallel is not None and parallel.enabled else None
         scene_cfg = SceneCfg(
@@ -70,6 +71,9 @@ class TrackingSim:
 
         self.N = num_envs
         self.motion, self.mdp, self.gamma = motion, mdp, gamma
+        # reward and termination of each step: hundreds of small FK kernels, replayed as one CUDA graph if asked
+        self._reward_termination = GraphedCall(self._reward_termination_eager, enabled=graph_reward,
+                                               thread_local=self.parallel is not None)
         self.eval_mode = eval_mode
         self.max_episode_steps = max_episode_steps if not eval_mode else 10**9
         self.reset_noise = reset_noise and not eval_mode
@@ -195,6 +199,10 @@ class TrackingSim:
         if not self.eval_mode:
             self.xi[env_ids, 1:30] = torch.empty(n, 29, device=dev).uniform_(-0.01, 0.01)
 
+    def _reward_termination_eager(self, S1, f1, a, a_prev):
+        r, terms = self.mdp.reward(S1, f1, a, a_prev, terms=True)
+        return r, terms, self.mdp.termination(S1, f1)
+
     def refresh(self):
         """Recompute derived quantities (body poses, contacts) after writing states."""
         self.sim.forward()
@@ -214,8 +222,7 @@ class TrackingSim:
             self.scene.update(PHYSICS_DT)
         S1 = self.state()
         f1 = f + 1
-        r, terms = self.mdp.reward(S1, f1, a, a_prev, terms=True)
-        term = self.mdp.termination(S1, f1)
+        r, terms, term = self._reward_termination(S1, f1, a, a_prev)
         clip_end = self.motion.clip_end[self.motion.clip_id[f]]
         timeout = (f1 >= clip_end) | (ep_step + 1 >= self.max_episode_steps)
         done = term | timeout
