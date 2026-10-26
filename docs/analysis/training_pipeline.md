@@ -171,41 +171,64 @@ flowchart TD
 
 要点：
 
-- **动作映射**（论文附录A）： $q^{\mathrm{sp}} = \alpha a + q^0$ ，其中 $\alpha = 0.25\, \tau_{\max} / K_p$ （力矩上限除以刚度），取自mjlab内置G1配置。
-  实现把关节标定偏置 $\Delta q^0$ 同时加在目标和观测上，即 $q^{\mathrm{sp}} = q^0 + \Delta q^0 + \alpha a$ ，
-  观测为 $q - q^0 - \Delta q^0$ ：机器人以为自己在 $q - \Delta q^0$ ，这正是“标定误差”的含义。
-- **奖励**（论文表A.2，`MDP.reward`）：
+**动作映射**（论文附录A）： $`q^{\mathrm{sp}} = \alpha a + q^0`$ ，其中 $`\alpha = 0.25\, \tau_{\max} / K_p`$ （力矩上限除以刚度），取自mjlab内置G1配置。
+  实现把关节标定偏置 $`\Delta q^0`$ 同时加在目标和观测上，即 $`q^{\mathrm{sp}} = q^0 + \Delta q^0 + \alpha a`$ ，
+  观测为 $`q - q^0 - \Delta q^0`$ ：机器人以为自己在 $`q - \Delta q^0`$ ，这正是“标定误差”的含义。
 
-  $$
-  r_{t+1} = \Delta t \left( r^{\mathrm{track}} + r^{\mathrm{reg}} \right), \quad \Delta t = 0.02
-  $$
+**奖励**（论文表A.2，`MDP.reward`）：
 
-  $$
-  r^{\mathrm{track}} = e^{-\bar{e}_{\mathrm{pos}}/0.3^2} + e^{-\bar{e}_{\mathrm{ori}}/0.4^2} + e^{-\bar{e}_{\mathrm{lv}}/1.0^2} + e^{-\bar{e}_{\mathrm{av}}/3.14^2} + 0.5\, e^{-e_{\mathrm{rp}}/0.3^2} + 0.5\, e^{-e_{\mathrm{ro}}/0.4^2}
-  $$
+```math
+r_{t+1} = \Delta t \left( r^{\mathrm{track}} + r^{\mathrm{reg}} \right), \quad \Delta t = 0.02
+```
 
-  $$
-  r^{\mathrm{reg}} = -0.1 \lVert a_t - a_{t-1} \rVert^2 - 2 \sum_j \left[ \max(0, q_j - q_j^{\max}) + \max(0, q_j^{\min} - q_j) \right]
-  $$
+```math
+\begin{aligned}
+r^{\mathrm{track}}
+&= e^{-\bar{e}_{\mathrm{pos}}/0.3^2}
+   + e^{-\bar{e}_{\mathrm{ori}}/0.4^2} \\
+&\quad + e^{-\bar{e}_{\mathrm{lv}}/1.0^2}
+   + e^{-\bar{e}_{\mathrm{av}}/3.14^2} \\
+&\quad + 0.5\,e^{-e_{\mathrm{rp}}/0.3^2}
+   + 0.5\,e^{-e_{\mathrm{ro}}/0.4^2}.
+\end{aligned}
+```
 
-  $\bar{e}$ 为14个跟踪身体的平均平方误差（位置、朝向测地角、线速度、角速度）， $e_{\mathrm{rp}}$ 、 $e_{\mathrm{ro}}$ 为根的位置与朝向误差；
-  $q_j^{\max}$ 、 $q_j^{\min}$ 是按0.9系数收缩后的软限位。追踪项满分5，所以单步最大奖励为 $5 \Delta t = 0.1$ 。
-  通俗地说：六项打分衡量“像不像”，两项惩罚防止“乱来”，乘 $\Delta t$ 让每秒能拿的分与控制频率无关；指数核的直觉、“重新锚定”的推导和完整算例见[formulas.md](formulas.md)第2节。
+```math
+\begin{aligned}
+r^{\mathrm{reg}}
+&= -0.1\lVert a_t-a_{t-1}\rVert^2 \\
+&\quad -2\sum_j\bigl[
+  \max(0,q_j-q_j^{\max}) \\
+&\qquad\qquad +\max(0,q_j^{\min}-q_j)\bigr].
+\end{aligned}
+```
+
+  $`\bar{e}`$ 为14个跟踪身体的平均平方误差（位置、朝向测地角、线速度、角速度）， $`e_{\mathrm{rp}}`$ 、 $`e_{\mathrm{ro}}`$ 为根的位置与朝向误差；
+  $`q_j^{\max}`$ 、 $`q_j^{\min}`$ 是按0.9系数收缩后的软限位。追踪项满分5，所以单步最大奖励为 $`5 \Delta t = 0.1`$ 。
+  通俗地说：六项打分衡量“像不像”，两项惩罚防止“乱来”，乘 $`\Delta t`$ 让每秒能拿的分与控制频率无关；指数核的直觉、“重新锚定”的推导和完整算例见[formulas.md](formulas.md)第2节。
   身体位置与朝向误差先把参考身体“重新锚定”到机器人根的水平位置和偏航（BeyondMimic做法），
   所以只惩罚姿态和相对位置，不惩罚整体平移漂移；全局漂移由根位置项惩罚。
-- **终止**（论文附录A）： $e_z = \lvert z_{\mathrm{ref}} - z \rvert > 0.25\ \mathrm{m}$ ，或 $e_{\mathrm{tilt}} = \lvert (R_{\mathrm{ref}})_{33} - R_{33} \rvert > 0.8$ 。
+
+**终止**（论文附录A）： $`e_z = \lvert z_{\mathrm{ref}} - z \rvert > 0.25\ \mathrm{m}`$ ，或 $`e_{\mathrm{tilt}} = \lvert (R_{\mathrm{ref}})_{33} - R_{33} \rvert > 0.8`$ 。
   后者正是“参考与机器人根系中重力方向z分量之差”，直立参考下约78°（推导见[formulas.md](formulas.md)第3.1节）。
-- **超时**：到达段末或回合满500步（10 s）。超时不是失败。
-- **分箱回报估计**：回合结束时，用折扣回报更新起始分箱：
 
-  $$
-  G = \sum_{t=0}^{T-1} \gamma^t r_{t+1} + \mathbb{1}_{\mathrm{timeout}} \cdot \frac{\gamma^T \bar{r}}{1 - \gamma}, \qquad G_b \leftarrow 0.8\, G_b + 0.2\, G
-  $$
+**超时**：到达段末或回合满500步（10 s）。超时不是失败。
 
-  $T$ 为回合步数， $\bar{r}$ 为该回合平均每步奖励；超时时 $\mathbb{1}_{\mathrm{timeout}} = 1$ ，终止时为0。
+**分箱回报估计**：回合结束时，用折扣回报更新起始分箱：
+
+```math
+\begin{aligned}
+G &= \sum_{t=0}^{T-1} \gamma^t r_{t+1} + \mathbb{1}_{\mathrm{timeout}} \cdot \frac{\gamma^T \bar{r}}{1 - \gamma} \\
+&G_b \leftarrow 0.8\, G_b + 0.2\, G
+\end{aligned}
+```
+
+  $`T`$ 为回合步数， $`\bar{r}`$ 为该回合平均每步奖励；超时时 $`\mathbb{1}_{\mathrm{timeout}} = 1`$ ，终止时为0。
   超时的回合用平均奖励把回报外推到无穷远，避免短回合的分箱被误判为“难”（等比数列推导见[formulas.md](formulas.md)第8.2节）。
-  若同一步有多个回合在同一分箱结束，先取这些回合的 $G$ 均值，再对该分箱更新一次EMA；没有结束回合的分箱不变。
-- **多卡采样**：每卡只跑本地环境，`sim_steps`按全局环境数累计；回合结束统计在记日志时跨卡汇总，并按结束回合数加权。
+  若同一步有多个回合在同一分箱结束，先取这些回合的 $`G`$ 均值，再对该分箱更新一次EMA；没有结束回合的分箱不变。
+
+**多卡采样**：每卡只跑本地环境，`sim_steps`按全局环境数累计；回合结束统计在记日志时跨卡汇总，并按结束回合数加权。
+
 
 ## 4. 按回报重置采样（论文附录D.1）
 
@@ -222,13 +245,19 @@ flowchart TD
 
 抽样分布：
 
-$$
-P(b) = \frac{0.5}{N_{\mathrm{bin}}} + 0.4\, \mathrm{softmax}_b\left( -25\, \frac{G_b}{G_{\max}} \right) + 0.1\, \frac{\bar{w}_b}{\sum_{b'} \bar{w}_{b'}}, \qquad G_{\max} = \frac{0.1}{1 - 0.99} = 10
-$$
+```math
+\begin{aligned}
+P(b)
+&= \frac{0.5}{N_{\mathrm{bin}}}
+   +0.4\,\mathrm{softmax}_b\left(-25\,\frac{G_b}{G_{\max}}\right) \\
+&\quad +0.1\,\frac{\bar{w}_b}{\sum_{b'}\bar{w}_{b'}}, \\
+G_{\max} &= \frac{0.1}{1-0.99}=10.
+\end{aligned}
+```
 
-其中 $\bar{w}_b \leftarrow 0.999\, \bar{w}_b + 0.001\, \mathrm{softmax}_b(\cdot)$ 是历史权重。系数−25有多“尖”、三种成分各起什么作用，见[formulas.md](formulas.md)第8.3–8.4节的算例。
+其中 $`\bar{w}_b \leftarrow 0.999\, \bar{w}_b + 0.001\, \mathrm{softmax}_b(\cdot)`$ 是历史权重。系数−25有多“尖”、三种成分各起什么作用，见[formulas.md](formulas.md)第8.3–8.4节的算例。
 
-- $G_b$ 越低（越难），softmax权重越大；系数−25让分布很尖锐，难点会被集中练习。
+- $`G_b`$ 越低（越难），softmax权重越大；系数−25让分布很尖锐，难点会被集中练习。
 - 10%的历史权重让学会之后的难点仍保留一定练习量，防止遗忘。
 - 多卡时softmax的max与分母、历史权重的EMA都按全局归约计算，但每卡只在本地分片的分箱上按条件分布抽样；
   这样各卡同步更新，却不保证与单卡全库自适应采样、回放轨迹或随机序列逐步等价。
@@ -261,16 +290,24 @@ flowchart TD
 
 网络不直接输出下一状态，而是输出在机器人局部坐标系中的增量，再积分回世界系：
 
-$$
-p' = p + H_{\mathrm{yaw}}\, \Delta p, \qquad R' = R \exp\left( [\Delta\theta]_\times \right)
-$$
+```math
+\begin{aligned}
+p' &= p + H_{\mathrm{yaw}}\, \Delta p \\
+R' &= R \exp\left( [\Delta\theta]_\times \right)
+\end{aligned}
+```
 
-$$
-v' = v + R\, \Delta v, \qquad w' = w + R\, \Delta w, \qquad q' = q + \Delta q, \qquad \dot{q}' = \dot{q} + \Delta \dot{q}
-$$
+```math
+\begin{aligned}
+v' &= v + R\, \Delta v \\
+w' &= w + R\, \Delta w \\
+q' &= q + \Delta q \\
+\dot{q}' &= \dot{q} + \Delta \dot{q}
+\end{aligned}
+```
 
-$H_{\mathrm{yaw}}$ 是只保留偏航的旋转（水平位移在偏航系中表示，与朝向无关）； $\Delta\theta$ 是根坐标系中的旋转向量，
-$[\cdot]_\times$ 为反对称矩阵； $\Delta v$ 、 $\Delta w$ 是根坐标系中的速度增量（罗德里格斯公式与逐项解释见[formulas.md](formulas.md)第5.4节）。
+$`H_{\mathrm{yaw}}`$ 是只保留偏航的旋转（水平位移在偏航系中表示，与朝向无关）； $`\Delta\theta`$ 是根坐标系中的旋转向量，
+$`[\cdot]_\times`$ 为反对称矩阵； $`\Delta v`$ 、 $`\Delta w`$ 是根坐标系中的速度增量（罗德里格斯公式与逐项解释见[formulas.md](formulas.md)第5.4节）。
 
 这样做的好处：
 
@@ -283,11 +320,11 @@ $[\cdot]_\times$ 为反对称矩阵； $\Delta v$ 、 $\Delta w$ 是根坐标系
 - 误差在上一状态的局部坐标系中计算，与目标增量的定义一致。
 - 每个分量除以输出增量的标准差，并设下限：位置3 mm、朝向0.005 rad、线速度0.02 m/s、角速度0.05 rad/s、
   q 3 mrad、q̇ 0.05 rad/s。下限防止几乎不变的分量（例如静止关节）被除以极小的数而主导损失。
-- 写成公式（ $B$ 个窗口， $m_{ij}$ 为掩码， $e_{ij} \in \mathbb{R}^{70}$ 为第 $i$ 个窗口第 $j$ 步的局部坐标系误差， $\sigma$ 为输出增量标准差， $\epsilon$ 为上述下限）：
+写成公式（ $`B`$ 个窗口， $`m_{ij}`$ 为掩码， $`e_{ij} \in \mathbb{R}^{70}`$ 为第 $`i`$ 个窗口第 $`j`$ 步的局部坐标系误差， $`\sigma`$ 为输出增量标准差， $`\epsilon`$ 为上述下限）：
 
-  $$
-  \mathcal{L} = \frac{1}{B} \sum_{i=1}^{B} \sum_{j=1}^{k} m_{ij} \cdot \frac{1}{70} \sum_{d=1}^{70} \left( \frac{e_{ij,d}}{\max(\sigma_d, \epsilon_d)} \right)^2
-  $$
+```math
+\mathcal{L} = \frac{1}{B} \sum_{i=1}^{B} \sum_{j=1}^{k} m_{ij} \cdot \frac{1}{70} \sum_{d=1}^{70} \left( \frac{e_{ij,d}}{\max(\sigma_d, \epsilon_d)} \right)^2
+```
 
 - 论文式(1)还有奖励、观测、终止三项；本实现三者都是解析头，所以只有状态项（误差归一化、掩码与论文式(1)的逐项对照见[formulas.md](formulas.md)第5.5–5.6节）。
 - 日志里的`wm_err8`是窗口最后一步（第8步）的归一化误差，对应论文图3(c)的指标形式，但“名义误差”的定义不同。
@@ -337,37 +374,49 @@ flowchart TD
 ```
 
 “冻结”指参数不求梯度（`requires_grad=False`），但梯度仍然穿过它们对输入的雅可比。
-对 $\theta$ 的梯度沿三条路径回传：
+对 $`\theta`$ 的梯度沿三条路径回传：
 
-1. **动作 → 动力学**： $a_t \to f_\omega \to \hat{S}_{t+1} \to$ 之后所有奖励和终止。
-2. **状态 → 观测 → 策略**： $\hat{S}_t \to \mathrm{obs} \to \pi_\theta \to a_t$ 。策略看到的观测本身取决于它之前的动作。
-3. **动作平滑项**：奖励里的 $\lVert a_t - a_{t-1} \rVert^2$ 直接连着相邻两步的动作。
+1. **动作 → 动力学**： $`a_t \to f_\omega \to \hat{S}_{t+1} \to`$ 之后所有奖励和终止。
+2. **状态 → 观测 → 策略**： $`\hat{S}_t \to \mathrm{obs} \to \pi_\theta \to a_t`$ 。策略看到的观测本身取决于它之前的动作。
+3. **动作平滑项**：奖励里的 $`\lVert a_t - a_{t-1} \rVert^2`$ 直接连着相邻两步的动作。
 
 ### 6.3 目标函数的计算
 
 实现先只展开动力学，32步结束后再把所有 (H × B) 个状态一次性批量算奖励和软终止，因为奖励不会回灌到动力学：
 
-软终止（用sigmoid平滑两个硬阈值， $\sigma$ 为sigmoid， $e_z$ 、 $e_{\mathrm{tilt}}$ 由 $\hat{S}_{t+1}$ 与参考帧 $f_{t+1}$ 算出）：
+软终止（用sigmoid平滑两个硬阈值， $`\sigma`$ 为sigmoid， $`e_z`$ 、 $`e_{\mathrm{tilt}}`$ 由 $`\hat{S}_{t+1}`$ 与参考帧 $`f_{t+1}`$ 算出）：
 
-$$
-\hat{d}_{t+1} = 1 - \left( 1 - \sigma\left( \frac{e_z - 0.25}{0.02} \right) \right) \left( 1 - \sigma\left( \frac{e_{\mathrm{tilt}} - 0.8}{0.04} \right) \right)
-$$
+```math
+\begin{aligned}
+p_z &= \sigma\left(\frac{e_z-0.25}{0.02}\right), \\
+p_{\mathrm{tilt}} &= \sigma\left(\frac{e_{\mathrm{tilt}}-0.8}{0.04}\right), \\
+\hat{d}_{t+1} &= 1-(1-p_z)(1-p_{\mathrm{tilt}}).
+\end{aligned}
+```
 
 存活权重累乘：
 
-$$
-\hat{c}_0 = 1, \qquad \hat{c}_{t+1} = \hat{c}_t \left( 1 - \hat{d}_{t+1} \right)
-$$
+```math
+\begin{aligned}
+\hat{c}_0 &= 1 \\
+\hat{c}_{t+1} &= \hat{c}_t \left( 1 - \hat{d}_{t+1} \right)
+\end{aligned}
+```
 
-目标与损失（ $\hat{r}_{t+1}$ 由 $\hat{S}_{t+1}$ 、 $a_t$ 、 $a_{t-1}$ 算出）：
+目标与损失（ $`\hat{r}_{t+1}`$ 由 $`\hat{S}_{t+1}`$ 、 $`a_t`$ 、 $`a_{t-1}`$ 算出）：
 
-$$
-\hat{J} = \sum_{t=0}^{31} 0.99^t\, \hat{c}_t\, \hat{r}_{t+1} + 0.99^{32}\, \hat{c}_{32}\, V_\psi(\hat{S}_{32}, g_{32}, \xi), \qquad \mathrm{loss} = -\mathrm{mean}(\hat{J})
-$$
+```math
+\begin{aligned}
+\hat{J} &= \sum_{t=0}^{31} 0.99^t\,\hat{c}_t\,\hat{r}_{t+1} \\
+&\quad +0.99^{32}\,\hat{c}_{32}\,
+V_\psi(\hat{S}_{32},g_{32},\xi), \\
+\mathrm{loss} &= -\mathrm{mean}(\hat{J})
+\end{aligned}
+```
 
 sigmoid的取值表、存活权重的算例，以及“自举项约占目标73%”的计算，见[formulas.md](formulas.md)第3.2–3.3节与第6.2节。
 
-更新步骤：反向传播 → 跨卡按本地样本数加权平均 → 全局范数裁剪1.0 → 逐元素裁剪到±0.1 → 范数为有限值时才执行Adam（ $\beta = (0.9, 0.95)$ ）。
+更新步骤：反向传播 → 跨卡按本地样本数加权平均 → 全局范数裁剪1.0 → 逐元素裁剪到±0.1 → 范数为有限值时才执行Adam（ $`\beta = (0.9, 0.95)`$ ）。
 
 ## 7. ③' Critic更新
 
@@ -380,15 +429,19 @@ flowchart TD
     FIX --> EP["5轮：每轮打乱后分4个小批<br/>MSE → 跨卡加权平均 → 全局范数裁剪1.0 → Adam"]
 ```
 
-GAE目标（论文式3，从 $t = 31$ 反向递推到0）：
+GAE目标（论文式3，从 $`t = 31`$ 反向递推到0）：
 
-$$
-\hat{R}_{32} = V_{32}, \qquad \hat{R}_t = \hat{r}_{t+1} + \gamma \left( 1 - \hat{d}_{t+1} \right) \left[ (1 - \lambda) V_{t+1} + \lambda \hat{R}_{t+1} \right], \qquad \gamma = 0.99,\ \lambda = 0.95
-$$
+```math
+\begin{aligned}
+\hat{R}_{32} &= V_{32} \\
+\hat{R}_t &= \hat{r}_{t+1} + \gamma \left( 1 - \hat{d}_{t+1} \right) \left[ (1 - \lambda) V_{t+1} + \lambda \hat{R}_{t+1} \right] \\
+\gamma &= 0.99,\ \lambda = 0.95
+\end{aligned}
+```
 
-$$
+```math
 \mathcal{L}_V(\psi) = \mathrm{mean}_{t, b} \left( V_\psi(X_{t,b}) - \hat{R}_{t,b} \right)^2
-$$
+```
 
 λ取0和1两个极端时公式退化成什么、为什么有效视野约17步，见[formulas.md](formulas.md)第7.3节。
 
@@ -443,13 +496,15 @@ flowchart TD
     E3 --> E6["失败 = 段末之前触发训练终止条件"]
 ```
 
-第 $c$ 段动作长 $L_c$ 帧，评估时最多走 $L_c - 1$ 步：
+第 $`c`$ 段动作长 $`L_c`$ 帧，评估时最多走 $`L_c - 1`$ 步：
 
-$$
-\mathrm{NR}_c = \frac{\sum_t r_t}{(L_c - 1) \times 0.1}, \qquad
-\mathrm{NR}_{\mathrm{mean}} = \frac{1}{C} \sum_c \mathrm{NR}_c, \qquad
-\mathrm{NR}_{\mathrm{frame}} = \frac{\sum_c \sum_t r_t}{0.1 \sum_c (L_c - 1)}
-$$
+```math
+\begin{aligned}
+\mathrm{NR}_c &= \frac{\sum_t r_t}{(L_c - 1) \times 0.1} \\
+\mathrm{NR}_{\mathrm{mean}} &= \frac{1}{C} \sum_c \mathrm{NR}_c \\
+\mathrm{NR}_{\mathrm{frame}} &= \frac{\sum_c \sum_t r_t}{0.1 \sum_c (L_c - 1)}
+\end{aligned}
+```
 
 两种汇总的差别可以很大，算例见[formulas.md](formulas.md)第10.2节。
 

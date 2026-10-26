@@ -8,7 +8,7 @@
 表A.5将环境数明确标为每GPU 4096；世界模型写作“10 batches of 2048 windows per update”，
 策略写作“4096 imagined rollouts per update”。源文件没有额外的全局/每卡说明。
 因此分别测量全局批量与每卡批量两种解释；两者均不能冒充作者另行确认。
-双卡学习率为`2e-4 * sqrt(2)`；32万次迭代、25万次余弦衰减至0.03倍、UTD=0.4。
+双卡学习率为 $`\alpha_2=\sqrt{2}\,(2\times10^{-4})\approx2.8284\times10^{-4}`$；32万次迭代、25万次余弦衰减至0.03倍、UTD=0.4。
 图5说明世界模型训练使用TF32，故本次关闭BF16 autocast，FP32张量的CUDA矩阵乘法允许TF32。
 
 | 项目 | 方案A：全局批量 | 方案B：每卡批量 |
@@ -56,7 +56,13 @@
 本次日志：`/train_result/log/supermimic/codex_opt/paper_two_gpu`；
 tmux日志：`/train_result/log/supermimic/codex_opt/tmux/codex-paper-two-gpu.log`。
 
-时间换算为`稳定秒/迭代 × 320000 / 3600`。这仅估算完成指定迭代数，不预测达到论文零失败结果的时间；
+稳定耗时记为 $`t_{\mathrm{iter}}`$（秒/迭代），换算公式为：
+
+```math
+T_{\mathrm{hours}} = \frac{320{,}000\,t_{\mathrm{iter}}}{3600}.
+```
+
+这仅估算完成指定迭代数，不预测达到论文零失败结果的时间；
 完整checkpoint评估另计，短测也不能代替长期收敛验证。
 
 

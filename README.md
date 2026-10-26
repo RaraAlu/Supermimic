@@ -278,6 +278,7 @@ uv run --frozen python -B -m unittest discover -s tests -v
 | [docs/analysis/algorithm.md](docs/analysis/algorithm.md) | 论文算法分析：问题设定、世界模型、一阶策略梯度、critic、加速来源与风险 |
 | [docs/analysis/training_pipeline.md](docs/analysis/training_pipeline.md) | 训练流程图与算法细节：采样、重置采样、世界模型拟合、想象推演BPTT、critic、评估、实现与论文差异 |
 | [docs/analysis/formulas.md](docs/analysis/formulas.md) | 公式精讲：每个公式按直觉、拆分、符号、数值算例、代码位置逐项讲解 |
+| [docs/analysis/markdown_math.md](docs/analysis/markdown_math.md) | GitHub公式排版约定：行内公式、独立公式、多行对齐与界面验收 |
 | [docs/analysis/optimization.md](docs/analysis/optimization.md) | 性能优化分析：剖析方法与实测、瓶颈（kernel发射）、按优先级的优化项与验证顺序 |
 | [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) | 第三方代码许可与出处 |
 | [CONTRIBUTORS.md](CONTRIBUTORS.md) | 贡献者名单、AI 编码代理署名与提交模板约定 |
