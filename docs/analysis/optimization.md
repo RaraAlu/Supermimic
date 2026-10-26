@@ -176,11 +176,11 @@ uv run --frozen python scripts/profile_train.py --report logs/profile.json --wai
 **CUDA graph的实现要点**
 - 捕获两段：世界模型的一次更新（展开、损失、反传、裁剪、Adam，每次迭代重放10次），策略的想象推演加BPTT与Adam。
   回放缓冲采样、观测历史、critic更新仍直接执行。前3次调用直接执行（真实更新，同时预热cuBLAS与显存分配器），第4次捕获并重放。
-- `auto`只在单进程、CUDA、未开`torch.compile`、未设`SM_PROFILE`时启用；`torch.compile`加图的组合未验证。
+- `auto`只在单进程、CUDA、未开`torch.compile`、未设`SM_PROFILE`时启用；`torch.compile`加图的组合当时未验证，A100上的结果见7.2节。
 - 多卡需显式`--cuda_graph on`：图内的梯度all-reduce改用固定的全局样本数（`average_gradients(..., total_count=...)`），
   省去“哪些参数有梯度”的主机往返；被捕获的两步里所有参数每次都有梯度，这条路径与通用路径逐位一致（CPU/gloo两进程单测）。
   捕获时用`capture_error_mode="thread_local"`，因为NCCL的watchdog线程会在捕获期间查询CUDA事件。
-  Rara只有一张卡，NCCL多卡下的捕获尚未实测；`scripts/check_cuda_graph.py`可在目标机器上用torchrun逐rank检查图重放与直接执行是否逐位一致。
+  Rara只有一张卡，当时未实测NCCL多卡下的捕获（后在A100双卡上逐位验证，见第7节）；`scripts/check_cuda_graph.py`可在目标机器上用torchrun逐rank检查图重放与直接执行是否逐位一致。
 - 世界模型与策略的Adam改为`capturable=True`，学习率改为设备上的张量，每次迭代原地写入调度值。
 - `torch.cumprod`的反向会在主机上判断输入里是否有0，无法捕获；启用图时存活权重改为逐步连乘，前向与cumprod逐位一致，反向只差浮点舍入。
 - 图里不能在主机上分支，策略梯度非有限时也照常step；这种情况本迭代末仍会报错退出，不会记录或保存。
@@ -189,5 +189,113 @@ uv run --frozen python scripts/profile_train.py --report logs/profile.json --wai
 
 **未做的项**
 - 3.6 FK按树深度批量：策略推演里的FK已被CUDA graph覆盖，剩余调用在采样和critic特征里，次数少；未实施。
-- 3.1 `torch.compile`、3.7–3.9：需要Linux或H100实测，未在本机进行。
+- 3.1 `torch.compile`、3.7–3.9：需要Linux或H100实测，未在本机进行。A100上compile的实测见7.2节。
 
+## 7. A100实测与后续记录（2026-10-26至27，分支`perf/critic-graph`、`perf/env-reward-graph`，均未合并）
+
+**环境与口径**
+- 服务器A100（Linux，Python 3.12，torch 2.14.1+cu130，`torch.compile`可用），每个实验单卡（双卡检查除外）。
+- 论文单卡口径：4096环境，世界模型10批×2048窗口，策略批4096，`--buffer_steps 1000 --amp bf16 --fused_adam on --seed 0`；
+  数据为过滤后BONES-SEED的前5000段（`--motion_limit 5000`）。
+- 速度取第30次迭代之后it/s均值的倒数。“配对”指同一批次、在不同卡上同时运行的对照组；不同批次之间的绝对值随服务器负载浮动几个百分点，只比较同批数字。
+- 逐位检查：`scripts/check_cuda_graph.py`，单卡与`torchrun --nproc-per-node=2 ... --batch_scope per_gpu`（NCCL）各跑一次，运行时`torch.compile`为on。
+
+### 7.1 世界模型段的耗时构成
+
+`SM_PROFILE=1`、`--compile on`、不开图，只改世界模型批量：
+
+| 世界模型批量 | 世界模型段（10次更新） | 采样（2步） | 策略+critic |
+| --- | --- | --- | --- |
+| 256 | 277 ms | 120 ms | 443 ms |
+| 2048（论文） | 279 ms | 114 ms | 432 ms |
+| 4096 | 323 ms | 123 ms | 447 ms |
+
+批量从256增到2048只多2 ms，从2048增到4096多44 ms。据此推算2048个窗口的实际计算约45 ms，其余约235 ms与批量无关，
+是kernel发射、Python调度和10次优化器更新的开销（估计）。“论文每次迭代只做1次世界模型更新、本实现多做了10倍”的猜测不成立：表A.5写的就是10批×2048。
+
+### 7.2 `torch.compile`与CUDA graph的组合
+
+| `--compile` | `--cuda_graph` | 每次迭代 | 相对全关 |
+| --- | --- | --- | --- |
+| off | off | 1.457 s | 1.0× |
+| off | on | 0.716 s | 2.0× |
+| on | off | 0.869 s | 1.7× |
+| on | on | 0.512 s | 2.8× |
+
+- 四组跑到第100次迭代时损失与回报处于同一水平；compile加图时图重放与直接执行逐位一致（单卡与双卡NCCL）。
+- 两者可以叠加。`--cuda_graph auto`在开compile时不启用图，Linux上要显式加`--compile on --cuda_graph on`。
+- 按0.512 s/iter计，32万次迭代单卡约46 h。论文只给出“单卡3 h回报超过SONIC”，没有写3 h对应的迭代数，两者不能直接按小时比较。
+
+### 7.3 critic更新放进CUDA graph（`perf/critic-graph`，提交c29e9f6）
+
+- 开关：`--cuda_graph_critic on|off`（默认on，仅在CUDA graph启用时生效）。
+- 内容：GAE目标与5轮×4小批的梯度步整体捕获，critic的Adam改为capturable；多卡下每个小批的全局样本数在启动时算好，
+  走固定计数的梯度all-reduce；`global_moments`改为在设备上填样本数，捕获期间跳过需要主机的样本数检查。
+- 逐位：Rara单卡、A100单卡、A100双卡NCCL下，世界模型、策略、critic三步的输出、参数与缓冲都逐位一致。
+- 速度（配对各2组）：关0.4616 / 0.4636 s → 开0.4582 / 0.4584 s，约快0.9%。
+- 读数：不开图时分段计时里critic约100 ms，图化收益远小于此。分段计时前后都有同步，而图化只省CPU发射、不省GPU计算，所以分段数字不能直接当作可省的时间。
+
+### 7.4 环境奖励与终止放进CUDA graph（`perf/env-reward-graph`，提交31190d9，基于c29e9f6）
+
+- 开关：`--cuda_graph_env on|off`（默认on，仅在CUDA graph启用时生效）。`GraphedCall`移到`supermimic/utils/cuda_graph.py`，训练脚本与环境共用。
+- 内容：`env.step`里的奖励（含分项字典）与终止计算按开关直接执行或图重放。
+- 逐位：同7.3的三种环境下，8个输出张量逐位一致。
+- 速度（配对各2组）：关0.4581 / 0.4646 s → 开0.4491 / 0.4500 s，约快2.6%，折合每个采样步约4–5 ms。
+- 采样一步（7.5的工具，开、关各一个进程配对）：开40.2 ms，关38.5 ms，进程间波动有几ms，分辨不出这4–5 ms；主机kernel发射从每步2,763次降到1,164次。
+- **更正**：提交说明里“奖励与终止每步28 ms，多于物理仿真的16.7 ms”是把这段单独拿出来、前后加同步测得的。
+  在`env.step`里，这些kernel的发射与GPU上的物理仿真是重叠的，不在关键路径上，实际可省的远小于28 ms。
+
+### 7.5 采样一步的拆解与主机同步
+
+单独运行时（训练30次迭代后测，每步约108个环境重置）：
+
+| 部分（前后加同步单独计时） | 耗时 |
+| --- | --- |
+| `collect(1)`整步 | 52.7 ms（另一批次34.7–43.2 ms，随负载浮动） |
+| 策略侧（观测、目标、归一化、策略前向） | 7.1 ms |
+| 后处理（`buffer.add`、世界模型归一化） | 5.5 ms |
+| 物理4个子步 | 16.7 ms（只算`sim.step`为14.2 ms，约28.8万env-step/s） |
+| `env.reset(k)` | 3.3 ms，k=8到512不变 |
+
+每步GPU忙碌约18–19 ms，主机同步13.1次。来源：
+
+- 12次是同一种写法：用CUDA下标张量写Python标量，`x[ids] = 0.0`。
+  其中mjlab `EntityData.clear_state`里7次（7个执行器目标清零），mjlab `Simulation.reset`里`_reset_mask[env_ids] = True`1次，
+  `TrackingSim.reset`里4次（`ep_step`、`a_prev`、`ep_disc_ret`、`ep_ret`清零）。
+  在torch 2.14.1上，这种写法每次同步一次；`index_fill_`或写零张量不同步，结果相同。写入值本身是张量的（如`self.f[env_ids] = frames`）不同步。
+- 1次是`done.nonzero()`：每步重置的环境数不固定，这次同步省不掉。
+
+**去掉那12次同步的实测**：只在测量工具里于运行时把这12处改成`index_fill_`，仓库代码不变。
+
+- 每步同步从13.1次降到1.0次。
+- 重置1、37、300个环境三种情况，比较23个张量（其中15个被重置改写），逐位一致。
+- `collect(1)`同一进程交替8轮，中位数34.78 → 34.64 ms，约快0.4%，在波动内。**未采用。**
+- 几乎没有收益是因为这12次都在`nonzero`之后：那时GPU队列已经空了，每次同步只需要等几个很小的kernel。
+
+**不加同步的主机时间线**：在关键位置记录主机时间戳，不额外同步。这一进程里每步43.2 ms，看比例：
+
+| 阶段 | 主机耗时 | GPU |
+| --- | --- | --- |
+| 策略侧（发射） | 7.1 ms | 基本空闲 |
+| `env.step`到第一个物理子步发射 | 1.4 ms | 基本空闲 |
+| 发射4个物理子步 | 1.7 ms | 开始跑物理 |
+| 发射奖励图、算done，在`done.nonzero()`等GPU | 21.5 ms | 物理、奖励（CPU空等） |
+| 重置（含那12次同步） | 5.5 ms | 基本空闲 |
+| 后处理（发射） | 5.9 ms | 基本空闲 |
+
+CPU干活的约21 ms里GPU基本空闲，GPU跑物理和奖励的约21 ms里CPU在空等，两者没有重叠。
+剖析器统计的主机阻塞在`cudaStreamSynchronize`里约15 ms/步，与此一致。
+采样每次迭代2.5步（`--utd 0.4`），约占整次迭代的五分之一。
+
+### 7.6 尚未实施的方向（收益均为估计）
+
+| 方向 | 数值 | 估计收益 |
+| --- | --- | --- |
+| A. 把后处理（`buffer.add`、世界模型归一化）挪到`done.nonzero()`之前，与物理仿真重叠 | 逐位一致：只读本步已复制的张量，不用随机数 | 每步约5–6 ms |
+| B. 把策略侧（观测、目标、归一化更新、策略前向、动作噪声）捕获进CUDA graph | 逐位一致：全部固定形状，随机数走默认生成器 | 每步约6 ms |
+| C. 固定形状的掩码重置，去掉`done.nonzero()` | 不逐位一致：每步为全部环境抽样，随机数的消耗顺序改变，统计上等价 | 每步接近GPU时间18–20 ms |
+
+A加B每步约省10–12 ms（约25–30%），整次迭代约省25–30 ms（约6%）。C还要处理多卡`prepare_sampling`里另一次主机同步。
+
+**测量工具**：采样拆解、同步影响和主机时间线的脚本是一次性工具，放在服务器工作目录`tools_claude/`下，未入库；
+日志在服务器`/train_result/log/supermimic/`的`tmux/claude-p11`至`p17`与`logs/p11_*`至`logs/p17_*`。

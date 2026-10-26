@@ -32,9 +32,11 @@ Linux本次回归使用Python 3.12.3，运行64个环境、4次迭代，验证�
 
 训练默认用CUDA graph重放世界模型更新和策略的想象推演加BPTT（`--cuda_graph auto`：单进程、CUDA、未开`torch.compile`时启用），
 三个优化器默认用fused Adam（`--fused_adam on`）。两者都只改变执行方式，不改变算法；实测与开关见
-[docs/analysis/optimization.md](docs/analysis/optimization.md)第6节。用`scripts/profile_train.py`剖析时请加`--cuda_graph off`。
-多卡（torchrun）时`auto`不启用CUDA graph；加`--cuda_graph on`可在多卡下启用，梯度all-reduce也在图内执行。
-这条路径尚未在多卡机器上验证，正式训练前先在目标机器上运行
+[docs/analysis/optimization.md](docs/analysis/optimization.md)第6、7节。用`scripts/profile_train.py`剖析时请加`--cuda_graph off`。
+图启用时，critic更新与环境每步的奖励和终止也用图重放（`--cuda_graph_critic`、`--cuda_graph_env`，默认on）。
+Linux上`torch.compile`可用时`auto`不启用图；A100上显式加`--compile on --cuda_graph on`最快（0.51 s/iter，两者全关为1.46 s/iter）。
+多卡（torchrun）时`auto`也不启用CUDA graph；加`--cuda_graph on`可在多卡下启用，梯度all-reduce也在图内执行。
+这条路径已在A100双卡（NCCL）上逐位验证；换机器后，正式训练前先在目标机器上运行
 `torchrun --standalone --nproc-per-node=2 scripts/check_cuda_graph.py --motion_limit 8 --batch_scope per_gpu`，
 各rank都输出“bitwise equal True”后再使用。
 
