@@ -64,7 +64,8 @@ parser.add_argument("--collect_overlap", type=str, default="on", choices=["on", 
                     help="enqueue replay writes and world-model statistics before the simulator reset waits for CUDA")
 parser.add_argument("--device", type=str, default="cuda:0")
 parser.add_argument("--batch_scope", type=str, default="global", choices=["global", "per_gpu"],
-                    help="--num_envs/--wm_batch/--pi_batch are global totals split across ranks, or per-GPU sizes (paper Table A.5)")
+                    help="--num_envs/--wm_batch/--pi_batch are global totals split across ranks, or per-GPU sizes; "
+                         "paper Table A.5 explicitly labels only environments per GPU")
 parser.add_argument("--lr_scaling", type=str, default="none", choices=["none", "sqrt"],
                     help="multiply --lr by sqrt(WORLD_SIZE); the paper uses sqrt(2) x for two GPUs")
 parser.add_argument("--local-rank", "--local_rank", type=int, default=None, help=argparse.SUPPRESS)
