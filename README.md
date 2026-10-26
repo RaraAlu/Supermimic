@@ -30,6 +30,10 @@ Windows与Linux（x86_64，NVIDIA GPU）共用同一份`pyproject.toml`、`uv.lo
 Linux本次回归使用Python 3.12.3，运行64个环境、4次迭代，验证训练、检查点保存与加载、40条LAFAN1动作评估，以及中文目录中的UTF-8 JSON/CSV读写。
 该结果仅验证运行兼容性，不代表训练质量达标；`--compile auto/on`开启编译的路径与H100尚未验证。
 
+训练默认用CUDA graph重放世界模型更新和策略的想象推演加BPTT（`--cuda_graph auto`：单进程、CUDA、未开`torch.compile`时启用），
+三个优化器默认用fused Adam（`--fused_adam on`）。两者都只改变执行方式，不改变算法；实测与开关见
+[docs/analysis/optimization.md](docs/analysis/optimization.md)第6节。用`scripts/profile_train.py`剖析时请加`--cuda_graph off`。
+
 同一目录被两个系统共享（例如虚拟机挂载宿主机磁盘）时，两边不能共用`.venv`：
 `.venv`内的解释器路径与目录结构按系统生成，在一边执行`uv sync`或`uv run`会重建另一边的环境。
 此时由Windows使用默认`.venv`，Linux把环境放到共享目录之外：

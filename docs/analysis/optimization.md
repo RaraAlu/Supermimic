@@ -74,6 +74,7 @@ uv run --frozen python scripts/profile_train.py --report logs/profile.json --wai
 - Windows没有Triton，`torch.compile`的Inductor后端不可用，但`torch.compile(backend="cudagraphs")`或手动`torch.cuda.CUDAGraph`不依赖Triton，
   可以作为Windows开发卡的加速路径（未验证）。
 - 风险：实现量中等；捕获后调试困难，需要保留关闭开关。
+- **已实施**（`--cuda_graph`，见第6节）：手动`torch.cuda.CUDAGraph`，Windows可用。
 
 ### P1：低风险、改动小
 
@@ -81,11 +82,14 @@ uv run --frozen python scripts/profile_train.py --report logs/profile.json --wai
 - 现状：`run_mlp`每次调用都新开一个`torch.autocast`上下文。autocast的权重转换缓存在最外层上下文退出时清空，
   所以同一组权重在一次策略更新的32步展开里被反复转换成bf16。实测每次迭代2,792个bf16转换kernel、34 ms GPU。
 - 做法：在世界模型更新、策略更新和critic更新的外层各开一次autocast，`run_mlp`内部的上下文变成嵌套、复用缓存。
-- 收益：预计减少约2,500个kernel和30 ms GPU时间；数值完全不变。
+- 收益：预计减少约2,500个kernel和30 ms GPU时间。
+- **实测后不采用**（第6节）：前向输出逐位不变，但梯度不是。共享同一份bf16权重副本后，32步展开里各步的梯度先在bf16里累加、再转回fp32；
+  原来每步各自转回fp32再相加。相对fp32参考的梯度误差中位数从4.5e-3升到1.6e-2，所以“数值完全不变”的判断不成立。
 
 **3.4 三个优化器改用融合版Adam（`fused=True`）。**
 - 现状：每次迭代31次Adam step（世界模型10次、策略1次、critic 20次），默认的foreach实现每次仍有多段kernel。
 - 收益：kernel数小幅下降；critic的20次小网络更新受益最明显。数值与非融合版在浮点误差内一致。
+- **已实施**（`--fused_adam`，第6节）：Rara上几乎无提速。注意`load_state_dict`会用检查点里的fused标志覆盖当前设置，恢复训练后须重新设回。
 
 **3.5 去掉训练路径上的主机同步。** 实测每次迭代49–86次，来源：
 
@@ -98,6 +102,9 @@ uv run --frozen python scripts/profile_train.py --report logs/profile.json --wai
 | 多卡`average_gradients`里的`.tolist()` | 每次梯度平均1次，共31次 | 参数是否被使用在一次运行中固定，首次计算后缓存 |
 
 收益：单看CPU阻塞时间只有16–78 ms，但它们也是CUDA graph捕获的前提（3.2）。
+
+- **已实施的部分**（第6节）：`RunningNorm.update`改为GPU上判断冻结。其余来源未改：采样每步约27次同步来自mjlab按`env_ids`写状态的内部实现，
+  改成整批掩码重置会改变随机数消耗顺序；`done.nonzero()`和拒绝采样各约1–2.5次，且不在CUDA graph捕获范围内。
 
 **3.6 前向运动学按树深度批量计算。**
 - 现状：`G1Kinematics.forward`按30个刚体逐个串行计算，每个刚体约十个小kernel；奖励、critic特征和参考库构建都会调用。
@@ -148,3 +155,35 @@ uv run --frozen python scripts/profile_train.py --report logs/profile.json --wai
 - 提高更新数据比、缩短想象长度H；
 - 用fp16或fp8替代bf16做推演；
 - 用多步动作或降低控制频率减少仿真步数。
+
+## 6. 实施记录（2026-10-26，分支`perf/systematic-opt`）
+
+范围：只做数值不变或只差浮点舍入的提速，每项单独提交并保留开关。全部在Rara（RTX 4070 Ti SUPER 16 GB，Windows，`torch.compile`不可用，bf16）上测得。
+
+**测量方法**
+- 速度：2048环境（`--wm_batch 2048 --pi_batch 2048 --buffer_steps 100`），80次迭代，取第30次之后的平均it/s；
+  main与本分支交替各跑3次，抵消桌面负载造成的波动。
+- 数值：单次更新逐位比较；训练层面用固定种子、512环境、150次迭代，与main两次运行之间的波动比较
+  （同种子的两次main运行本身就不完全一致，第150次迭代wm 0.324对0.336）。
+
+| 项 | 开关（默认） | 数值 | 速度（2048环境） | 结论 |
+| --- | --- | --- | --- | --- |
+| 3.3 autocast作用域上提 | — | 前向逐位不变；梯度相对fp32误差中位数4.5e-3 → 1.6e-2 | 未测 | 不采用 |
+| 3.4 fused Adam | `--fused_adam on` | 50步后参数差约为更新量的1e-5 | 0.936 → 0.933 s/iter（剖析） | 采用，提速可忽略 |
+| 3.5 `RunningNorm`去同步 | 无开关（逐位不变） | 跨冻结点逐位一致 | 与3.4合计 0.922 → 0.912 s/iter，在波动内 | 采用；同步86 → 75次/迭代 |
+| 3.2 CUDA graph | `--cuda_graph auto` | 图重放与直接调用逐位一致（含随机数）；相对main只差浮点舍入 | 0.911 → 0.833 s/iter（−9%）；512环境1.87 → 2.92 it/s（+56%） | 采用 |
+
+**CUDA graph的实现要点**
+- 捕获两段：世界模型的一次更新（展开、损失、反传、裁剪、Adam，每次迭代重放10次），策略的想象推演加BPTT与Adam。
+  回放缓冲采样、观测历史、critic更新仍直接执行。前3次调用直接执行（真实更新，同时预热cuBLAS与显存分配器），第4次捕获并重放。
+- `auto`只在单进程、CUDA、未开`torch.compile`、未设`SM_PROFILE`时启用。多卡的梯度all-reduce不在捕获范围内；`torch.compile`加图的组合未验证。
+- 世界模型与策略的Adam改为`capturable=True`，学习率改为设备上的张量，每次迭代原地写入调度值。
+- `torch.cumprod`的反向会在主机上判断输入里是否有0，无法捕获；启用图时存活权重改为逐步连乘，前向与cumprod逐位一致，反向只差浮点舍入。
+- 图里不能在主机上分支，策略梯度非有限时也照常step；这种情况本迭代末仍会报错退出，不会记录或保存。
+- 显存：已分配峰值7.74 → 7.79 GiB，保留峰值9.12 → 11.06 GiB（两张图各自的私有显存池）。
+- `scripts/profile_train.py`靠策略优化器step的Python钩子推进剖析调度，图重放不触发钩子，剖析时需加`--cuda_graph off`（设`SM_PROFILE=1`时`auto`本来就关闭）。
+
+**未做的项**
+- 3.6 FK按树深度批量：策略推演里的FK已被CUDA graph覆盖，剩余调用在采样和critic特征里，次数少；未实施。
+- 3.1 `torch.compile`、3.7–3.9：需要Linux或H100实测，未在本机进行。
+
