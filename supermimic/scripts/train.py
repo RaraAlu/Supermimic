@@ -200,11 +200,18 @@ if args.resume:
     ck = resume_ck
     wm.load_state_dict(ck["wm"]), pi.load_state_dict(ck["pi"]), critic.load_state_dict(ck["critic"])
     opt_wm.load_state_dict(ck["opt_wm"]), opt_pi.load_state_dict(ck["opt_pi"]), opt_v.load_state_dict(ck["opt_v"])
+    # load_state_dict restores the checkpoint's own flags, lr type and step placement; match this run's mode.
+    # Fused and capturable kernels read the step count from device memory, the others from the host.
     for opt, captured in ((opt_wm, USE_GRAPH), (opt_pi, USE_GRAPH), (opt_v, GRAPH_CRITIC)):
-        for group in opt.param_groups:  # load_state_dict restores the checkpoint's own flags and lr type
+        on_device = FUSED_ADAM or captured
+        for group in opt.param_groups:
             group["fused"], group["foreach"], group["capturable"] = FUSED_ADAM, None, captured
-            if captured:
-                group["lr"] = torch.tensor(float(group["lr"]), device=dev)
+            group["lr"] = torch.tensor(float(group["lr"]), device=dev) if captured else float(group["lr"])
+            for p in group["params"]:
+                state = opt.state.get(p)
+                if state and "step" in state:
+                    state["step"] = torch.as_tensor(state["step"], dtype=torch.float32,
+                                                    device=p.device if on_device else "cpu").clone()
     start_it, wall_offset, sim_steps = ck["iteration"], ck["wall_time"], ck["sim_steps"]
 for model in (wm, pi, critic):
     parallel.broadcast_module(model)
