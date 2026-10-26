@@ -203,3 +203,91 @@ class IndexedG1Dataset:
                 "shorter_than_33_frames": sum(c.length < 33 for c in self.clips),
                 "source_hashes_verified": self.verify_hashes,
                 "source_binding": "manifest, source metadata, stat; SHA256 if requested or stat changed"}
+
+
+class MergedG1Dataset:
+    """A single merged ``teleopit_motion_hdf5`` source, read without an index.
+
+    Clip boundaries come from the file's own ``source_clip_*`` arrays, so no
+    pairing index is needed. Identity is a digest over the file's structural
+    metadata, which stays stable when the same file is copied between machines.
+    """
+
+    def __init__(self, path, limit=None):
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+            raise ValueError("motion_limit must be positive")
+        self.path = Path(path).expanduser().resolve(strict=True)
+        self.stats = self.path.stat()
+        with h5py.File(self.path, "r") as source:
+            if source.attrs.get("format") != "teleopit_motion_hdf5":
+                raise ValueError("requires a teleopit_motion_hdf5 v1 source")
+            if int(source.attrs.get("version", 0)) != 1:
+                raise ValueError("requires teleopit_motion_hdf5 version 1")
+            if int(source.attrs.get("fps", 0)) != 50:
+                raise ValueError("the source must declare 50 Hz")
+            frames = int(source["root_pos"].shape[0])
+            for key, width in ARRAY_SHAPES.items():
+                block = source[key]
+                if block.shape != (frames, width) or block.dtype != np.dtype("float32"):
+                    raise ValueError(f"{key} must be float32 ({frames}, {width})")
+            starts = source["source_clip_starts"][:]
+            lengths = source["source_clip_lengths"][:]
+            fps = source["source_clip_fps"][:]
+            names = None
+            if "clips" in source and "source_relative_path" in source["clips"]:
+                names = source["clips"]["source_relative_path"].asstr()[:]
+        count = len(lengths)
+        if count < 1 or len(starts) != count:
+            raise ValueError("source_clip_starts and source_clip_lengths must agree")
+        if np.any(fps != 50):
+            raise ValueError("every source clip must declare 50 Hz")
+        if np.any(lengths < 2):
+            raise ValueError("every source clip needs at least two frames")
+        if int(starts[0]) != 0 or not np.array_equal(starts[1:], starts[:-1] + lengths[:-1]):
+            raise ValueError("source clips must partition the frame axis contiguously")
+        if int(starts[-1] + lengths[-1]) != frames:
+            raise ValueError("source clips do not cover the whole file")
+        if names is not None and len(names) != count:
+            raise ValueError("clips/source_relative_path must have one row per clip")
+        if limit is not None:
+            starts, lengths = starts[:limit], lengths[:limit]
+            names = None if names is None else names[:limit]
+            count = len(lengths)
+        keep = np.arange(count, dtype=np.int64)
+        self.clips = [SourceClip(name=str(names[i]) if names is not None else f"clip_{i:06d}",
+                                 shard=self.path.name, source_clip_index=int(keep[i]),
+                                 start=int(starts[i]), length=int(lengths[i]))
+                      for i in range(count)]
+        self.whitelist_clips = int(len(lengths))
+        self.frames = int(lengths.sum())
+        self.limit = limit
+        digest = hashlib.sha256()
+        digest.update(json.dumps({"format": "merged_g1_v1", "fps": 50, "frames": frames,
+                                  "clips": int(len(lengths)),
+                                  "bytes": self.stats.st_size},
+                                 sort_keys=True).encode())
+        digest.update(np.ascontiguousarray(starts.astype(np.int64)).tobytes())
+        digest.update(np.ascontiguousarray(lengths.astype(np.int64)).tobytes())
+        self.fingerprint = digest.hexdigest()
+
+    def iter_clips(self):
+        before = self.path.stat()
+        with h5py.File(self.path, "r") as source:
+            for clip in self.clips:
+                sl = slice(clip.start, clip.start + clip.length)
+                arrays = tuple(source[key][sl] for key in ARRAY_SHAPES)
+                validate_pose_arrays(*arrays, clip.name)
+                yield arrays
+        after = self.path.stat()
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            raise ValueError("source changed during reference loading")
+
+    def summary(self):
+        frames = sum(c.length for c in self.clips)
+        return {"format": "supermimic_merged_g1_v1", "source": str(self.path),
+                "fingerprint": self.fingerprint, "length_policy": "full_g1_source", "fps": 50,
+                "whitelist_clips": self.whitelist_clips, "selected_clips": len(self.clips),
+                "selected_frames": frames, "frame_hours": frames / 50 / 3600,
+                "shorter_than_33_frames": sum(c.length < 33 for c in self.clips),
+                "source_bytes": self.stats.st_size,
+                "source_binding": "structural metadata digest; file size and mtime checked on load"}

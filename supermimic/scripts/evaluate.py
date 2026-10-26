@@ -29,6 +29,7 @@ parser.add_argument("--record", type=str, default=None, help="save trajectories 
 source = parser.add_mutually_exclusive_group()
 source.add_argument("--motion_dir", type=str, default=None)
 source.add_argument("--motion_index", type=str, default=None)
+source.add_argument("--motion_source", type=str, default=None)
 parser.add_argument("--motion_root", type=str, default=None)
 parser.add_argument("--motion_limit", type=int, default=None)
 parser.add_argument("--eval_batch_size", type=int, default=4096, help="parallel environments per batch (paper: 4096 per GPU)")

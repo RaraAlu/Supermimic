@@ -41,19 +41,21 @@ class RotationView:
 def resolve_motion_args(args, saved=None):
     """Restore a run's selection unless the caller explicitly selects another source."""
     saved = saved or {}
-    if args.motion_dir is None and args.motion_index is None:
+    source = getattr(args, "motion_source", None)
+    if args.motion_dir is None and args.motion_index is None and source is None:
         args.motion_dir = saved.get("motion_dir")
         args.motion_index = saved.get("motion_index")
+        args.motion_source = saved.get("motion_source")
         if args.motion_limit is None:
             args.motion_limit = saved.get("motion_limit")
         if args.motion_root is None:
             args.motion_root = saved.get("motion_root")
-    if args.motion_dir is None and args.motion_index is None:
+    if args.motion_dir is None and args.motion_index is None and getattr(args, "motion_source", None) is None:
         args.motion_dir = str(Path(__file__).resolve().parents[3] / "data" / "lafan1_g1")
     if args.motion_root is not None and args.motion_index is None:
         raise ValueError("--motion_root requires --motion_index")
-    for key in ("motion_dir", "motion_index", "motion_root"):
-        value = getattr(args, key)
+    for key in ("motion_dir", "motion_index", "motion_source", "motion_root"):
+        value = getattr(args, key, None)
         if value is not None:
             setattr(args, key, str(Path(value).expanduser().resolve()))
 
@@ -222,7 +224,22 @@ class MotionLib:
         return instance
 
     @classmethod
+    def from_source(cls, path, kin, device, limit=None, rank=0, world_size=1):
+        from supermimic.tasks.tracking.motion_hdf5 import MergedG1Dataset
+
+        dataset = MergedG1Dataset(path, limit)
+        instance = cls.__new__(cls)
+        instance.description = dataset.summary()
+        ids = instance._select([c.length for c in dataset.clips], rank, world_size)
+        dataset.clips = [dataset.clips[i] for i in ids]
+        instance._build([c.name for c in dataset.clips], [c.length for c in dataset.clips],
+                        dataset.iter_clips(), kin, device)
+        return instance
+
+    @classmethod
     def from_args(cls, args, kin, device, rank=0, world_size=1):
+        if getattr(args, "motion_source", None):
+            return cls.from_source(args.motion_source, kin, device, args.motion_limit, rank, world_size)
         if args.motion_index:
             return cls.from_index(args.motion_index, kin, device, args.motion_root, args.motion_limit, rank, world_size)
         return cls.from_dir(args.motion_dir, kin, device, args.motion_limit, rank, world_size)
