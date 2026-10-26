@@ -57,6 +57,22 @@ def collective_worker(rank, root):
             for p, expected in zip(model.parameters(), baseline.parameters()):
                 torch.testing.assert_close(p, expected, rtol=2e-6, atol=1e-7)
         parallel.require_equal([p.detach().tolist() for p in model.parameters()], "updated parameters")
+
+        # The fixed-count path used inside CUDA graphs matches the general path bitwise.
+        general, fixed = copy.deepcopy(model), copy.deepcopy(model)
+        for m in (general, fixed):
+            ((m(data[local]) - target[local]) ** 2).mean().backward()
+        average_gradients(general, len(data[local]))
+        average_gradients(fixed, len(data[local]), total_count=len(data))
+        for p, q in zip(general.parameters(), fixed.parameters()):
+            assert torch.equal(p.grad, q.grad)
+        fixed.bias.grad = None
+        try:
+            average_gradients(fixed, len(data[local]), total_count=len(data))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("the fixed-count path accepted a missing gradient")
         try:
             parallel.broadcast_module(torch.nn.Linear(1 + rank, 1))
         except ValueError:

@@ -176,7 +176,11 @@ uv run --frozen python scripts/profile_train.py --report logs/profile.json --wai
 **CUDA graph的实现要点**
 - 捕获两段：世界模型的一次更新（展开、损失、反传、裁剪、Adam，每次迭代重放10次），策略的想象推演加BPTT与Adam。
   回放缓冲采样、观测历史、critic更新仍直接执行。前3次调用直接执行（真实更新，同时预热cuBLAS与显存分配器），第4次捕获并重放。
-- `auto`只在单进程、CUDA、未开`torch.compile`、未设`SM_PROFILE`时启用。多卡的梯度all-reduce不在捕获范围内；`torch.compile`加图的组合未验证。
+- `auto`只在单进程、CUDA、未开`torch.compile`、未设`SM_PROFILE`时启用；`torch.compile`加图的组合未验证。
+- 多卡需显式`--cuda_graph on`：图内的梯度all-reduce改用固定的全局样本数（`average_gradients(..., total_count=...)`），
+  省去“哪些参数有梯度”的主机往返；被捕获的两步里所有参数每次都有梯度，这条路径与通用路径逐位一致（CPU/gloo两进程单测）。
+  捕获时用`capture_error_mode="thread_local"`，因为NCCL的watchdog线程会在捕获期间查询CUDA事件。
+  Rara只有一张卡，NCCL多卡下的捕获尚未实测；`scripts/check_cuda_graph.py`可在目标机器上用torchrun逐rank检查图重放与直接执行是否逐位一致。
 - 世界模型与策略的Adam改为`capturable=True`，学习率改为设备上的张量，每次迭代原地写入调度值。
 - `torch.cumprod`的反向会在主机上判断输入里是否有0，无法捕获；启用图时存活权重改为逐步连乘，前向与cumprod逐位一致，反向只差浮点舍入。
 - 图里不能在主机上分支，策略梯度非有限时也照常step；这种情况本迭代末仍会报错退出，不会记录或保存。

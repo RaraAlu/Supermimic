@@ -30,12 +30,28 @@ def global_moments(x):
 
 
 @torch.no_grad()
-def average_gradients(module, sample_count=1):
-    """Reduce before clipping; preserve globally-unused parameters as grad=None."""
+def average_gradients(module, sample_count=1, total_count=None):
+    """Reduce before clipping; preserve globally-unused parameters as grad=None.
+
+    With total_count, the global sample count fixed for the run, every parameter must have a gradient on
+    every rank. The reduction then needs no host round trip, so it can run inside a CUDA graph.
+    """
     if not distributed_active():
         return
     params = [p for p in module.parameters() if p.requires_grad]
     if not params:
+        return
+    if total_count is not None:
+        if any(p.grad is None for p in params):
+            raise ValueError("average_gradients(total_count=...) requires a gradient for every parameter")
+        flat = torch.cat([p.grad.reshape(-1) for p in params])
+        flat.mul_(sample_count)
+        dist.all_reduce(flat)
+        flat.div_(total_count)
+        offset = 0
+        for p in params:
+            p.grad.copy_(flat[offset:offset + p.numel()].view_as(p))
+            offset += p.numel()
         return
     info = torch.tensor([sample_count, *[p.grad is not None for p in params]],
                         device=params[0].device, dtype=torch.float64)

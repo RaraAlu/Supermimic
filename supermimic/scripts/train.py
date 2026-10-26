@@ -53,7 +53,7 @@ parser.add_argument("--fused_adam", type=str, default="on", choices=["on", "off"
 parser.add_argument("--compile", type=str, default="auto", choices=["auto", "on", "off"], help="torch.compile (auto: only if triton is installed)")
 parser.add_argument("--cuda_graph", type=str, default="auto", choices=["auto", "on", "off"],
                     help="replay the world-model step and the policy imagination+BPTT step as CUDA graphs "
-                         "(auto: single CUDA process without torch.compile or SM_PROFILE)")
+                         "(auto: single CUDA process without torch.compile or SM_PROFILE; multi-GPU needs on)")
 parser.add_argument("--device", type=str, default="cuda:0")
 parser.add_argument("--batch_scope", type=str, default="global", choices=["global", "per_gpu"],
                     help="--num_envs/--wm_batch/--pi_batch are global totals split across ranks, or per-GPU sizes (paper Table A.5)")
@@ -136,8 +136,11 @@ PROFILE = bool(int(os.environ.get("SM_PROFILE", "0")))
 USE_GRAPH = args.cuda_graph == "on" or (
     args.cuda_graph == "auto" and torch.device(dev).type == "cuda" and not parallel.enabled and not PROFILE
     and not (args.compile == "on" or (args.compile == "auto" and importlib.util.find_spec("triton") is not None)))
-if USE_GRAPH and (parallel.enabled or torch.device(dev).type != "cuda"):
-    raise ValueError("--cuda_graph on needs a single CUDA process (gradient all-reduce is not captured)")
+if USE_GRAPH and torch.device(dev).type != "cuda":
+    raise ValueError("--cuda_graph on needs CUDA")
+# Inside graphs the gradient all-reduce uses the fixed global batch sizes (no host round trip).
+GRAPH_WM_TOTAL = args.wm_batch * scope if USE_GRAPH else None
+GRAPH_PI_TOTAL = args.pi_batch * scope if USE_GRAPH else None
 
 
 def make_adam(params, captured: bool, **kw):
@@ -253,7 +256,10 @@ class GraphedCall:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()  # return the eager calls' cached blocks before the graph takes its own pool
             self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph):  # records only; the replay below performs this call
+            # records only; the replay below performs this call. With NCCL, the communicator's watchdog thread
+            # keeps querying CUDA events during capture, so only this thread's calls are checked.
+            mode = "thread_local" if parallel.enabled else "global"
+            with torch.cuda.graph(self.graph, capture_error_mode=mode):
                 self.static_out = self.fn(*self.static_in)
         tree_map(lambda dst, src: dst.copy_(src), self.static_in, inputs)
         self.graph.replay()
@@ -266,7 +272,7 @@ def _wm_step(s, a, xi, s1, mask):
     loss, e_last = wm_err(S_hat, s1, mask)
     opt_wm.zero_grad(set_to_none=True)
     loss.backward()
-    average_gradients(wm, local_wm_batch)
+    average_gradients(wm, local_wm_batch, total_count=GRAPH_WM_TOTAL)
     grad_norm = nn.utils.clip_grad_norm_(wm.parameters(), 1.0)
     nonfinite[0].logical_or_(~torch.isfinite(grad_norm))
     opt_wm.step()
@@ -349,7 +355,7 @@ def _policy_step(s_flat, xi, f, a_prev, o_hist):
         torch.cuda.synchronize(); tq1 = time.time()
     opt_pi.zero_grad(set_to_none=True)
     loss.backward()
-    average_gradients(pi, local_pi_batch)
+    average_gradients(pi, local_pi_batch, total_count=GRAPH_PI_TOTAL)
     if PROFILE:
         torch.cuda.synchronize(); tq2 = time.time()
     gn = nn.utils.clip_grad_norm_(pi.parameters(), 1.0)
