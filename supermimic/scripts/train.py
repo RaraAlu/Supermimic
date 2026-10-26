@@ -50,6 +50,9 @@ parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"],
 parser.add_argument("--fused_adam", type=str, default="on", choices=["on", "off"],
                     help="fused CUDA Adam kernels for all three optimizers (same update up to float rounding)")
 parser.add_argument("--compile", type=str, default="auto", choices=["auto", "on", "off"], help="torch.compile (auto: only if triton is installed)")
+parser.add_argument("--cuda_graph", type=str, default="auto", choices=["auto", "on", "off"],
+                    help="replay the world-model step and the policy imagination+BPTT step as CUDA graphs "
+                         "(auto: single CUDA process without torch.compile or SM_PROFILE)")
 parser.add_argument("--device", type=str, default="cuda:0")
 parser.add_argument("--batch_scope", type=str, default="global", choices=["global", "per_gpu"],
                     help="--num_envs/--wm_batch/--pi_batch are global totals split across ranks, or per-GPU sizes (paper Table A.5)")
@@ -62,6 +65,7 @@ import importlib.util
 
 import torch
 import torch.nn as nn
+from torch.utils._pytree import tree_map
 
 from supermimic.tasks.tracking.env import TrackingSim
 from supermimic.tasks.tracking.mdp import CRITIC_EXTRA, INV_DIM, MDP, OBS_DIM, invariant_features, normalize_xi, unflatten_state
@@ -127,17 +131,34 @@ wm = WorldModel().to(dev)
 pi = Policy(OBS_DIM, GOAL_DIM, hist=Hh).to(dev)
 critic = Critic(CRITIC_IN).to(dev)
 FUSED_ADAM = args.fused_adam == "on" and torch.device(dev).type == "cuda"
-opt_wm = torch.optim.Adam(wm.parameters(), lr=base_lr, fused=FUSED_ADAM)
-opt_pi = torch.optim.Adam(pi.parameters(), lr=base_lr, betas=(0.9, 0.95), fused=FUSED_ADAM)
-opt_v = torch.optim.Adam(critic.parameters(), lr=base_lr, fused=FUSED_ADAM)
+PROFILE = bool(int(os.environ.get("SM_PROFILE", "0")))
+USE_GRAPH = args.cuda_graph == "on" or (
+    args.cuda_graph == "auto" and torch.device(dev).type == "cuda" and not parallel.enabled and not PROFILE
+    and not (args.compile == "on" or (args.compile == "auto" and importlib.util.find_spec("triton") is not None)))
+if USE_GRAPH and (parallel.enabled or torch.device(dev).type != "cuda"):
+    raise ValueError("--cuda_graph on needs a single CUDA process (gradient all-reduce is not captured)")
+
+
+def make_adam(params, captured: bool, **kw):
+    """Graph-captured optimizers keep their step count and learning rate on the device."""
+    if captured:
+        return torch.optim.Adam(params, lr=torch.tensor(base_lr, device=dev), fused=FUSED_ADAM, capturable=True, **kw)
+    return torch.optim.Adam(params, lr=base_lr, fused=FUSED_ADAM, **kw)
+
+
+opt_wm = make_adam(wm.parameters(), USE_GRAPH)
+opt_pi = make_adam(pi.parameters(), USE_GRAPH, betas=(0.9, 0.95))
+opt_v = make_adam(critic.parameters(), False)
 start_it, wall_offset, sim_steps = 0, 0.0, 0
 if args.resume:
     ck = resume_ck
     wm.load_state_dict(ck["wm"]), pi.load_state_dict(ck["pi"]), critic.load_state_dict(ck["critic"])
     opt_wm.load_state_dict(ck["opt_wm"]), opt_pi.load_state_dict(ck["opt_pi"]), opt_v.load_state_dict(ck["opt_v"])
-    for opt in (opt_wm, opt_pi, opt_v):  # load_state_dict restores the checkpoint's own fused flag
-        for group in opt.param_groups:
-            group["fused"], group["foreach"] = FUSED_ADAM, None
+    for opt, captured in ((opt_wm, USE_GRAPH), (opt_pi, USE_GRAPH), (opt_v, False)):
+        for group in opt.param_groups:  # load_state_dict restores the checkpoint's own flags and lr type
+            group["fused"], group["foreach"], group["capturable"] = FUSED_ADAM, None, captured
+            if captured:
+                group["lr"] = torch.tensor(float(group["lr"]), device=dev)
     start_it, wall_offset, sim_steps = ck["iteration"], ck["wall_time"], ck["sim_steps"]
 for model in (wm, pi, critic):
     parallel.broadcast_module(model)
@@ -210,20 +231,55 @@ def set_requires_grad(m: nn.Module, flag: bool):
 nonfinite = torch.zeros(3, dtype=torch.bool, device=dev)
 
 
+class GraphedCall:
+    """Run fn eagerly for its first calls, then capture it once as a CUDA graph and replay it.
+
+    Tensor inputs are copied into static buffers before each replay and outputs are cloned, so a call
+    returns what the eager call would. fn must keep static shapes and must not sync with the host;
+    random ops draw from the default CUDA generator, which each replay advances like an eager call.
+    The eager calls are real updates that also warm up cuBLAS and the allocator before capture.
+    """
+
+    def __init__(self, fn, eager_calls: int = 3):
+        self.fn, self.eager_calls, self.calls, self.graph = fn, eager_calls, 0, None
+
+    def __call__(self, *inputs):
+        if not USE_GRAPH or self.calls < self.eager_calls:
+            self.calls += 1
+            return self.fn(*inputs)
+        if self.graph is None:
+            self.static_in = tree_map(torch.clone, inputs)
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()  # return the eager calls' cached blocks before the graph takes its own pool
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph):  # records only; the replay below performs this call
+                self.static_out = self.fn(*self.static_in)
+        tree_map(lambda dst, src: dst.copy_(src), self.static_in, inputs)
+        self.graph.replay()
+        return tree_map(torch.clone, self.static_out)
+
+
 # ------------------------------------------------------------------------------------------------
-def wm_update():
-    w = buffer.sample_windows(local_wm_batch, args.wm_window)
-    S_hat = wm_rollout(w["s"], w["a"], w["xi"])
-    loss, e_last = wm_err(S_hat, w["s1"], w["mask"])
+def _wm_step(s, a, xi, s1, mask):
+    S_hat = wm_rollout(s, a, xi)
+    loss, e_last = wm_err(S_hat, s1, mask)
     opt_wm.zero_grad(set_to_none=True)
     loss.backward()
     average_gradients(wm, local_wm_batch)
     grad_norm = nn.utils.clip_grad_norm_(wm.parameters(), 1.0)
     nonfinite[0].logical_or_(~torch.isfinite(grad_norm))
     opt_wm.step()
-    m = w["mask"][:, -1]
+    m = mask[:, -1]
     error = parallel.reduce(torch.stack(((e_last.detach() * m).sum(), m.sum())))
     return loss.detach() / args.wm_window, error[0] / error[1].clamp(min=1)
+
+
+wm_step = GraphedCall(_wm_step)
+
+
+def wm_update():
+    w = buffer.sample_windows(local_wm_batch, args.wm_window)
+    return wm_step(w["s"], w["a"], w["xi"], w["s1"], w["mask"])
 
 
 def sample_valid_starts(B: int):
@@ -243,26 +299,31 @@ def sample_valid_starts(B: int):
     return cat(starts), cat(hists)
 
 
-PROFILE = bool(int(os.environ.get("SM_PROFILE", "0")))
+def survival(d):
+    """Soft survival weights c_{t+1} = prod_{i<=t} (1 - d_i) along the imagined horizon (dim 0).
+
+    cumprod's backward branches on zeros in its input on the host, which a captured graph cannot do,
+    so graphs use the same running product written out step by step.
+    """
+    if not USE_GRAPH:
+        return torch.cumprod(1 - d, 0)
+    out, c = [], torch.ones_like(d[0])
+    for t in range(d.shape[0]):
+        c = c * (1 - d[t])
+        out.append(c)
+    return torch.stack(out)
 
 
-def policy_update():
+def _policy_step(s_flat, xi, f, a_prev, o_hist):
+    """Imagine HZ steps through the frozen world model, backpropagate the return and step the policy."""
     if PROFILE:
         torch.cuda.synchronize(); tq0 = time.time()
-    with parallel.coordinated("policy replay sampling"):
-        s, h = sample_valid_starts(local_pi_batch)
-    S = unflatten_state(s["s"])
-    xi, f, a_prev = s["xi"], s["f"], s["a_prev"]
+    S = unflatten_state(s_flat)
     xi_n = normalize_xi(xi)
-    with torch.no_grad():
-        o_hist = mdp.obs(unflatten_state(h["s"]), h["a_prev"], h["xi"], h["f"])
-    o_hist = mdp.add_noise(o_hist)
-    set_requires_grad(wm, False)
-    set_requires_grad(critic, False)
     B = local_pi_batch
     g0 = motion.goal(f, K)
     g = g0
-    S0 = S
+    S0, f0 = S, f
     Ss, As, Aps, Fs, Gs = [], [], [], [], []
     for t in range(HZ):
         Aps.append(a_prev)
@@ -273,7 +334,7 @@ def policy_update():
     f_all = flat(Fs)
     r, d = reward_term(S_all, f_all, flat(As), flat(Aps))
     r, d = r.view(HZ, B), d.view(HZ, B)
-    alive = torch.cumprod(1 - d, 0)  # c_{t+1}
+    alive = survival(d)  # c_{t+1}
     c_t = torch.cat((torch.ones(1, B, device=dev), alive[:-1]), 0)
     disc = args.gamma ** torch.arange(HZ, device=dev, dtype=torch.float32).unsqueeze(-1)
     J = (disc * c_t * r).sum(0)
@@ -294,17 +355,38 @@ def policy_update():
     nn.utils.clip_grad_value_(pi.parameters(), 0.1)
     finite_pi_grad = torch.isfinite(gn)
     nonfinite[2].logical_or_(~finite_pi_grad)
-    if bool(finite_pi_grad):
+    # A captured graph cannot branch on the host, so it always steps; a non-finite gradient still aborts
+    # the run at the end of this iteration, before anything is logged or saved.
+    if USE_GRAPH or bool(finite_pi_grad):
         opt_pi.step()
+    with torch.no_grad():
+        S_c = tuple(torch.cat((S0[i].unsqueeze(0), torch.stack([St[i].detach() for St in Ss])), 0).flatten(0, 1) for i in range(6))
+        f_c = torch.cat((f0.unsqueeze(0), torch.stack(Fs)), 0).flatten()
+        g_c = torch.cat((g0.unsqueeze(0), torch.stack(Gs)), 0).flatten(0, 1)
+    tq = (tq0, tq1, tq2) if PROFILE else ()
+    return (loss.detach(), gn.detach(), (r_sum / HZ / 0.1).mean(), c.mean().detach(), rews, dones, xi_n,
+            S_c, f_c, g_c) + tq
+
+
+policy_step = GraphedCall(_policy_step)
+
+
+def policy_update():
+    with parallel.coordinated("policy replay sampling"):
+        s, h = sample_valid_starts(local_pi_batch)
+    with torch.no_grad():
+        o_hist = mdp.obs(unflatten_state(h["s"]), h["a_prev"], h["xi"], h["f"])
+    o_hist = mdp.add_noise(o_hist)
+    set_requires_grad(wm, False)
+    set_requires_grad(critic, False)
+    loss, gn, imag_r, surv, rews, dones, xi_n, S_c, f_c, g_c, *tq = policy_step(s["s"], s["xi"], s["f"], s["a_prev"], o_hist)
     set_requires_grad(wm, True)
     set_requires_grad(critic, True)
+    B = local_pi_batch
     # ---------------- critic: GAE(lambda) targets over the imagined transitions ----------------
     v_loss = torch.zeros(())
     if not args.no_critic:
         with torch.no_grad():
-            S_c = tuple(torch.cat((S0[i].unsqueeze(0), torch.stack([St[i].detach() for St in Ss])), 0).flatten(0, 1) for i in range(6))
-            f_c = torch.cat((s["f"].unsqueeze(0), torch.stack(Fs)), 0).flatten()
-            g_c = torch.cat((g0.unsqueeze(0), torch.stack(Gs)), 0).flatten(0, 1)
             xi_c = xi_n.unsqueeze(0).expand(HZ + 1, -1, -1).flatten(0, 1)
             X = critic_input_c(S_c, f_c, xi_c, g_c).view(HZ + 1, B, -1)
         critic.norm.update(X)
@@ -330,8 +412,9 @@ def policy_update():
                 opt_v.step()
     if PROFILE:
         torch.cuda.synchronize()
+        tq0, tq1, tq2 = tq
         print(f"[prof] imagine fwd {1e3*(tq1-tq0):.0f} ms | bwd {1e3*(tq2-tq1):.0f} ms | critic {1e3*(time.time()-tq2):.0f} ms", flush=True)
-    return loss.detach(), v_loss.detach(), (r_sum / HZ / 0.1).mean(), gn.detach(), c.mean().detach()
+    return loss, v_loss.detach(), imag_r, gn, surv
 
 
 # ------------------------------------------------------------------------------------------------
@@ -380,7 +463,10 @@ for it in range(start_it, args.iterations):
     lr = lr_at(it)
     for o in (opt_wm, opt_pi, opt_v):
         for gparam in o.param_groups:
-            gparam["lr"] = lr
+            if torch.is_tensor(gparam["lr"]):
+                gparam["lr"].fill_(lr)
+            else:
+                gparam["lr"] = lr
     step_acc += 1.0 / args.utd
     n = int(step_acc)
     step_acc -= n
