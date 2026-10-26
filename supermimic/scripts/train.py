@@ -198,10 +198,10 @@ def set_requires_grad(m: nn.Module, flag: bool):
         p.requires_grad_(flag)
 
 
-# Non-finite world-model/critic gradients are flagged on the GPU and checked once per iteration:
+# Non-finite world-model/critic/policy gradients are flagged on the GPU and checked once per iteration:
 # a host sync after each of the 10 world-model and 20 critic updates stalls the GPU queue.
 # The check runs before logging and checkpointing, so a corrupted step aborts without being saved.
-nonfinite = torch.zeros(2, dtype=torch.bool, device=dev)
+nonfinite = torch.zeros(3, dtype=torch.bool, device=dev)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -286,7 +286,9 @@ def policy_update():
         torch.cuda.synchronize(); tq2 = time.time()
     gn = nn.utils.clip_grad_norm_(pi.parameters(), 1.0)
     nn.utils.clip_grad_value_(pi.parameters(), 0.1)
-    if torch.isfinite(gn):
+    finite_pi_grad = torch.isfinite(gn)
+    nonfinite[2].logical_or_(~finite_pi_grad)
+    if bool(finite_pi_grad):
         opt_pi.step()
     set_requires_grad(wm, True)
     set_requires_grad(critic, True)
@@ -394,7 +396,7 @@ for it in range(start_it, args.iterations):
             print(f"[prof] collect {1e3*(tp1-tp0):.0f} ms ({n} steps) | wm {1e3*(tp2-tp1):.0f} ms | policy+critic {1e3*(tp3-tp2):.0f} ms", flush=True)
         agg["pi"].append(pl), agg["v"].append(vl), agg["ir"].append(ir), agg["gn"].append(gn), agg["surv"].append(surv)
     if bool(nonfinite.any()):
-        which = [name for name, bad in zip(("world-model", "critic"), nonfinite.tolist()) if bad]
+        which = [name for name, bad in zip(("world-model", "critic", "policy"), nonfinite.tolist()) if bad]
         raise FloatingPointError(f"non-finite globally averaged {' and '.join(which)} gradient at iteration {it + 1}")
     if (it + 1) % args.log_every == 0:
         keys = list(agg) + ["r"]
