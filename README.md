@@ -9,10 +9,10 @@
 
 ## 当前状态
 
-- 阶段：实现v0.1.0（训练闭环、评估、数据/自检脚本），规划v2.2。
-- 目标层级：T2，即在129,514段基准上复现主结果；T3除实机外全部排期。
+- 阶段：实现v0.1.0（训练闭环、评估、数据/自检脚本）。
+- 目标：在129,514段基准上复现论文主结果。
 - 算力：8卡H100服务器负责训练与评估；RTX 5080与RTX 4070 Ti SUPER负责开发。
-- 依赖版本：以`pyproject.toml`与`uv.lock`为准（mjlab 1.6.0、mujoco-warp 3.11.0、warp-lang 1.18.0、torch 2.14.1+cu130），规划D4已同步。
+- 依赖版本：以`pyproject.toml`与`uv.lock`为准（mjlab 1.6.0、mujoco-warp 3.11.0、warp-lang 1.18.0、torch 2.14.1+cu130）。
 - 数据：支持 LAFAN1 CSV 与索引白名单选择的原生 50 Hz G1 HDF5；本仓库 MotionLib 生成参考速度和 FK。
 - 数据/检查点/日志均不入库。
 
@@ -218,9 +218,6 @@ tests/
   test_motion_hdf5.py
   test_evaluation.py
   test_distributed.py
-docs/planning/
-  plan.md
-  rubric.json
 ```
 
 | 路径 | 内容 |
@@ -254,8 +251,6 @@ uv run --frozen python -B -m unittest discover -s tests -v
 
 | 文件 | 内容 |
 | --- | --- |
-| [docs/planning/plan.md](docs/planning/plan.md) | 主张、证据帐本、依赖、显存估算、验收标准、里程碑 |
-| [docs/planning/rubric.json](docs/planning/rubric.json) | 加权评分树，叶子引用验收标准与帐本ID |
 | [docs/analysis/algorithm.md](docs/analysis/algorithm.md) | 论文算法分析：问题设定、世界模型、一阶策略梯度、critic、加速来源与风险 |
 | [docs/analysis/training_pipeline.md](docs/analysis/training_pipeline.md) | 训练流程图与算法细节：采样、重置采样、世界模型拟合、想象推演BPTT、critic、评估、实现与论文差异 |
 | [docs/analysis/formulas.md](docs/analysis/formulas.md) | 公式精讲：每个公式按直觉、拆分、符号、数值算例、代码位置逐项讲解 |

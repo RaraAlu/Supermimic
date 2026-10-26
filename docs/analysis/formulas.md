@@ -954,7 +954,7 @@ $$
 \mathrm{NR}_{\mathrm{mean}} = \frac{1.0 + 0.5}{2} = 0.75, \qquad \mathrm{NR}_{\mathrm{frame}} = \frac{100 \times 1.0 + 1000 \times 0.5}{1100} \approx 0.545
 $$
 
-差别可以很大。论文没说用的是哪一种（规划L-EVAL-2），所以两种都报告。
+差别可以很大。论文没说用的是哪一种，所以两种都报告。
 
 代码：`supermimic/scripts/evaluate.py`中的`evaluate`。
 
