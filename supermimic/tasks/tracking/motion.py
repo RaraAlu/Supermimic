@@ -236,6 +236,7 @@ class MotionLib:
                         dataset.iter_clips(), kin, device)
         return instance
 
+    @classmethod
     def from_args(cls, args, kin, device, rank=0, world_size=1):
         if getattr(args, "motion_source", None):
             return cls.from_source(args.motion_source, kin, device, args.motion_limit, rank, world_size)

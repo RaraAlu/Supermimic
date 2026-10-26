@@ -96,3 +96,29 @@ class MergedSourceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LoaderWiringTests(unittest.TestCase):
+    """Guards the classmethod wiring used by the script entry points."""
+
+    def test_entry_points_are_classmethods(self):
+        from supermimic.tasks.tracking.motion import MotionLib
+
+        for name in ("from_dir", "from_index", "from_source"):
+            with self.subTest(name=name):
+                self.assertIsInstance(MotionLib.__dict__.get(name), (classmethod, staticmethod))
+        # from_args forwards to ``cls``, so it must be a real classmethod.
+        self.assertIsInstance(MotionLib.__dict__.get("from_args"), classmethod)
+
+    def test_from_args_binds_without_an_instance(self):
+        from types import SimpleNamespace
+
+        from supermimic.tasks.tracking.motion import MotionLib
+
+        bound = MotionLib.from_args
+        self.assertTrue(callable(bound))
+        # A plain function would bind its first argument as ``self`` and expose a
+        # three-parameter signature; a classmethod hides ``cls``.
+        import inspect
+        self.assertEqual(list(inspect.signature(bound).parameters)[:3], ["args", "kin", "device"])
+        self.assertFalse(hasattr(SimpleNamespace(), "from_args"))
