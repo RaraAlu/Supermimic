@@ -1,0 +1,771 @@
+{
+  "summary": {
+    "global": {
+      "seconds_per_iteration": 0.3739360956143354,
+      "iterations_per_second": 2.674253734069484,
+      "projected_320k_hours": 33.238764054607586,
+      "round_seconds_per_iteration": [
+        0.37496207287320654,
+        0.3729101183554643
+      ]
+    },
+    "per_gpu": {
+      "seconds_per_iteration": 0.5724923646391178,
+      "iterations_per_second": 1.746748186991752,
+      "projected_320k_hours": 50.8882101901438,
+      "round_seconds_per_iteration": [
+        0.5728873576657982,
+        0.5720973716124372
+      ]
+    }
+  },
+  "runs": [
+    {
+      "round": 0,
+      "interpretation": "global",
+      "gpus": [
+        0,
+        1
+      ],
+      "path": "/train_result/log/supermimic/codex_opt/paper_two_gpu/round0_global",
+      "seconds_per_iteration": 0.37496207287320654,
+      "iterations_per_second": 2.6669363979597747,
+      "projected_320k_hours": 33.32996203317391,
+      "training_loop_seconds": 168.71292,
+      "timed_iterations": 150,
+      "last_wm_loss": 0.252552,
+      "last_sim_reward": 0.359279,
+      "shards": [
+        {
+          "format": "supermimic_merged_g1_v1",
+          "source": "/train_result/log/train_data/data/boneseed_filtered_114406.h5",
+          "fingerprint": "68264b1469957e66180815549e7e4bf62fb49dcd6f35ea16300458fa69171958",
+          "length_policy": "full_g1_source",
+          "fps": 50,
+          "whitelist_clips": 114406,
+          "selected_clips": 57203,
+          "selected_frames": 19815520,
+          "frame_hours": 110.08622222222223,
+          "shorter_than_33_frames": 4,
+          "source_bytes": 5770667222,
+          "source_binding": "structural metadata digest; file size and mtime checked on load",
+          "partition": {
+            "algorithm": "full_clip_lpt_v1",
+            "rank": 0,
+            "world_size": 2,
+            "clip_indices": {
+              "omitted_item_count": 57203,
+              "sha256_canonical_json": "8189fc0e1ef340b037e82d79c3ef5ba045ce320f0e71cc48ea54e32093ba7ac6",
+              "note": "Full rank manifests remain in remote benchmark logs; large assignment lists omitted."
+            },
+            "frames_per_rank": [
+              19815520,
+              19815520
+            ],
+            "clips_per_rank": [
+              57203,
+              57203
+            ]
+          },
+          "reference_tensor_bytes": 20845927040,
+          "runtime": {
+            "device": "cuda:0",
+            "local_envs": 4096,
+            "local_wm_batch": 1024,
+            "local_pi_batch": 2048,
+            "batch_scope": "global",
+            "global_envs": 8192,
+            "base_lr": 0.000282842712474619
+          }
+        },
+        {
+          "format": "supermimic_merged_g1_v1",
+          "source": "/train_result/log/train_data/data/boneseed_filtered_114406.h5",
+          "fingerprint": "68264b1469957e66180815549e7e4bf62fb49dcd6f35ea16300458fa69171958",
+          "length_policy": "full_g1_source",
+          "fps": 50,
+          "whitelist_clips": 114406,
+          "selected_clips": 57203,
+          "selected_frames": 19815520,
+          "frame_hours": 110.08622222222223,
+          "shorter_than_33_frames": 4,
+          "source_bytes": 5770667222,
+          "source_binding": "structural metadata digest; file size and mtime checked on load",
+          "partition": {
+            "algorithm": "full_clip_lpt_v1",
+            "rank": 1,
+            "world_size": 2,
+            "clip_indices": {
+              "omitted_item_count": 57203,
+              "sha256_canonical_json": "b9d6cabddc8336144f5ad08a47a907568443f324f766dc90712706d92873e58d",
+              "note": "Full rank manifests remain in remote benchmark logs; large assignment lists omitted."
+            },
+            "frames_per_rank": [
+              19815520,
+              19815520
+            ],
+            "clips_per_rank": [
+              57203,
+              57203
+            ]
+          },
+          "reference_tensor_bytes": 20845927040,
+          "runtime": {
+            "device": "cuda:1",
+            "local_envs": 4096,
+            "local_wm_batch": 1024,
+            "local_pi_batch": 2048,
+            "batch_scope": "global",
+            "global_envs": 8192,
+            "base_lr": 0.000282842712474619
+          }
+        }
+      ],
+      "process_wall_seconds": 450.1165580749512
+    },
+    {
+      "round": 0,
+      "interpretation": "per_gpu",
+      "gpus": [
+        4,
+        5
+      ],
+      "path": "/train_result/log/supermimic/codex_opt/paper_two_gpu/round0_per_gpu",
+      "seconds_per_iteration": 0.5728873576657982,
+      "iterations_per_second": 1.7455438431639538,
+      "projected_320k_hours": 50.923320681404284,
+      "training_loop_seconds": 304.074,
+      "timed_iterations": 150,
+      "last_wm_loss": 0.251959,
+      "last_sim_reward": 0.283841,
+      "shards": [
+        {
+          "format": "supermimic_merged_g1_v1",
+          "source": "/train_result/log/train_data/data/boneseed_filtered_114406.h5",
+          "fingerprint": "68264b1469957e66180815549e7e4bf62fb49dcd6f35ea16300458fa69171958",
+          "length_policy": "full_g1_source",
+          "fps": 50,
+          "whitelist_clips": 114406,
+          "selected_clips": 57203,
+          "selected_frames": 19815520,
+          "frame_hours": 110.08622222222223,
+          "shorter_than_33_frames": 4,
+          "source_bytes": 5770667222,
+          "source_binding": "structural metadata digest; file size and mtime checked on load",
+          "partition": {
+            "algorithm": "full_clip_lpt_v1",
+            "rank": 0,
+            "world_size": 2,
+            "clip_indices": {
+              "omitted_item_count": 57203,
+              "sha256_canonical_json": "8189fc0e1ef340b037e82d79c3ef5ba045ce320f0e71cc48ea54e32093ba7ac6",
+              "note": "Full rank manifests remain in remote benchmark logs; large assignment lists omitted."
+            },
+            "frames_per_rank": [
+              19815520,
+              19815520
+            ],
+            "clips_per_rank": [
+              57203,
+              57203
+            ]
+          },
+          "reference_tensor_bytes": 20845927040,
+          "runtime": {
+            "device": "cuda:0",
+            "local_envs": 4096,
+            "local_wm_batch": 2048,
+            "local_pi_batch": 4096,
+            "batch_scope": "global",
+            "global_envs": 8192,
+            "base_lr": 0.000282842712474619
+          }
+        },
+        {
+          "format": "supermimic_merged_g1_v1",
+          "source": "/train_result/log/train_data/data/boneseed_filtered_114406.h5",
+          "fingerprint": "68264b1469957e66180815549e7e4bf62fb49dcd6f35ea16300458fa69171958",
+          "length_policy": "full_g1_source",
+          "fps": 50,
+          "whitelist_clips": 114406,
+          "selected_clips": 57203,
+          "selected_frames": 19815520,
+          "frame_hours": 110.08622222222223,
+          "shorter_than_33_frames": 4,
+          "source_bytes": 5770667222,
+          "source_binding": "structural metadata digest; file size and mtime checked on load",
+          "partition": {
+            "algorithm": "full_clip_lpt_v1",
+            "rank": 1,
+            "world_size": 2,
+            "clip_indices": {
+              "omitted_item_count": 57203,
+              "sha256_canonical_json": "b9d6cabddc8336144f5ad08a47a907568443f324f766dc90712706d92873e58d",
+              "note": "Full rank manifests remain in remote benchmark logs; large assignment lists omitted."
+            },
+            "frames_per_rank": [
+              19815520,
+              19815520
+            ],
+            "clips_per_rank": [
+              57203,
+              57203
+            ]
+          },
+          "reference_tensor_bytes": 20845927040,
+          "runtime": {
+            "device": "cuda:1",
+            "local_envs": 4096,
+            "local_wm_batch": 2048,
+            "local_pi_batch": 4096,
+            "batch_scope": "global",
+            "global_envs": 8192,
+            "base_lr": 0.000282842712474619
+          }
+        }
+      ],
+      "process_wall_seconds": 586.2608072757721
+    },
+    {
+      "round": 1,
+      "interpretation": "global",
+      "gpus": [
+        4,
+        5
+      ],
+      "path": "/train_result/log/supermimic/codex_opt/paper_two_gpu/round1_global",
+      "seconds_per_iteration": 0.3729101183554643,
+      "iterations_per_second": 2.681611334146699,
+      "projected_320k_hours": 33.14756607604127,
+      "training_loop_seconds": 91.34532,
+      "timed_iterations": 150,
+      "last_wm_loss": 0.274205,
+      "last_sim_reward": 0.372953,
+      "shards": [
+        {
+          "format": "supermimic_merged_g1_v1",
+          "source": "/train_result/log/train_data/data/boneseed_filtered_114406.h5",
+          "fingerprint": "68264b1469957e66180815549e7e4bf62fb49dcd6f35ea16300458fa69171958",
+          "length_policy": "full_g1_source",
+          "fps": 50,
+          "whitelist_clips": 114406,
+          "selected_clips": 57203,
+          "selected_frames": 19815520,
+          "frame_hours": 110.08622222222223,
+          "shorter_than_33_frames": 4,
+          "source_bytes": 5770667222,
+          "source_binding": "structural metadata digest; file size and mtime checked on load",
+          "partition": {
+            "algorithm": "full_clip_lpt_v1",
+            "rank": 0,
+            "world_size": 2,
+            "clip_indices": {
+              "omitted_item_count": 57203,
+              "sha256_canonical_json": "8189fc0e1ef340b037e82d79c3ef5ba045ce320f0e71cc48ea54e32093ba7ac6",
+              "note": "Full rank manifests remain in remote benchmark logs; large assignment lists omitted."
+            },
+            "frames_per_rank": [
+              19815520,
+              19815520
+            ],
+            "clips_per_rank": [
+              57203,
+              57203
+            ]
+          },
+          "reference_tensor_bytes": 20845927040,
+          "runtime": {
+            "device": "cuda:0",
+            "local_envs": 4096,
+            "local_wm_batch": 1024,
+            "local_pi_batch": 2048,
+            "batch_scope": "global",
+            "global_envs": 8192,
+            "base_lr": 0.000282842712474619
+          }
+        },
+        {
+          "format": "supermimic_merged_g1_v1",
+          "source": "/train_result/log/train_data/data/boneseed_filtered_114406.h5",
+          "fingerprint": "68264b1469957e66180815549e7e4bf62fb49dcd6f35ea16300458fa69171958",
+          "length_policy": "full_g1_source",
+          "fps": 50,
+          "whitelist_clips": 114406,
+          "selected_clips": 57203,
+          "selected_frames": 19815520,
+          "frame_hours": 110.08622222222223,
+          "shorter_than_33_frames": 4,
+          "source_bytes": 5770667222,
+          "source_binding": "structural metadata digest; file size and mtime checked on load",
+          "partition": {
+            "algorithm": "full_clip_lpt_v1",
+            "rank": 1,
+            "world_size": 2,
+            "clip_indices": {
+              "omitted_item_count": 57203,
+              "sha256_canonical_json": "b9d6cabddc8336144f5ad08a47a907568443f324f766dc90712706d92873e58d",
+              "note": "Full rank manifests remain in remote benchmark logs; large assignment lists omitted."
+            },
+            "frames_per_rank": [
+              19815520,
+              19815520
+            ],
+            "clips_per_rank": [
+              57203,
+              57203
+            ]
+          },
+          "reference_tensor_bytes": 20845927040,
+          "runtime": {
+            "device": "cuda:1",
+            "local_envs": 4096,
+            "local_wm_batch": 1024,
+            "local_pi_batch": 2048,
+            "batch_scope": "global",
+            "global_envs": 8192,
+            "base_lr": 0.000282842712474619
+          }
+        }
+      ],
+      "process_wall_seconds": 336.11520552635193
+    },
+    {
+      "round": 1,
+      "interpretation": "per_gpu",
+      "gpus": [
+        0,
+        1
+      ],
+      "path": "/train_result/log/supermimic/codex_opt/paper_two_gpu/round1_per_gpu",
+      "seconds_per_iteration": 0.5720973716124372,
+      "iterations_per_second": 1.7479541938490883,
+      "projected_320k_hours": 50.853099698883305,
+      "training_loop_seconds": 131.13144,
+      "timed_iterations": 150,
+      "last_wm_loss": 0.238369,
+      "last_sim_reward": 0.33619,
+      "shards": [
+        {
+          "format": "supermimic_merged_g1_v1",
+          "source": "/train_result/log/train_data/data/boneseed_filtered_114406.h5",
+          "fingerprint": "68264b1469957e66180815549e7e4bf62fb49dcd6f35ea16300458fa69171958",
+          "length_policy": "full_g1_source",
+          "fps": 50,
+          "whitelist_clips": 114406,
+          "selected_clips": 57203,
+          "selected_frames": 19815520,
+          "frame_hours": 110.08622222222223,
+          "shorter_than_33_frames": 4,
+          "source_bytes": 5770667222,
+          "source_binding": "structural metadata digest; file size and mtime checked on load",
+          "partition": {
+            "algorithm": "full_clip_lpt_v1",
+            "rank": 0,
+            "world_size": 2,
+            "clip_indices": {
+              "omitted_item_count": 57203,
+              "sha256_canonical_json": "8189fc0e1ef340b037e82d79c3ef5ba045ce320f0e71cc48ea54e32093ba7ac6",
+              "note": "Full rank manifests remain in remote benchmark logs; large assignment lists omitted."
+            },
+            "frames_per_rank": [
+              19815520,
+              19815520
+            ],
+            "clips_per_rank": [
+              57203,
+              57203
+            ]
+          },
+          "reference_tensor_bytes": 20845927040,
+          "runtime": {
+            "device": "cuda:0",
+            "local_envs": 4096,
+            "local_wm_batch": 2048,
+            "local_pi_batch": 4096,
+            "batch_scope": "global",
+            "global_envs": 8192,
+            "base_lr": 0.000282842712474619
+          }
+        },
+        {
+          "format": "supermimic_merged_g1_v1",
+          "source": "/train_result/log/train_data/data/boneseed_filtered_114406.h5",
+          "fingerprint": "68264b1469957e66180815549e7e4bf62fb49dcd6f35ea16300458fa69171958",
+          "length_policy": "full_g1_source",
+          "fps": 50,
+          "whitelist_clips": 114406,
+          "selected_clips": 57203,
+          "selected_frames": 19815520,
+          "frame_hours": 110.08622222222223,
+          "shorter_than_33_frames": 4,
+          "source_bytes": 5770667222,
+          "source_binding": "structural metadata digest; file size and mtime checked on load",
+          "partition": {
+            "algorithm": "full_clip_lpt_v1",
+            "rank": 1,
+            "world_size": 2,
+            "clip_indices": {
+              "omitted_item_count": 57203,
+              "sha256_canonical_json": "b9d6cabddc8336144f5ad08a47a907568443f324f766dc90712706d92873e58d",
+              "note": "Full rank manifests remain in remote benchmark logs; large assignment lists omitted."
+            },
+            "frames_per_rank": [
+              19815520,
+              19815520
+            ],
+            "clips_per_rank": [
+              57203,
+              57203
+            ]
+          },
+          "reference_tensor_bytes": 20845927040,
+          "runtime": {
+            "device": "cuda:1",
+            "local_envs": 4096,
+            "local_wm_batch": 2048,
+            "local_pi_batch": 4096,
+            "batch_scope": "global",
+            "global_envs": 8192,
+            "base_lr": 0.000282842712474619
+          }
+        }
+      ],
+      "process_wall_seconds": 390.3746795654297
+    }
+  ],
+  "validation": {
+    "runs_completed": 4,
+    "iterations_each": 200,
+    "all_logged_values_finite": true,
+    "actual_rank_config_verified": true,
+    "clips": 114406,
+    "frames": 39631040,
+    "finished_at": "2026-10-27T02:23:17+08:00",
+    "exit_code": 0
+  },
+  "metadata": {
+    "paper": "https://arxiv.org/pdf/2610.28480v1",
+    "batch_scope_confirmed_by_author": false,
+    "interpretation": "primary: batches per update are global; alternative: per GPU",
+    "head": "e2faefe1fd84b79db3aeb324648785a335fe13d0",
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "plans": [
+      {
+        "round": 0,
+        "interpretation": "global",
+        "gpus": [
+          0,
+          1
+        ],
+        "path": "/train_result/log/supermimic/codex_opt/paper_two_gpu/round0_global",
+        "command": [
+          "/train_result/log/train_data/.venv/bin/python",
+          "-m",
+          "torch.distributed.run",
+          "--standalone",
+          "--nproc-per-node=2",
+          "-m",
+          "supermimic.scripts.train",
+          "--batch_scope",
+          "global",
+          "--num_envs",
+          "8192",
+          "--wm_batch",
+          "2048",
+          "--pi_batch",
+          "4096",
+          "--wm_batches",
+          "10",
+          "--wm_window",
+          "8",
+          "--horizon",
+          "32",
+          "--goal_frames",
+          "10",
+          "--hist",
+          "10",
+          "--buffer_steps",
+          "1000",
+          "--utd",
+          "0.4",
+          "--lr",
+          "0.0002",
+          "--lr_scaling",
+          "sqrt",
+          "--lr_decay_iters",
+          "250000",
+          "--gamma",
+          "0.99",
+          "--lam",
+          "0.95",
+          "--action_noise",
+          "0.1",
+          "--critic_epochs",
+          "5",
+          "--critic_minibatches",
+          "4",
+          "--amp",
+          "none",
+          "--warmup_steps",
+          "64",
+          "--wm_only_iters",
+          "0",
+          "--compile",
+          "on",
+          "--cuda_graph",
+          "on",
+          "--seed",
+          "0",
+          "--motion_source",
+          "/train_result/log/train_data/data/boneseed_filtered_114406.h5",
+          "--iterations",
+          "200",
+          "--log_every",
+          "10",
+          "--ckpt_every",
+          "200",
+          "--log_dir",
+          "/train_result/log/supermimic/codex_opt/paper_two_gpu/round0_global"
+        ]
+      },
+      {
+        "round": 0,
+        "interpretation": "per_gpu",
+        "gpus": [
+          4,
+          5
+        ],
+        "path": "/train_result/log/supermimic/codex_opt/paper_two_gpu/round0_per_gpu",
+        "command": [
+          "/train_result/log/train_data/.venv/bin/python",
+          "-m",
+          "torch.distributed.run",
+          "--standalone",
+          "--nproc-per-node=2",
+          "-m",
+          "supermimic.scripts.train",
+          "--batch_scope",
+          "global",
+          "--num_envs",
+          "8192",
+          "--wm_batch",
+          "4096",
+          "--pi_batch",
+          "8192",
+          "--wm_batches",
+          "10",
+          "--wm_window",
+          "8",
+          "--horizon",
+          "32",
+          "--goal_frames",
+          "10",
+          "--hist",
+          "10",
+          "--buffer_steps",
+          "1000",
+          "--utd",
+          "0.4",
+          "--lr",
+          "0.0002",
+          "--lr_scaling",
+          "sqrt",
+          "--lr_decay_iters",
+          "250000",
+          "--gamma",
+          "0.99",
+          "--lam",
+          "0.95",
+          "--action_noise",
+          "0.1",
+          "--critic_epochs",
+          "5",
+          "--critic_minibatches",
+          "4",
+          "--amp",
+          "none",
+          "--warmup_steps",
+          "64",
+          "--wm_only_iters",
+          "0",
+          "--compile",
+          "on",
+          "--cuda_graph",
+          "on",
+          "--seed",
+          "0",
+          "--motion_source",
+          "/train_result/log/train_data/data/boneseed_filtered_114406.h5",
+          "--iterations",
+          "200",
+          "--log_every",
+          "10",
+          "--ckpt_every",
+          "200",
+          "--log_dir",
+          "/train_result/log/supermimic/codex_opt/paper_two_gpu/round0_per_gpu"
+        ]
+      },
+      {
+        "round": 1,
+        "interpretation": "global",
+        "gpus": [
+          4,
+          5
+        ],
+        "path": "/train_result/log/supermimic/codex_opt/paper_two_gpu/round1_global",
+        "command": [
+          "/train_result/log/train_data/.venv/bin/python",
+          "-m",
+          "torch.distributed.run",
+          "--standalone",
+          "--nproc-per-node=2",
+          "-m",
+          "supermimic.scripts.train",
+          "--batch_scope",
+          "global",
+          "--num_envs",
+          "8192",
+          "--wm_batch",
+          "2048",
+          "--pi_batch",
+          "4096",
+          "--wm_batches",
+          "10",
+          "--wm_window",
+          "8",
+          "--horizon",
+          "32",
+          "--goal_frames",
+          "10",
+          "--hist",
+          "10",
+          "--buffer_steps",
+          "1000",
+          "--utd",
+          "0.4",
+          "--lr",
+          "0.0002",
+          "--lr_scaling",
+          "sqrt",
+          "--lr_decay_iters",
+          "250000",
+          "--gamma",
+          "0.99",
+          "--lam",
+          "0.95",
+          "--action_noise",
+          "0.1",
+          "--critic_epochs",
+          "5",
+          "--critic_minibatches",
+          "4",
+          "--amp",
+          "none",
+          "--warmup_steps",
+          "64",
+          "--wm_only_iters",
+          "0",
+          "--compile",
+          "on",
+          "--cuda_graph",
+          "on",
+          "--seed",
+          "0",
+          "--motion_source",
+          "/train_result/log/train_data/data/boneseed_filtered_114406.h5",
+          "--iterations",
+          "200",
+          "--log_every",
+          "10",
+          "--ckpt_every",
+          "200",
+          "--log_dir",
+          "/train_result/log/supermimic/codex_opt/paper_two_gpu/round1_global"
+        ]
+      },
+      {
+        "round": 1,
+        "interpretation": "per_gpu",
+        "gpus": [
+          0,
+          1
+        ],
+        "path": "/train_result/log/supermimic/codex_opt/paper_two_gpu/round1_per_gpu",
+        "command": [
+          "/train_result/log/train_data/.venv/bin/python",
+          "-m",
+          "torch.distributed.run",
+          "--standalone",
+          "--nproc-per-node=2",
+          "-m",
+          "supermimic.scripts.train",
+          "--batch_scope",
+          "global",
+          "--num_envs",
+          "8192",
+          "--wm_batch",
+          "4096",
+          "--pi_batch",
+          "8192",
+          "--wm_batches",
+          "10",
+          "--wm_window",
+          "8",
+          "--horizon",
+          "32",
+          "--goal_frames",
+          "10",
+          "--hist",
+          "10",
+          "--buffer_steps",
+          "1000",
+          "--utd",
+          "0.4",
+          "--lr",
+          "0.0002",
+          "--lr_scaling",
+          "sqrt",
+          "--lr_decay_iters",
+          "250000",
+          "--gamma",
+          "0.99",
+          "--lam",
+          "0.95",
+          "--action_noise",
+          "0.1",
+          "--critic_epochs",
+          "5",
+          "--critic_minibatches",
+          "4",
+          "--amp",
+          "none",
+          "--warmup_steps",
+          "64",
+          "--wm_only_iters",
+          "0",
+          "--compile",
+          "on",
+          "--cuda_graph",
+          "on",
+          "--seed",
+          "0",
+          "--motion_source",
+          "/train_result/log/train_data/data/boneseed_filtered_114406.h5",
+          "--iterations",
+          "200",
+          "--log_every",
+          "10",
+          "--ckpt_every",
+          "200",
+          "--log_dir",
+          "/train_result/log/supermimic/codex_opt/paper_two_gpu/round1_per_gpu"
+        ]
+      }
+    ],
+    "initial_replay_collection_steps": 64,
+    "wm_only_iterations": 0,
+    "skip": 50,
+    "started_unix": 1793038020.7011085
+  }
+}

@@ -154,14 +154,22 @@ CSV 也支持相同的分片规则，但会先在 CPU 解析/重采样所选 CSV
 严格保持总量，梯度按实际本地样本数加权；总量小于进程数时直接报错。
 默认 8 卡对应每卡 512 环境、256 世界模型样本、512 策略样本；3/5/6/7 卡也无需手工整除批大小。
 
-论文表 A.5 的多卡口径不同：每卡 4096 环境、每卡 10×2048 世界模型窗口和 4096 条想象推演，
-数据并行，双卡学习率乘 √2。用 `--batch_scope per_gpu` 把三个批量参数解释为每卡大小，
-用 `--lr_scaling sqrt` 把学习率乘以 √WORLD_SIZE（双卡即论文的 √2；更多卡时是按同一规则外推，论文未给出）：
+论文表 A.5 明确规定每卡4096环境、双卡学习率乘√2；世界模型批量2048与策略批量4096仅标为
+“per update”，PDF及arXiv的LaTeX原始文件都没有进一步标注全局或每卡。不能将三者全部按每卡解释当作作者已确认的设置。
+已测方案A按“每次全局更新”解释：`--batch_scope global --num_envs 8192 --wm_batch 2048 --pi_batch 4096 --lr_scaling sqrt`。
+方案B按每卡批量解释，其全局世界模型/策略批量为4096/8192。两种解读每卡都运行4096环境。
+同行源码与√2学习率的线索更支持方案B，但不是作者确认；两轮实测外推32万次更新分别为33.24/50.89小时。
+精度使用`--amp none`，保留FP32张量并允许TF32矩阵乘法；`--wm_only_iters 0`取消额外的500次世界模型单独训练。
+论文未规定初始replay填充量，此处保留64个采样步；正式迭代从第一轮起同时更新世界模型、策略与critic。
 
 ```bash
-# 论文双卡配置（附录 F.2 的 9.8 h 零失败实验）
-uv run --frozen torchrun --standalone --nproc-per-node=2 -m supermimic.scripts.train --motion_index INDEX --batch_scope per_gpu --lr_scaling sqrt --log_dir logs/two_gpu
+# 全量数据短测：两种批量解读各用两卡，每组200次，第二轮交换GPU对。
+# 该入口限制为最多1000次迭代，没有长训模式；输出目录必须是新目录。
+uv run --frozen python scripts/benchmark_paper_two_gpu.py --motion_source SOURCE \
+  --gpus 0 1 4 5 --output_dir logs/paper_two_gpu --iterations 200 --skip 50
 ```
+
+表A.5原始证据、每卡实际批量及时间估算见[双卡短测记录](docs/analysis/paper_two_gpu.md)。
 
 每卡动作数和帧数无需整除；动作不足以覆盖各进程，或某分片没有完整想象起点时会协调报错。
 `--motion_limit` 在分片前作用于全局选择，不是每卡各取该数量。

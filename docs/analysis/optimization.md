@@ -153,7 +153,7 @@ uv run --frozen python scripts/profile_train.py --report logs/profile.json --wai
 - 减少每次迭代的世界模型批数（10批）或窗口长度（k=8）；
 - 缩小世界模型或策略网络（2048宽MLP）；
 - 提高更新数据比、缩短想象长度H；
-- 用fp16或fp8替代bf16做推演；
+- 用FP16、BF16或FP8替代论文的TF32做推演（历史BF16测量是性能实验）；
 - 用多步动作或降低控制频率减少仿真步数。
 
 ## 6. 实施记录（2026-10-26，分支`perf/systematic-opt`）
@@ -195,7 +195,8 @@ uv run --frozen python scripts/profile_train.py --report logs/profile.json --wai
 
 **环境与口径**
 - 服务器A100（Linux，Python 3.12，torch 2.14.1+cu130，`torch.compile`可用），每个实验单卡（双卡检查除外）。
-- 论文单卡口径：4096环境，世界模型10批×2048窗口，策略批4096，`--buffer_steps 1000 --amp bf16 --fused_adam on --seed 0`；
+- 单卡性能实验：4096环境，世界模型10批×2048窗口，策略批4096，`--buffer_steps 1000 --amp bf16 --fused_adam on --seed 0`；
+  环境与批量取论文单卡值，但BF16不等于论文图5所述TF32，不能称为完整论文复现配置。
   数据为过滤后BONES-SEED的前5000段（`--motion_limit 5000`）。
 - 速度取第30次迭代之后it/s均值的倒数。“配对”指同一批次、在不同卡上同时运行的对照组；不同批次之间的绝对值随服务器负载浮动几个百分点，只比较同批数字。
 - 逐位检查：`scripts/check_cuda_graph.py`，单卡与`torchrun --nproc-per-node=2 ... --batch_scope per_gpu`（NCCL）各跑一次，运行时`torch.compile`为on。
@@ -363,3 +364,10 @@ buffer 1000步、warmup 64步、5次世界模型预训练，BF16、compile与其
 
 验证日志在服务器`/train_result/log/supermimic/codex_opt/tmux/`：
 `codex-opt-unit53.log`、`codex-opt-capture1.log`、`codex-opt-capture2.log`、`codex-opt-compile2.log`及`codex-opt-bench-run.log`。
+
+
+## 9. 双卡TF32、全量可用数据短测（2026-10-27）
+
+取消500次世界模型预训练、每卡4096环境、学习率乘sqrt(2)，两种批量解释各跑两轮200次。
+全局2048/4096批量为0.373936秒/迭代，按每卡2048/4096为0.572492秒/迭代；
+32万次更新分别外推33.24/50.89小时。原始证据、同行核对、全部设置与限制见[双卡短测记录](paper_two_gpu.md)。
