@@ -75,6 +75,22 @@ def average_gradients(module, sample_count=1, total_count=None):
 
 
 @torch.no_grad()
+def update_bin_returns(estimates, bins, returns, alpha=0.2):
+    """Apply one EMA update per bin using its mean episode return in this simulator step.
+
+    Several environments can finish in the same bin. Sort them in a stable order and reduce each
+    segment before writing: index_put_ with duplicate destinations silently loses observations and
+    has undefined results on CUDA. Unique bins retain the original single-episode update exactly.
+    """
+    if bins.numel() == 0:
+        return
+    order = torch.argsort(bins, stable=True)
+    unique, counts = torch.unique_consecutive(bins[order], return_counts=True)
+    means = torch.segment_reduce(returns[order], "mean", lengths=counts)
+    estimates[unique] = (1 - alpha) * estimates[unique] + alpha * means
+
+
+@torch.no_grad()
 def global_bin_probabilities(returns, ema, maximum_return, num_bins, parallel):
     """Global 50/40/10 reset weights; sampling remains conditional on the local shard."""
     logits = -25.0 * returns / maximum_return

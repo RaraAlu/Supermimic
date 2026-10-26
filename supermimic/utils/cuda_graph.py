@@ -34,3 +34,11 @@ class GraphedCall:
         tree_map(lambda dst, src: dst.copy_(src), self.static_in, inputs)
         self.graph.replay()
         return tree_map(torch.clone, self.static_out)
+
+    def close(self):
+        """Release captured NCCL operations before destroying their process group."""
+        if self.graph is not None:
+            self.graph.reset()
+            self.graph = None
+            del self.static_in, self.static_out
+        self.calls = 0

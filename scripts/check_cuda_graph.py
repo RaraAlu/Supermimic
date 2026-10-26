@@ -66,13 +66,15 @@ def compare(name, module, opt, inputs, pre=lambda: None, post=lambda: None):
     eager_params = [t.detach().clone() for t in module.state_dict(keep_vars=True).values()]
     graphed = g["GraphedCall"](fn, eager_calls=0)
     restore(module, opt, snap); torch.cuda.set_rng_state(rng)
-    pre(); graphed(*inputs); post()  # capture, then replay
+    pre(); first_out = graphed(*inputs); post()  # capture, then replay
+    first_ok = all(torch.equal(a, b) for a, b in zip(tensors(eager_out), tensors(first_out)))
+    first_ok &= all(torch.equal(a, b.detach()) for a, b in zip(eager_params, module.state_dict(keep_vars=True).values()))
     restore(module, opt, snap); torch.cuda.set_rng_state(rng)
     pre(); graph_out = graphed(*inputs); post()  # replay from the eager call's starting state
     outs = all(torch.equal(a, b) for a, b in zip(tensors(eager_out), tensors(graph_out)))
     params = all(torch.equal(a, b.detach()) for a, b in zip(eager_params, module.state_dict(keep_vars=True).values()))
-    print(f"rank {rank} {name}: outputs bitwise equal {outs}, updated parameters and buffers bitwise equal {params}", flush=True)
-    return outs and params
+    print(f"rank {rank} {name}: first capture+replay bitwise equal {first_ok}, outputs bitwise equal {outs}, updated parameters and buffers bitwise equal {params}", flush=True)
+    return first_ok and outs and params
 
 
 w = g["buffer"].sample_windows(g["local_wm_batch"], g["args"].wm_window)
@@ -90,6 +92,31 @@ if g["GRAPH_CRITIC"]:
     rews, dones, xi_n, S_c, f_c, g_c = out[4:10]
     ok &= compare("critic_step", critic, g["opt_v"], (rews, dones, xi_n, S_c, f_c, g_c))
 env = g["env"]
+if g["collect_action"].enabled:
+    ok &= compare("collect_action", pi, opt_pi,
+                  (env.state(), env.a_prev, env.xi, env.f, env.ep_step, g["obs_hist"]))
+# Compare the actual post-processing on both sides of reset, using the same transition and the same
+# starting normalizer/buffer state. Replaying physics would introduce simulator nondeterminism.
+buffer, store = g["buffer"], g["store_transition"]
+norms = (wm.in_norm, wm.out_norm)
+overlap_same = True
+for _ in range(3):
+    saved = [{k: v.clone() for k, v in norm.state_dict().items()} for norm in norms]
+    ptr, size = buffer.ptr, buffer.size
+    action = torch.randn(env.N, 29, device=env.device)
+    with torch.no_grad():
+        transition = env.step(action, after_step=store)
+    expected = [{k: v.clone() for k, v in norm.state_dict().items()} for norm in norms]
+    row = {k: v[ptr].clone() for k, v in buffer.data.items()}
+    for norm, state in zip(norms, saved):
+        norm.load_state_dict(state)
+    buffer.ptr, buffer.size = ptr, size
+    store(transition)
+    overlap_same &= all(torch.equal(v, state[k]) for norm, state in zip(norms, expected)
+                        for k, v in norm.state_dict().items())
+    overlap_same &= all(torch.equal(buffer.data[k][ptr], v) for k, v in row.items())
+print(f"rank {rank} collection overlap: replay row and world-model normalizers bitwise equal {overlap_same}", flush=True)
+ok &= overlap_same
 if env._reward_termination.enabled:
     S1, f1 = env.state(), env.f + 1
     a, a_prev = torch.randn(env.N, 29, device=env.device), env.a_prev.clone()
@@ -100,5 +127,7 @@ if env._reward_termination.enabled:
     same = all(torch.equal(x, y) for x, y in zip(tensors(eager_out), tensors(graph_out)))
     print(f"rank {rank} env reward/termination: outputs bitwise equal {same} ({len(tensors(eager_out))} tensors)", flush=True)
     ok &= same
+for captured in (g["wm_step"], g["policy_step"], g["critic_step"], g["collect_action"], env._reward_termination):
+    captured.close()
 close(g["parallel"])
 sys.exit(0 if ok else 1)

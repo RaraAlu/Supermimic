@@ -53,11 +53,15 @@ parser.add_argument("--fused_adam", type=str, default="on", choices=["on", "off"
 parser.add_argument("--compile", type=str, default="auto", choices=["auto", "on", "off"], help="torch.compile (auto: only if triton is installed)")
 parser.add_argument("--cuda_graph", type=str, default="auto", choices=["auto", "on", "off"],
                     help="replay the world-model step and the policy imagination+BPTT step as CUDA graphs "
-                         "(auto: single CUDA process without torch.compile or SM_PROFILE; multi-GPU needs on)")
+                         "(auto: single CUDA process without SM_PROFILE, including torch.compile; multi-GPU needs on)")
 parser.add_argument("--cuda_graph_critic", type=str, default="on", choices=["on", "off"],
                     help="with CUDA graphs on, also replay the critic update (GAE targets and its minibatch steps)")
 parser.add_argument("--cuda_graph_env", type=str, default="on", choices=["on", "off"],
                     help="with CUDA graphs on, also replay the simulator step's reward and termination")
+parser.add_argument("--cuda_graph_collect", type=str, default="on", choices=["on", "off"],
+                    help="with CUDA graphs on, replay collection observations, normalizers, policy and action noise")
+parser.add_argument("--collect_overlap", type=str, default="on", choices=["on", "off"],
+                    help="enqueue replay writes and world-model statistics before the simulator reset waits for CUDA")
 parser.add_argument("--device", type=str, default="cuda:0")
 parser.add_argument("--batch_scope", type=str, default="global", choices=["global", "per_gpu"],
                     help="--num_envs/--wm_batch/--pi_batch are global totals split across ranks, or per-GPU sizes (paper Table A.5)")
@@ -138,8 +142,7 @@ critic = Critic(CRITIC_IN).to(dev)
 FUSED_ADAM = args.fused_adam == "on" and torch.device(dev).type == "cuda"
 PROFILE = bool(int(os.environ.get("SM_PROFILE", "0")))
 USE_GRAPH = args.cuda_graph == "on" or (
-    args.cuda_graph == "auto" and torch.device(dev).type == "cuda" and not parallel.enabled and not PROFILE
-    and not (args.compile == "on" or (args.compile == "auto" and importlib.util.find_spec("triton") is not None)))
+    args.cuda_graph == "auto" and torch.device(dev).type == "cuda" and not parallel.enabled and not PROFILE)
 if USE_GRAPH and torch.device(dev).type != "cuda":
     raise ValueError("--cuda_graph on needs CUDA")
 # Inside graphs the gradient all-reduce uses the fixed global batch sizes (no host round trip).
@@ -431,23 +434,41 @@ obs_hist = torch.zeros(local_envs, Hh, OBS_DIM, device=dev)
 
 
 @torch.no_grad()
+def _collect_action(S, a_prev, xi, f, ep_step, history):
+    """Fixed-shape collection work; all changing environment tensors are explicit graph inputs."""
+    o = mdp.add_noise(mdp.obs(S, a_prev, xi, f))
+    fresh = ep_step == 0
+    history = torch.where(fresh[:, None, None], o.unsqueeze(1).expand_as(history),
+                          torch.cat((history[:, 1:], o.unsqueeze(1)), 1))
+    g = motion.goal(f, K)
+    pi.obs_norm.update(o)
+    pi.goal_norm.update(g)
+    a = pi(history, g)
+    a = torch.clamp(a + args.action_noise * torch.randn_like(a), -20, 20)
+    return a, history
+
+
+collect_action = GraphedCall(_collect_action, enabled=USE_GRAPH and args.cuda_graph_collect == "on")
+
+
+@torch.no_grad()
+def store_transition(out):
+    buffer.add(out)
+    S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
+    wm.in_norm.update(wm.inputs(S0, out["a"], normalize_xi(out["xi"])))
+    wm.out_norm.update(wm.targets(S0, S1))
+
+
+@torch.no_grad()
 def collect(n_steps: int, stats: dict):
     global obs_hist, sim_steps
     for _ in range(n_steps):
         S = env.state()
-        o = mdp.add_noise(mdp.obs(S, env.a_prev, env.xi, env.f))
-        fresh = env.ep_step == 0
-        obs_hist = torch.where(fresh[:, None, None], o.unsqueeze(1).expand_as(obs_hist), torch.cat((obs_hist[:, 1:], o.unsqueeze(1)), 1))
-        g = motion.goal(env.f, K)
-        pi.obs_norm.update(o)
-        pi.goal_norm.update(g)
-        a = pi(obs_hist, g)
-        a = torch.clamp(a + args.action_noise * torch.randn_like(a), -20, 20)
-        out = env.step(a)
-        buffer.add(out)
-        S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
-        wm.in_norm.update(wm.inputs(S0, out["a"], normalize_xi(out["xi"])))
-        wm.out_norm.update(wm.targets(S0, S1))
+        a, obs_hist = collect_action(S, env.a_prev, env.xi, env.f, env.ep_step, obs_hist)
+        overlap = args.collect_overlap == "on"
+        out = env.step(a, after_step=store_transition if overlap else None)
+        if not overlap:
+            store_transition(out)
         sim_steps += global_envs
         stats["r"].append(out["r"].mean() / 0.1)
         if "ep_len" in out:
@@ -536,4 +557,6 @@ for it in range(start_it, args.iterations):
                 os.replace(path + ".tmp", path)
 if log_f:
     log_f.close()
+for captured in (wm_step, policy_step, critic_step, collect_action, env._reward_termination):
+    captured.close()
 parallel.close()

@@ -28,17 +28,23 @@ Windows与Linux（x86_64，NVIDIA GPU）共用同一份`pyproject.toml`、`uv.lo
 | 已验证 | RTX 4070 Ti SUPER，CUDA | RTX 5080，CUDA，`--compile off`；LAFAN1小规模回归通过 |
 
 Linux本次回归使用Python 3.12.3，运行64个环境、4次迭代，验证训练、检查点保存与加载、40条LAFAN1动作评估，以及中文目录中的UTF-8 JSON/CSV读写。
-该结果仅验证运行兼容性，不代表训练质量达标；`--compile auto/on`开启编译的路径与H100尚未验证。
+该结果仅验证运行兼容性，不代表训练质量达标。后续A100上已验证compile与CUDA graph的组合及双卡NCCL图重放；H100尚未实测。
 
-训练默认用CUDA graph重放世界模型更新和策略的想象推演加BPTT（`--cuda_graph auto`：单进程、CUDA、未开`torch.compile`时启用），
+训练默认用CUDA graph重放世界模型更新和策略的想象推演加BPTT（`--cuda_graph auto`：单进程、CUDA、未设`SM_PROFILE`时启用，可与`torch.compile`组合），
 三个优化器默认用fused Adam（`--fused_adam on`）。两者都只改变执行方式，不改变算法；实测与开关见
-[docs/analysis/optimization.md](docs/analysis/optimization.md)第6、7节。用`scripts/profile_train.py`剖析时请加`--cuda_graph off`。
+[docs/analysis/optimization.md](docs/analysis/optimization.md)第6至8节。用`scripts/profile_train.py`剖析时请加`--cuda_graph off`。
 图启用时，critic更新与环境每步的奖励和终止也用图重放（`--cuda_graph_critic`、`--cuda_graph_env`，默认on）。
-Linux上`torch.compile`可用时`auto`不启用图；A100上显式加`--compile on --cuda_graph on`最快（0.51 s/iter，两者全关为1.46 s/iter）。
+采样侧的观测、策略前向与动作噪声也可用图重放（`--cuda_graph_collect on`）；`--collect_overlap on`在reset等待GPU前提交回放写入与世界模型统计。
+两项均有独立开关，完整训练A/B工具为`scripts/benchmark_collect.py`。Linux上`auto`现在可同时开启compile与图；显式复现实验可加`--compile on --cuda_graph on`。
 多卡（torchrun）时`auto`也不启用CUDA graph；加`--cuda_graph on`可在多卡下启用，梯度all-reduce也在图内执行。
 这条路径已在A100双卡（NCCL）上逐位验证；换机器后，正式训练前先在目标机器上运行
 `torchrun --standalone --nproc-per-node=2 scripts/check_cuda_graph.py --motion_limit 8 --batch_scope per_gpu`，
 各rank都输出“bitwise equal True”后再使用。
+
+多个环境在同一仿真步结束于同一个动作bin时，先对该bin的回报取均值，再更新一次EMA，避免重复索引覆盖。
+此修复会改变旧版本在重复bin时未定义的更新结果；性能对照必须在同一修复版本中切换开关。
+`scripts/check_compile_equiv.py`另外检查eager与compile的数值差异；它使用相同噪声、独立恢复的模型及Adam状态，
+默认严格门槛为`--atol 1e-5 --rtol 1e-3`，不把CUDA graph的逐位一致解释为compile与eager逐位一致。
 
 同一目录被两个系统共享（例如虚拟机挂载宿主机磁盘）时，两边不能共用`.venv`：
 `.venv`内的解释器路径与目录结构按系统生成，在一边执行`uv sync`或`uv run`会重建另一边的环境。

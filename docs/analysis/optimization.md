@@ -191,7 +191,7 @@ uv run --frozen python scripts/profile_train.py --report logs/profile.json --wai
 - 3.6 FK按树深度批量：策略推演里的FK已被CUDA graph覆盖，剩余调用在采样和critic特征里，次数少；未实施。
 - 3.1 `torch.compile`、3.7–3.9：需要Linux或H100实测，未在本机进行。A100上compile的实测见7.2节。
 
-## 7. A100实测与后续记录（2026-10-26至27，分支`perf/critic-graph`、`perf/env-reward-graph`，均未合并）
+## 7. A100实测与后续记录（2026-10-26至27，相关提交已进入main）
 
 **环境与口径**
 - 服务器A100（Linux，Python 3.12，torch 2.14.1+cu130，`torch.compile`可用），每个实验单卡（双卡检查除外）。
@@ -223,7 +223,7 @@ uv run --frozen python scripts/profile_train.py --report logs/profile.json --wai
 | on | on | 0.512 s | 2.8× |
 
 - 四组跑到第100次迭代时损失与回报处于同一水平；compile加图时图重放与直接执行逐位一致（单卡与双卡NCCL）。
-- 两者可以叠加。`--cuda_graph auto`在开compile时不启用图，Linux上要显式加`--compile on --cuda_graph on`。
+- 两者可以叠加。当时`--cuda_graph auto`在开compile时不启用图；第8节已调整为单卡auto可同时开启两者。
 - 按0.512 s/iter计，32万次迭代单卡约46 h。论文只给出“单卡3 h回报超过SONIC”，没有写3 h对应的迭代数，两者不能直接按小时比较。
 
 ### 7.3 critic更新放进CUDA graph（`perf/critic-graph`，提交c29e9f6）
@@ -287,7 +287,7 @@ CPU干活的约21 ms里GPU基本空闲，GPU跑物理和奖励的约21 ms里CPU�
 剖析器统计的主机阻塞在`cudaStreamSynchronize`里约15 ms/步，与此一致。
 采样每次迭代2.5步（`--utd 0.4`），约占整次迭代的五分之一。
 
-### 7.6 尚未实施的方向（收益均为估计）
+### 7.6 当时提出的方向（A、B已在第8节实施）
 
 | 方向 | 数值 | 估计收益 |
 | --- | --- | --- |
@@ -296,6 +296,70 @@ CPU干活的约21 ms里GPU基本空闲，GPU跑物理和奖励的约21 ms里CPU�
 | C. 固定形状的掩码重置，去掉`done.nonzero()` | 不逐位一致：每步为全部环境抽样，随机数的消耗顺序改变，统计上等价 | 每步接近GPU时间18–20 ms |
 
 A加B每步约省10–12 ms（约25–30%），整次迭代约省25–30 ms（约6%）。C还要处理多卡`prepare_sampling`里另一次主机同步。
+这是拆段计时得到的估计；A、B合用的完整训练实测为降低约2.65%的迭代耗时，见第8节。
 
 **测量工具**：采样拆解、同步影响和主机时间线的脚本是一次性工具，放在服务器工作目录`tools_claude/`下，未入库；
 日志在服务器`/train_result/log/supermimic/`的`tmux/claude-p11`至`p17`与`logs/p11_*`至`logs/p17_*`。
+
+## 8. 采样优化与正确性修复（2026-10-27）
+
+基于`681b796`实施，使用XERJ索引并检索采样、图重放与分箱更新路径。以下性能对照在同一份修复后的代码中切换开关。
+
+### 8.1 已实施的变化
+
+- `--collect_overlap on|off`：默认on。将replay写入与世界模型归一化统计放到`done.nonzero()`的主机等待之前，提前提交CUDA工作。
+  `env.step(..., after_step=...)`的回调只读取已复制的transition，不修改环境、transition或随机数状态；各rank都执行。
+- `--cuda_graph_collect on|off`：默认on，仅在总图开关开启时生效。固定形状的观测、历史、归一化、策略前向和动作噪声整体图重放；
+  环境状态、起始帧、回合步数和历史均作为显式输入传入。
+- 单CUDA进程且未开启`SM_PROFILE`时，`--cuda_graph auto`允许与compile组合。多卡仍需显式`--cuda_graph on`。
+- 在销毁NCCL进程组前释放图，避免包含采样归一化collective的图导致进程退出等待。
+- 同一步结束于相同分箱的回合先按稳定顺序分组取均值，再进行一次`0.8 * old + 0.2 * mean`更新。
+  原先对重复索引执行`index_put_`会覆盖观测且结果未定义：实际4096环境、8段动作、40步中共2407个结束回合，
+  存在1114次额外同箱写入；固定输入重复测试40次得到39种结果。修复后CUDA重复测试40次逐位一致。
+  此项定义了重复分箱时的更新语义，不能声称与旧版未定义行为逐位一致；单回合分箱保留原更新。
+
+### 8.2 完整训练A/B
+
+机器为A100-SXM4-80GB；每个任务使用一张卡，四种设置同时运行，第二轮反转GPU分配。
+数据为`boneseed_filtered_114406.h5`的前5000段，共3,926,788帧；4096环境、世界模型批量2048、策略批量4096、
+buffer 1000步、warmup 64步、5次世界模型预训练，BF16、compile与其他CUDA图均开启。
+每组100次迭代，丢弃前30次，按日志中`it_per_s`的倒数计算剩余区间的平均耗时，再取两轮中位数。
+
+| 设置 | 第一轮 s/iter | 第二轮 s/iter | 两轮中位数 s/iter | 耗时降低 |
+| --- | --- | --- | --- | --- |
+| 两项均关闭 | 0.450831 | 0.447484 | 0.449157 | 基线 |
+| 仅提前后处理 | 0.443859 | 0.446295 | 0.445077 | 0.91% |
+| 仅采样CUDA图 | 0.441920 | 0.442450 | 0.442185 | 1.55% |
+| 两项均开启 | 0.436192 | 0.438309 | 0.437251 | **2.65%** |
+
+合用在两轮均较快，吞吐量约提高2.72%。此为短程实测，不能替代长期收敛或策略质量评估；各组损失与回报存在波动。
+测量期间共享文件系统上有环境备份任务，因此结果应按本机与本次负载理解。
+
+复现命令（使用新的输出目录）：
+
+```bash
+.venv/bin/python scripts/benchmark_collect.py --gpus 0 1 4 6 \
+  --output_dir /train_result/log/supermimic/collect_ab_new \
+  --motion_source /train_result/log/supermimic/data/boneseed_filtered_114406.h5 \
+  --motion_limit 5000
+```
+
+脚本记录命令、源码HEAD、未提交diff与SHA256、各组日志及`results.json`。
+本次原始结果位于服务器`/train_result/log/supermimic/codex_opt/benchmark`。
+
+### 8.3 验证结果与边界
+
+- `python -m unittest discover -s tests -v`：53项通过，包含分箱聚合、重复输入稳定性、编译检查的全局函数切换与Adam快照隔离。
+- `check_cuda_graph.py`：单A100/compile off、双A100/NCCL/compile on均通过。
+  世界模型、策略、critic、采样函数首次捕捉加重播及后续重播的输出、参数和缓冲均逐位一致。
+  奖励/终止的8个张量一致；同一真实transition在reset前后处理的replay行及世界模型归一化状态一致。
+- `check_compile_equiv.py`已修复：eager与compiled调用各自真实的内核，模型、Adam状态和RNG从独立快照恢复，
+  编译预热不会污染比较起点。使用`fallback_random=True`使两侧噪声一致，仅用于算术比较；正常训练的编译器RNG不变。
+  整数索引要求精确一致，同时检查参数更新量，避免大权重掩盖小更新中的误差。
+- **FP32 eager/compile严格比较未通过**，门槛仍为`atol=1e-5, rtol=1e-3`，失败会返回非零退出码。
+  世界模型参数更新最大绝对差为`1.647e-5`、最大相对L2差`1.565e-3`；策略输出最大绝对差`1.138e-4`。
+  世界模型输出、完整模型状态和Adam状态通过该门槛，但这不足以宣称所有更新数值等价。
+  CUDA graph与同一编译路径逐位一致，不代表compile与eager之间逐位一致。
+
+验证日志在服务器`/train_result/log/supermimic/codex_opt/tmux/`：
+`codex-opt-unit53.log`、`codex-opt-capture1.log`、`codex-opt-capture2.log`、`codex-opt-compile2.log`及`codex-opt-bench-run.log`。

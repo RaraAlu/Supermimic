@@ -22,6 +22,7 @@ from supermimic.tasks.tracking.constants import FOOT_GEOMS, G1_JOINT_NAMES
 from supermimic.tasks.tracking.mdp import MAX_STEP_REWARD, MDP, flatten_state
 from supermimic.tasks.tracking.motion import CONTROL_DT, MotionLib
 from supermimic.utils.cuda_graph import GraphedCall
+from supermimic.utils.distributed import update_bin_returns
 from supermimic.utils.rotations import mat_to_quat, quat_to_mat, so3_exp
 
 NUM_SUBSTEPS = 4
@@ -208,7 +209,13 @@ class TrackingSim:
         self.sim.forward()
 
     # ------------------------------------------------------------------ step
-    def step(self, a: torch.Tensor) -> dict:
+    def step(self, a: torch.Tensor, after_step=None) -> dict:
+        """Advance physics; optionally enqueue transition processing before the reset's host wait.
+
+        after_step may read the detached transition and update training statistics. It must not
+        mutate the environment, transition tensors or RNG state, or perform rank-conditional work.
+        Episode summary fields are added later, after the callback.
+        """
         S = self.state()
         f = self.f.clone()
         xi = self.xi.clone()
@@ -236,6 +243,8 @@ class TrackingSim:
         self.f = f1
         self.ep_step = ep_step + 1
         self.a_prev = a.clone()
+        if after_step is not None:
+            after_step(out)
         if self.eval_mode:
             self.failed_eval |= term & ~self.done_eval
             self.done_eval |= done
@@ -247,7 +256,7 @@ class TrackingSim:
             boot = torch.where(term[ids], 0.0, (self.gamma**T) * (self.ep_ret[ids] / T) / (1 - self.gamma))
             G = self.ep_disc_ret[ids] + boot
             b = self.start_bin[ids]
-            self.bin_G.index_put_((b,), 0.8 * self.bin_G[b] + 0.2 * G)
+            update_bin_returns(self.bin_G, b, G)
             out["ep_len"] = T
             out["ep_ret_norm"] = self.ep_ret[ids] / (T * MAX_STEP_REWARD)
         if self.parallel:
