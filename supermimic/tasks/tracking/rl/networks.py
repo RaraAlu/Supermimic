@@ -36,14 +36,17 @@ class RunningNorm(nn.Module):
     @torch.no_grad()
     def update(self, x: torch.Tensor):
         x = x.reshape(-1, x.shape[-1]).float()
-        if self.count >= self.max_count:
-            return
+        # The freeze test stays on the GPU (a host branch here syncs on every simulator step), and the
+        # buffers are written in place so CUDA graphs that read them keep valid addresses.
+        active = self.count < self.max_count
         n, m, v = global_moments(x)
         tot = self.count + n
         delta = m - self.mean
-        self.mean += delta * n / tot
-        self.var = (self.var * self.count + v * n + delta**2 * self.count * n / tot) / tot
-        self.count = tot
+        mean = self.mean + delta * n / tot
+        var = (self.var * self.count + v * n + delta**2 * self.count * n / tot) / tot
+        self.mean.copy_(torch.where(active, mean, self.mean))
+        self.var.copy_(torch.where(active, var, self.var))
+        self.count.copy_(torch.where(active, tot, self.count))
 
     def forward(self, x):
         return (x - self.mean) / torch.sqrt(self.var + self.eps**2)
