@@ -19,10 +19,12 @@ def global_moments(x):
     if not distributed_active():
         return x.shape[0], x.mean(0), x.var(0, unbiased=False)
     values = x.double()
-    totals = torch.cat((values.new_tensor([len(x)]), values.sum(0)))
+    # filled on the device, not copied from a host list, so this also runs inside a captured CUDA graph
+    totals = torch.cat((torch.full((1,), len(x), dtype=values.dtype, device=values.device), values.sum(0)))
     dist.all_reduce(totals)
     n, mean = totals[0], totals[1:] / totals[0].clamp(min=1)
-    if n <= 0:
+    # the check needs the host, which a graph capture cannot wait on; the eager calls before capture run it
+    if not (values.is_cuda and torch.cuda.is_current_stream_capturing()) and n <= 0:
         raise ValueError("normalizer received no samples on any rank")
     m2 = ((values - mean) ** 2).sum(0)
     dist.all_reduce(m2)

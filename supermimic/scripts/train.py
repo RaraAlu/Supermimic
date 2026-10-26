@@ -54,6 +54,8 @@ parser.add_argument("--compile", type=str, default="auto", choices=["auto", "on"
 parser.add_argument("--cuda_graph", type=str, default="auto", choices=["auto", "on", "off"],
                     help="replay the world-model step and the policy imagination+BPTT step as CUDA graphs "
                          "(auto: single CUDA process without torch.compile or SM_PROFILE; multi-GPU needs on)")
+parser.add_argument("--cuda_graph_critic", type=str, default="on", choices=["on", "off"],
+                    help="with CUDA graphs on, also replay the critic update (GAE targets and its minibatch steps)")
 parser.add_argument("--device", type=str, default="cuda:0")
 parser.add_argument("--batch_scope", type=str, default="global", choices=["global", "per_gpu"],
                     help="--num_envs/--wm_batch/--pi_batch are global totals split across ranks, or per-GPU sizes (paper Table A.5)")
@@ -141,6 +143,19 @@ if USE_GRAPH and torch.device(dev).type != "cuda":
 # Inside graphs the gradient all-reduce uses the fixed global batch sizes (no host round trip).
 GRAPH_WM_TOTAL = args.wm_batch * scope if USE_GRAPH else None
 GRAPH_PI_TOTAL = args.pi_batch * scope if USE_GRAPH else None
+GRAPH_CRITIC = USE_GRAPH and args.cuda_graph_critic == "on" and not args.no_critic
+
+
+def split_sizes(n: int, parts: int) -> list[int]:
+    """Chunk sizes of torch.tensor_split(range(n), parts)."""
+    return [n // parts + int(i < n % parts) for i in range(parts)]
+
+
+# global sample count of each critic minibatch: every rank splits its HZ * local_pi_batch rows the same way
+GRAPH_CRITIC_TOTALS = [sum(col) for col in zip(*(
+    split_sizes(args.horizon * parallel_batch, args.critic_minibatches)
+    for parallel_batch in (args.pi_batch * scope // parallel.world_size + int(r < args.pi_batch * scope % parallel.world_size)
+                           for r in range(parallel.world_size))))] if GRAPH_CRITIC else None
 
 
 def make_adam(params, captured: bool, **kw):
@@ -152,13 +167,13 @@ def make_adam(params, captured: bool, **kw):
 
 opt_wm = make_adam(wm.parameters(), USE_GRAPH)
 opt_pi = make_adam(pi.parameters(), USE_GRAPH, betas=(0.9, 0.95))
-opt_v = make_adam(critic.parameters(), False)
+opt_v = make_adam(critic.parameters(), GRAPH_CRITIC)
 start_it, wall_offset, sim_steps = 0, 0.0, 0
 if args.resume:
     ck = resume_ck
     wm.load_state_dict(ck["wm"]), pi.load_state_dict(ck["pi"]), critic.load_state_dict(ck["critic"])
     opt_wm.load_state_dict(ck["opt_wm"]), opt_pi.load_state_dict(ck["opt_pi"]), opt_v.load_state_dict(ck["opt_v"])
-    for opt, captured in ((opt_wm, USE_GRAPH), (opt_pi, USE_GRAPH), (opt_v, False)):
+    for opt, captured in ((opt_wm, USE_GRAPH), (opt_pi, USE_GRAPH), (opt_v, GRAPH_CRITIC)):
         for group in opt.param_groups:  # load_state_dict restores the checkpoint's own flags and lr type
             group["fused"], group["foreach"], group["capturable"] = FUSED_ADAM, None, captured
             if captured:
@@ -244,11 +259,12 @@ class GraphedCall:
     The eager calls are real updates that also warm up cuBLAS and the allocator before capture.
     """
 
-    def __init__(self, fn, eager_calls: int = 3):
+    def __init__(self, fn, eager_calls: int = 3, enabled: bool | None = None):
         self.fn, self.eager_calls, self.calls, self.graph = fn, eager_calls, 0, None
+        self.enabled = USE_GRAPH if enabled is None else enabled
 
     def __call__(self, *inputs):
-        if not USE_GRAPH or self.calls < self.eager_calls:
+        if not self.enabled or self.calls < self.eager_calls:
             self.calls += 1
             return self.fn(*inputs)
         if self.graph is None:
@@ -378,6 +394,40 @@ def _policy_step(s_flat, xi, f, a_prev, o_hist):
 policy_step = GraphedCall(_policy_step)
 
 
+def _critic_step(rews, dones, xi_n, S_c, f_c, g_c):
+    """Fit the critic to GAE(lambda) targets over the imagined transitions (Eq. 3)."""
+    B = local_pi_batch
+    with torch.no_grad():
+        xi_c = xi_n.unsqueeze(0).expand(HZ + 1, -1, -1).flatten(0, 1)
+        X = critic_input_c(S_c, f_c, xi_c, g_c).view(HZ + 1, B, -1)
+    critic.norm.update(X)
+    with torch.no_grad():
+        V = critic(X)
+        R = V[-1]
+        targets = []
+        for t in range(HZ - 1, -1, -1):
+            R = rews[t] + args.gamma * (1 - dones[t]) * ((1 - args.lam) * V[t + 1] + args.lam * R)
+            targets.append(R)
+        targets = torch.stack(targets[::-1])  # (H, B)
+    Xf, Yf = X[:-1].reshape(-1, X.shape[-1]), targets.reshape(-1)
+    n = Xf.shape[0]
+    v_loss = torch.zeros(())
+    for _ in range(args.critic_epochs):
+        perm = torch.randperm(n, device=dev)
+        for i, idx in enumerate(torch.tensor_split(perm, args.critic_minibatches)):
+            v_loss = ((critic(Xf[idx]) - Yf[idx]) ** 2).mean()
+            opt_v.zero_grad(set_to_none=True)
+            v_loss.backward()
+            average_gradients(critic, len(idx), total_count=GRAPH_CRITIC_TOTALS[i] if GRAPH_CRITIC else None)
+            grad_norm = nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
+            nonfinite[1].logical_or_(~torch.isfinite(grad_norm))
+            opt_v.step()
+    return v_loss.detach()
+
+
+critic_step = GraphedCall(_critic_step, enabled=GRAPH_CRITIC)
+
+
 def policy_update():
     with parallel.coordinated("policy replay sampling"):
         s, h = sample_valid_starts(local_pi_batch)
@@ -389,39 +439,13 @@ def policy_update():
     loss, gn, imag_r, surv, rews, dones, xi_n, S_c, f_c, g_c, *tq = policy_step(s["s"], s["xi"], s["f"], s["a_prev"], o_hist)
     set_requires_grad(wm, True)
     set_requires_grad(critic, True)
-    B = local_pi_batch
     # ---------------- critic: GAE(lambda) targets over the imagined transitions ----------------
-    v_loss = torch.zeros(())
-    if not args.no_critic:
-        with torch.no_grad():
-            xi_c = xi_n.unsqueeze(0).expand(HZ + 1, -1, -1).flatten(0, 1)
-            X = critic_input_c(S_c, f_c, xi_c, g_c).view(HZ + 1, B, -1)
-        critic.norm.update(X)
-        with torch.no_grad():
-            V = critic(X)
-            R = V[-1]
-            targets = []
-            for t in range(HZ - 1, -1, -1):
-                R = rews[t] + args.gamma * (1 - dones[t]) * ((1 - args.lam) * V[t + 1] + args.lam * R)
-                targets.append(R)
-            targets = torch.stack(targets[::-1])  # (H, B)
-        Xf, Yf = X[:-1].reshape(-1, X.shape[-1]), targets.reshape(-1)
-        n = Xf.shape[0]
-        for _ in range(args.critic_epochs):
-            perm = torch.randperm(n, device=dev)
-            for idx in torch.tensor_split(perm, args.critic_minibatches):
-                v_loss = ((critic(Xf[idx]) - Yf[idx]) ** 2).mean()
-                opt_v.zero_grad(set_to_none=True)
-                v_loss.backward()
-                average_gradients(critic, len(idx))
-                grad_norm = nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
-                nonfinite[1].logical_or_(~torch.isfinite(grad_norm))
-                opt_v.step()
+    v_loss = critic_step(rews, dones, xi_n, S_c, f_c, g_c) if not args.no_critic else torch.zeros(())
     if PROFILE:
         torch.cuda.synchronize()
         tq0, tq1, tq2 = tq
         print(f"[prof] imagine fwd {1e3*(tq1-tq0):.0f} ms | bwd {1e3*(tq2-tq1):.0f} ms | critic {1e3*(time.time()-tq2):.0f} ms", flush=True)
-    return loss, v_loss.detach(), imag_r, gn, surv
+    return loss, v_loss, imag_r, gn, surv
 
 
 # ------------------------------------------------------------------------------------------------

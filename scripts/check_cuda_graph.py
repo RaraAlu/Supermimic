@@ -1,4 +1,4 @@
-"""Check that CUDA-graph replay of the world-model step and the policy step matches eager execution bitwise.
+"""Check that CUDA-graph replay of the world-model, policy and critic steps matches eager execution bitwise.
 
 Builds the training state with ``supermimic.scripts.train --iterations 0 --cuda_graph on`` (a short warmup
 collection only), then on each rank runs one eager step and one graph replay from identical model, optimizer
@@ -35,16 +35,16 @@ rank = g["parallel"].rank
 
 
 def snapshot(module, opt):
-    params = [p.detach().clone() for p in module.parameters()]
+    tensors_ = [t.detach().clone() for t in module.state_dict(keep_vars=True).values()]  # parameters and buffers
     state = {id(p): {k: v.clone() for k, v in opt.state[p].items()} for p in module.parameters() if p in opt.state}
-    return params, state
+    return tensors_, state
 
 
 def restore(module, opt, snap):
-    params, state = snap
+    tensors_, state = snap
     with torch.no_grad():
-        for p, v in zip(module.parameters(), params):
-            p.copy_(v)
+        for t, v in zip(module.state_dict(keep_vars=True).values(), tensors_):
+            t.copy_(v)
         for p in module.parameters():  # in place: the captured graph holds these exact tensors
             for k, v in state.get(id(p), {}).items():
                 opt.state[p][k].copy_(v)
@@ -61,15 +61,15 @@ def compare(name, module, opt, inputs, pre=lambda: None, post=lambda: None):
     pre(); fn(*inputs); post()  # one real step first, so the optimizer state exists
     snap, rng = snapshot(module, opt), torch.cuda.get_rng_state()
     pre(); eager_out = fn(*inputs); post()
-    eager_params = [p.detach().clone() for p in module.parameters()]
+    eager_params = [t.detach().clone() for t in module.state_dict(keep_vars=True).values()]
     graphed = g["GraphedCall"](fn, eager_calls=0)
     restore(module, opt, snap); torch.cuda.set_rng_state(rng)
     pre(); graphed(*inputs); post()  # capture, then replay
     restore(module, opt, snap); torch.cuda.set_rng_state(rng)
     pre(); graph_out = graphed(*inputs); post()  # replay from the eager call's starting state
     outs = all(torch.equal(a, b) for a, b in zip(tensors(eager_out), tensors(graph_out)))
-    params = all(torch.equal(a, b.detach()) for a, b in zip(eager_params, module.parameters()))
-    print(f"rank {rank} {name}: outputs bitwise equal {outs}, updated parameters bitwise equal {params}", flush=True)
+    params = all(torch.equal(a, b.detach()) for a, b in zip(eager_params, module.state_dict(keep_vars=True).values()))
+    print(f"rank {rank} {name}: outputs bitwise equal {outs}, updated parameters and buffers bitwise equal {params}", flush=True)
     return outs and params
 
 
@@ -81,5 +81,11 @@ with torch.no_grad():
 sr = g["set_requires_grad"]
 ok &= compare("policy_step", pi, opt_pi, (s["s"], s["xi"], s["f"], s["a_prev"], o_hist),
               pre=lambda: (sr(wm, False), sr(critic, False)), post=lambda: (sr(wm, True), sr(critic, True)))
+if g["GRAPH_CRITIC"]:
+    sr(wm, False), sr(critic, False)
+    out = g["_policy_step"](s["s"], s["xi"], s["f"], s["a_prev"], o_hist)
+    sr(wm, True), sr(critic, True)
+    rews, dones, xi_n, S_c, f_c, g_c = out[4:10]
+    ok &= compare("critic_step", critic, g["opt_v"], (rews, dones, xi_n, S_c, f_c, g_c))
 close(g["parallel"])
 sys.exit(0 if ok else 1)
