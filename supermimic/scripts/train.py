@@ -47,6 +47,8 @@ parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "r
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
+parser.add_argument("--fused_adam", type=str, default="on", choices=["on", "off"],
+                    help="fused CUDA Adam kernels for all three optimizers (same update up to float rounding)")
 parser.add_argument("--compile", type=str, default="auto", choices=["auto", "on", "off"], help="torch.compile (auto: only if triton is installed)")
 parser.add_argument("--device", type=str, default="cuda:0")
 parser.add_argument("--batch_scope", type=str, default="global", choices=["global", "per_gpu"],
@@ -124,14 +126,18 @@ CRITIC_IN = INV_DIM + CRITIC_EXTRA + GOAL_DIM
 wm = WorldModel().to(dev)
 pi = Policy(OBS_DIM, GOAL_DIM, hist=Hh).to(dev)
 critic = Critic(CRITIC_IN).to(dev)
-opt_wm = torch.optim.Adam(wm.parameters(), lr=base_lr)
-opt_pi = torch.optim.Adam(pi.parameters(), lr=base_lr, betas=(0.9, 0.95))
-opt_v = torch.optim.Adam(critic.parameters(), lr=base_lr)
+FUSED_ADAM = args.fused_adam == "on" and torch.device(dev).type == "cuda"
+opt_wm = torch.optim.Adam(wm.parameters(), lr=base_lr, fused=FUSED_ADAM)
+opt_pi = torch.optim.Adam(pi.parameters(), lr=base_lr, betas=(0.9, 0.95), fused=FUSED_ADAM)
+opt_v = torch.optim.Adam(critic.parameters(), lr=base_lr, fused=FUSED_ADAM)
 start_it, wall_offset, sim_steps = 0, 0.0, 0
 if args.resume:
     ck = resume_ck
     wm.load_state_dict(ck["wm"]), pi.load_state_dict(ck["pi"]), critic.load_state_dict(ck["critic"])
     opt_wm.load_state_dict(ck["opt_wm"]), opt_pi.load_state_dict(ck["opt_pi"]), opt_v.load_state_dict(ck["opt_v"])
+    for opt in (opt_wm, opt_pi, opt_v):  # load_state_dict restores the checkpoint's own fused flag
+        for group in opt.param_groups:
+            group["fused"], group["foreach"] = FUSED_ADAM, None
     start_it, wall_offset, sim_steps = ck["iteration"], ck["wall_time"], ck["sim_steps"]
 for model in (wm, pi, critic):
     parallel.broadcast_module(model)
