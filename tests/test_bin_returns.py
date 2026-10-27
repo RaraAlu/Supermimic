@@ -4,53 +4,69 @@ import unittest
 
 import torch
 
-from supermimic.utils.distributed import DistributedContext, episode_bin_scores, global_bin_probabilities, update_bin_returns
+from supermimic.utils.distributed import (DistributedContext, LocalContext, episode_bin_scores, global_bin_probabilities,
+                                          update_bin_returns)
 
 GAMMA, STEP_MAX = 0.99, 0.1
 
 
-def episodes(rewards, terminated=False, at_clip_end=False, left=1000):
+def episodes(rewards, skip, terminated=False, at_clip_end=False, left=1000):
     """Reward sums of one episode per reward list, in the layout TrackingSim passes to episode_bin_scores."""
     disc = torch.tensor([sum(GAMMA**t * r for t, r in enumerate(rs)) for rs in rewards])
     ret = torch.tensor([float(sum(rs)) for rs in rewards])
-    first = torch.tensor([float(rs[0]) for rs in rewards])
+    head_disc = torch.tensor([sum(GAMMA**t * r for t, r in enumerate(rs[:skip])) for rs in rewards])
+    head_ret = torch.tensor([float(sum(rs[:skip])) for rs in rewards])
     steps = torch.tensor([float(len(rs)) for rs in rewards])
     n = len(rewards)
-    return (disc, ret, first, steps, torch.full((n,), terminated), torch.full((n,), at_clip_end),
+    return (disc, ret, head_disc, head_ret, steps, torch.full((n,), terminated), torch.full((n,), at_clip_end),
             torch.full((n,), float(left)))
 
 
 class BinScoreTests(unittest.TestCase):
-    def test_keep_reproduces_the_previous_score(self):
-        disc, ret, first, steps, term, end, left = episodes([[0.09] * 7, [-0.2, 0.08, 0.08]], at_clip_end=True, left=7)
+    def test_no_skip_reproduces_the_previous_score(self):
+        disc, ret, hd, hr, steps, term, end, left = episodes([[0.09] * 7, [-0.2, 0.08, 0.08]], 0, at_clip_end=True, left=7)
         boot = GAMMA**steps * (ret / steps) / (1 - GAMMA)
         g_max = STEP_MAX / (1 - GAMMA)
-        score, valid = episode_bin_scores(disc, ret, first, steps, term, end, left, GAMMA, STEP_MAX, skip_first=False)
+        score, valid = episode_bin_scores(disc, ret, hd, hr, steps, term, end, left, GAMMA, STEP_MAX)
         torch.testing.assert_close(score, (disc + boot) / g_max)
         self.assertTrue(bool(valid.all()))
-        score, _ = episode_bin_scores(disc, ret, first, steps, term, end, left, GAMMA, STEP_MAX, "terminal", skip_first=False)
+        score, _ = episode_bin_scores(disc, ret, hd, hr, steps, term, end, left, GAMMA, STEP_MAX, "terminal")
         torch.testing.assert_close(score, disc / (g_max * (1 - GAMMA**left)))
 
-    def test_skip_removes_the_reset_penalty_from_short_episodes(self):
-        # same tracking reward; the second episode pays a large first-step smoothness penalty
-        args = episodes([[0.09, 0.09, 0.09], [-0.2, 0.09, 0.09]], at_clip_end=True, left=3)
-        kept, _ = episode_bin_scores(*args, GAMMA, STEP_MAX, skip_first=False)
-        skipped, valid = episode_bin_scores(*args, GAMMA, STEP_MAX, skip_first=True)
-        self.assertLess(float(kept[1]), float(kept[0]) - 0.5)  # extrapolated penalty makes the bin look hard
+    def test_skip_removes_the_reset_transient(self):
+        # same steady tracking reward; the second episode pays a three-step transient after its reset
+        rewards = [[0.09] * 6, [-0.2, -0.1, 0.0, 0.09, 0.09, 0.09]]
+        kept, _ = episode_bin_scores(*episodes(rewards, 0, at_clip_end=True, left=6), GAMMA, STEP_MAX)
+        skipped, valid = episode_bin_scores(*episodes(rewards, 3, at_clip_end=True, left=6), GAMMA, STEP_MAX, skip_steps=3)
+        self.assertLess(float(kept[1]), float(kept[0]) - 0.5)  # extrapolated transient makes the bin look hard
         torch.testing.assert_close(skipped[1], skipped[0])
         torch.testing.assert_close(skipped[0], torch.tensor(0.9))  # 0.09 per step, extended, over G_max
         self.assertTrue(bool(valid.all()))
 
-    def test_one_step_episodes(self):
-        truncated = episodes([[-0.3]], at_clip_end=True, left=1)
-        _, valid = episode_bin_scores(*truncated, GAMMA, STEP_MAX)
-        self.assertFalse(bool(valid[0]))  # nothing after the reset step: no evidence about the bin
-        fell = episodes([[-0.3]], terminated=True, left=1)
+    def test_episodes_within_the_transient(self):
+        truncated = episodes([[-0.3, 0.05]], 3, at_clip_end=True, left=2)
+        _, valid = episode_bin_scores(*truncated, GAMMA, STEP_MAX, skip_steps=3)
+        self.assertFalse(bool(valid[0]))  # nothing after the transient: no evidence about the bin
+        fell = episodes([[-0.3, 0.05]], 3, terminated=True, left=2)
         for mode in ("bootstrap", "terminal"):
-            score, valid = episode_bin_scores(*fell, GAMMA, STEP_MAX, mode)
-            self.assertTrue(bool(valid[0]))  # falling at once is a real failure
+            score, valid = episode_bin_scores(*fell, GAMMA, STEP_MAX, mode, skip_steps=3)
+            self.assertTrue(bool(valid[0]))  # falling during the transient is a real failure
             self.assertTrue(bool(torch.isfinite(score).all()))
             self.assertEqual(float(score[0]), 0.0)
+
+    def test_unallowed_and_unscored_bins(self):
+        scores = torch.tensor([0.9, 0.5, 0.0, 0.0])
+        allowed = torch.tensor([True, True, True, False])
+        scored = torch.tensor([True, True, False, False])
+        probs = global_bin_probabilities(scores, torch.full((4,), 0.25), 1.0, 4, LocalContext, None, allowed, scored)
+        self.assertEqual(float(probs[3]), 0.0)  # never a reset start
+        torch.testing.assert_close(probs[2], torch.tensor(0.5 / 3))  # uniform share only, despite its score 0
+        torch.testing.assert_close(probs.sum(), torch.tensor(1.0))
+        self.assertGreater(float(probs[1]), float(probs[0]))  # the lower-scored bin gets the softmax share
+        everywhere = torch.ones(4, dtype=torch.bool)
+        masked = global_bin_probabilities(scores, torch.full((4,), 0.25), 1.0, 4, LocalContext, None, everywhere, everywhere)
+        plain = global_bin_probabilities(scores, torch.full((4,), 0.25), 1.0, 4, LocalContext)
+        torch.testing.assert_close(masked, plain)
 
 
 class BinReturnTests(unittest.TestCase):

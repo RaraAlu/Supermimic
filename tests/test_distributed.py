@@ -126,12 +126,14 @@ def collective_worker(rank, root):
 
         path = Path(__file__).resolve().parents[1] / "supermimic/tasks/tracking/env.py"
         cls = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.ClassDef) and n.name == "TrackingSim")
-        node = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "prepare_sampling")
-        ns = {}
-        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
+        nodes = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in ("prepare_sampling", "_bin_probabilities")]
+        ns = {"global_bin_probabilities": global_bin_probabilities}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), ns)
+        everywhere = torch.ones_like(returns, dtype=torch.bool)
         env = SimpleNamespace(parallel=parallel, bin_G=returns, bin_w_avg=ema.clone(), bin_prior="zero",
-                              bin_visits=torch.zeros_like(returns, dtype=torch.long),
-                              G_max=1., motion=SimpleNamespace(global_num_bins=5))
+                              bin_visits=torch.zeros_like(returns, dtype=torch.long), bin_allowed=everywhere,
+                              bin_scored=everywhere, G_max=1., motion=SimpleNamespace(global_num_bins=5))
+        env._bin_probabilities = lambda context: ns["_bin_probabilities"](env, context)
         ns["prepare_sampling"](env, rank == 0)  # Only one rank has completed episodes.
         soft = torch.softmax(-25 * all_returns, 0)
         expected_ema.mul_(0.999).add_(0.001 * soft)

@@ -98,24 +98,25 @@ def update_bin_returns(estimates, bins, returns, alpha=0.2, visits=None, replace
 
 
 @torch.no_grad()
-def episode_bin_scores(disc_ret, ret, first_r, steps, terminated, at_clip_end, left, gamma, step_max,
-                       clip_end="bootstrap", max_steps=500, skip_first=True):
+def episode_bin_scores(disc_ret, ret, head_disc, head_ret, steps, terminated, at_clip_end, left, gamma, step_max,
+                       clip_end="bootstrap", max_steps=500, skip_steps=0):
     """Normalized reset-bin scores of finished episodes, and which episodes may update their bin.
 
-    disc_ret and ret are the discounted and plain reward sums from the start frame, first_r the first
-    step's reward, steps the episode length, left the steps from the start frame to the clip end.
-    Truncated episodes extend their return with their mean reward ("bootstrap"); with "terminal", an
-    episode that reaches the clip end stops there and is scored against the maximum attainable from
-    its start, and only the max_steps cap is extended.
+    disc_ret and ret are the discounted and plain reward sums from the start frame, head_disc and
+    head_ret the same sums over the first skip_steps steps, steps the episode length, left the steps
+    from the start frame to the clip end. Truncated episodes extend their return with their mean
+    reward ("bootstrap"); with "terminal", an episode that reaches the clip end stops there and is
+    scored against the maximum attainable from its start, and only the max_steps cap is extended.
 
-    With skip_first the score is the return from the second step on: the first step's
-    action-smoothness penalty comes from the zero previous action at reset, not from the bin, and in
-    a few-step episode it dominates the mean reward that the bootstrap extends. A truncated episode
-    with no step after the first carries no other evidence and does not update its bin.
+    With skip_steps > 0 the score is the return after the reset transient: right after a reset the
+    policy recovers from reset noise, a zero previous action and a repeated observation history,
+    which costs reward for about a second regardless of the bin, and in a short episode that cost
+    dominates the mean reward the bootstrap extends. An episode that falls within the transient
+    still scores 0; one truncated within it carries no other evidence and does not update its bin.
     """
-    if skip_first:
-        disc_ret, ret = (disc_ret - first_r) / gamma, ret - first_r
-        steps, left, max_steps = steps - 1, left - 1, max_steps - 1
+    if skip_steps:
+        disc_ret, ret = (disc_ret - head_disc) / gamma**skip_steps, ret - head_ret
+        steps, left, max_steps = steps - skip_steps, left - skip_steps, max_steps - skip_steps
     valid = terminated | (steps > 0)
     ended = terminated | at_clip_end if clip_end == "terminal" else terminated
     G = disc_ret + torch.where(ended, 0.0, gamma**steps * (ret / steps.clamp(min=1)) / (1 - gamma))
@@ -126,22 +127,43 @@ def episode_bin_scores(disc_ret, ret, first_r, steps, terminated, at_clip_end, l
 
 
 @torch.no_grad()
-def global_bin_probabilities(returns, ema, maximum_return, num_bins, parallel, visits=None):
+def global_bin_probabilities(returns, ema, maximum_return, num_bins, parallel, visits=None, allowed=None, scored=None):
     """Global 50/40/10 reset weights; sampling remains conditional on the local shard.
 
     With ``visits``, bins without a finished episode score the global mean of visited bins.
+    ``allowed`` marks bins that may be reset to (the others get probability 0, and the uniform share
+    is spread over allowed bins only); ``scored`` marks allowed bins whose score enters the softmax
+    and the EMA. Bins that can never produce a score take only the uniform share, so an unscorable
+    bin stuck at its initial score cannot attract the adaptive share.
     """
+    if allowed is None:
+        allowed = torch.ones_like(returns, dtype=torch.bool)
+    else:
+        num_bins = parallel.reduce(allowed.sum().double())
+    scored = allowed if scored is None else scored & allowed
     if visits is not None:
-        seen = visits > 0
+        seen = (visits > 0) & scored
         total, count = parallel.reduce(torch.stack(((returns * seen).double().sum(), seen.sum().double())))
         returns = torch.where(seen, returns, (total / count.clamp(min=1)).to(returns.dtype))
-    logits = -25.0 * returns / maximum_return
+    logits = torch.where(scored, -25.0 * returns / maximum_return, -torch.inf)
     maximum = parallel.reduce(logits.max(), dist.ReduceOp.MAX)
-    exp = torch.exp(logits.double() - maximum)
-    soft = (exp / parallel.reduce(exp.sum())).to(returns.dtype)
+    exp = torch.where(scored, torch.exp(logits.double() - maximum), 0.0)
+    soft = (exp / parallel.reduce(exp.sum()).clamp(min=1e-300)).to(returns.dtype)
     ema.mul_(0.999).add_(0.001 * soft)
-    total_ema = parallel.reduce(ema.double().sum())
-    return 0.5 / num_bins + 0.4 * soft + 0.1 * ema / total_ema.to(ema.dtype)
+    kept = torch.where(scored, ema, 0.0)
+    total_ema = parallel.reduce(kept.double().sum()).clamp(min=1e-300)
+    probs = 0.5 / num_bins + 0.4 * soft + 0.1 * kept / total_ema.to(ema.dtype)
+    return torch.where(allowed, probs, 0.0).to(returns.dtype)
+
+
+class LocalContext:
+    """Single-process stand-in for DistributedContext.reduce."""
+
+    enabled = False
+
+    @staticmethod
+    def reduce(values, op=None):
+        return values.double() if torch.is_tensor(values) else torch.as_tensor(values, dtype=torch.float64)
 
 
 class DistributedContext:
