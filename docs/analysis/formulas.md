@@ -971,7 +971,8 @@ N_c = \left\lfloor \frac{L-1}{50} \right\rfloor + \mathbb{1}\!\left[(L-1) \bmod 
 ### 8.2 每个分箱的“难度分数”
 
 每当一个回合结束，用它的有效评分更新起点所在分箱的估计。
-当前默认`--bin_skip_steps S=50`：不计前50个转移，首个计分奖励为 $`r_{51}`$ ，折扣从此重新起算。
+训练与环境默认`--bin_skip_steps S=50`，并显式传给`episode_bin_scores`；该函数直接调用的`skip_steps`默认是0。
+`S=50`时不计前50个转移，首个计分奖励为 $`r_{51}`$ ，折扣从此重新起算。
 若回合共 $`T>S`$ 步，设 $`T'=T-S`$ ：
 
 ```math
@@ -1044,7 +1045,10 @@ P(b)=\mathbb{1}_{b\in A}\left[
 | 历史难度 | 10% | 以前难过的地方，学会后还保留一些练习 |
 
 不可重置的分箱权重为0；可重置但不可评分分箱只分均匀份额。
-若全库没有可评分分箱，`multinomial`将剩余均匀权重归一化。
+上述混合公式要求全局可评分集合非空。全库不可评分时，默认float32实现的历史权重归一化会因分母下溢为0产生非有限权重，
+不能保证回退到均匀分布，见[训练流程第4节](training_pipeline.md)的待修边界说明。
+多卡时每个rank在本地分片内再归一化，实际抽样概率为 $`P(b\mid r)=P(b)/\sum_{b'\in A_r}P(b')`$ 。
+日志`samp_top1`和`samp_entropy`统计全局权重快照，不等于跨rank实际重置频率。
 代码：`TrackingSim.sample_frames`、`TrackingSim.step`、`episode_bin_scores`、`global_bin_probabilities`。
 
 ## 9. 学习率调度

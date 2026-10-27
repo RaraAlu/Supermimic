@@ -4,6 +4,10 @@
 - 数据：服务器2×A100上的双卡global run（全局8192环境，世界模型10×2048窗口，策略4096条推演）。
 - 日志：`train_log.csv`每50次迭代一行；`sampling_log.csv`同频，记录重置采样快照。
 
+`sampling_log.csv`中的`samp_top1`为全局分箱权重最大值，`samp_entropy`为该权重快照的熵除以`log(max(全局分箱数, 2))`。
+多卡在各自分片内再归一化，实际重置频率还受各rank重置次数影响；这两列不能直接读成某分箱占了多少实际重置。
+`reset_tail_frac`才来自实际重置计数。全库不可评分时，默认float32路径存在产生非有限权重并在重置抽样时失败的边界问题，详见[训练流程第4节](../analysis/training_pipeline.md)。
+
 ## 1. `ep_ret_norm`为负而`sim_rew`在涨
 
 | 指标 | 平均方式 |
