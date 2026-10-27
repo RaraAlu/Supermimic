@@ -58,8 +58,9 @@ class TrackingSim:
         ("mean", whose first episode then replaces the prior instead of being blended into it).
         bin_skip_steps: bins are scored from this step of each episode on, past the reset transient
         (see utils.distributed.episode_bin_scores). reset_margin: no reset starts within this many
-        steps of a clip's end (a clip shorter than that starts only at its first frame); bins that
-        cannot outlast the transient take only the uniform share. Both 0 reproduce the earlier scores."""
+        steps of a clip's end (a clip shorter than that starts only at its first frame); such first
+        frames and bins that cannot outlast the transient take only the uniform share. Both 0
+        reproduce the earlier scores."""
         if bin_clip_end not in BIN_CLIP_END or bin_prior not in BIN_PRIOR or bin_skip_steps < 0 or reset_margin < 0:
             raise ValueError(f"bin_clip_end must be one of {BIN_CLIP_END}, bin_prior one of {BIN_PRIOR}, "
                              "and bin_skip_steps and reset_margin non-negative")
@@ -140,12 +141,14 @@ class TrackingSim:
         self.bin_G = torch.full((motion.num_bins,), 0.0, device=dev)
         self.bin_visits = torch.zeros(motion.num_bins, dtype=torch.long, device=dev)
         # reset starts of a bin are [bin_start, reset_end); none within reset_margin of the clip end, except
-        # a clip's first frame. A bin whose starts cannot outlast the transient is never scored.
+        # a clip's first frame. Those first frames are not scored: their score rests on the few steps between
+        # the transient and the clip end, and one low draw takes the whole softmax share. Neither is a bin whose
+        # starts cannot outlast the transient.
         clip_start, clip_end = motion.clip_start[motion.bin_clip], motion.clip_end[motion.bin_clip]
         limit = clip_end - reset_margin
         self.bin_allowed = (motion.bin_start < limit) | (motion.bin_start == clip_start)
         self.reset_end = torch.maximum(torch.minimum(motion.bin_end, limit), motion.bin_start + 1)
-        self.bin_scored = self.bin_allowed & (clip_end - motion.bin_start > bin_skip_steps)
+        self.bin_scored = (motion.bin_start < limit) & (clip_end - motion.bin_start > bin_skip_steps)
         num_bins = motion.global_num_bins if self.parallel else motion.num_bins
         self.bin_w_avg = torch.full((motion.num_bins,), 1.0 / num_bins, device=dev)
         self.bin_probs = self.bin_allowed.float() / self.bin_allowed.sum().clamp(min=1)
