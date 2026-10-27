@@ -134,7 +134,8 @@ def global_bin_probabilities(returns, ema, maximum_return, num_bins, parallel, v
     ``allowed`` marks bins that may be reset to (the others get probability 0, and the uniform share
     is spread over allowed bins only); ``scored`` marks allowed bins whose score enters the softmax
     and the EMA. Bins that can never produce a score take only the uniform share, so an unscorable
-    bin stuck at its initial score cannot attract the adaptive share.
+    bin stuck at its initial score cannot attract the adaptive share. With no scored bin on any rank
+    (every clip too short to score), the adaptive half joins the uniform share.
     """
     if allowed is None:
         allowed = torch.ones_like(returns, dtype=torch.bool)
@@ -148,11 +149,13 @@ def global_bin_probabilities(returns, ema, maximum_return, num_bins, parallel, v
     logits = torch.where(scored, -25.0 * returns / maximum_return, -torch.inf)
     maximum = parallel.reduce(logits.max(), dist.ReduceOp.MAX)
     exp = torch.where(scored, torch.exp(logits.double() - maximum), 0.0)
-    soft = (exp / parallel.reduce(exp.sum()).clamp(min=1e-300)).to(returns.dtype)
+    norm = parallel.reduce(exp.sum())  # >= 1 (the global maximum contributes exp(0)) unless nothing is scored
+    soft = (exp / norm.clamp(min=1e-300)).to(returns.dtype)
     ema.mul_(0.999).add_(0.001 * soft)
     kept = torch.where(scored, ema, 0.0)
     total_ema = parallel.reduce(kept.double().sum()).clamp(min=1e-300)
     probs = 0.5 / num_bins + 0.4 * soft + 0.1 * kept / total_ema.to(ema.dtype)
+    probs = torch.where(norm > 0, probs, 1.0 / num_bins)
     return torch.where(allowed, probs, 0.0).to(returns.dtype)
 
 
