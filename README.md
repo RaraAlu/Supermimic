@@ -11,7 +11,9 @@
 
 - 阶段：实现v0.1.0（训练闭环、评估、数据/自检脚本）。
 - 目标：在129,514段基准上复现论文主结果。
-- 算力：8卡H100服务器负责训练与评估；RTX 5080与RTX 4070 Ti SUPER负责开发。
+- 算力：8卡H100服务器负责训练与评估；2卡A100 SXM4 80GB（NVLink）服务器用于当前训练与全量诊断；RTX 5080与RTX 4070 Ti SUPER负责开发。
+- 2026-10-27：修正重置分箱后，在2卡A100上重新开始全量训练（全局8192环境、世界模型10×2048、策略4096、学习率2e-4不乘√2）。
+  此前一个run日志中为负的`ep_ret_norm`来自尾部短分箱缺陷，不代表策略变差，见[重置采样分析](docs/analysis/reset_sampling.md)。
 - 依赖版本：以`pyproject.toml`与`uv.lock`为准（mjlab 1.6.0、mujoco-warp 3.11.0、warp-lang 1.18.0、torch 2.14.1+cu130）。
 - 数据：支持 LAFAN1 CSV 与索引白名单选择的原生 50 Hz G1 HDF5；本仓库 MotionLib 生成参考速度和 FK。
 - 数据/检查点/日志均不入库。
@@ -199,6 +201,34 @@ RTX 5080 单卡回归、`--nproc-per-node=gpu` 自动启动和多进程检查点
 检查点评估仅为流程验收，短跑策略仍有失败；未运行全量长训、H100/NCCL 或新多卡编译路径。
 本次证据位于忽略目录 `logs/auto_shard_validation_20261022/`，没有改写源数据或提交 Git。
 
+## 重置采样与诊断
+
+附录D.1的按回报重置采样按1 s分箱。多分箱片段的最后一箱若不足25个起点，并入前一箱：
+否则从片段末尾起步的回合只有1–4步，首步（上一动作为0）的平滑惩罚摊不开，外推后这些分箱显得极难，
+课程重置被集中到片段末尾，训练日志按回合平均的`ep_ret_norm`也随之为负。
+全量BONES-SEED上，修正把不超过5步的回合从52%降到2.7%。排查、对照与未解决问题见[重置采样分析](docs/analysis/reset_sampling.md)。
+
+论文未规定的细节做成选项，默认保持原行为：
+
+| 选项 | 默认 | 含义 |
+| --- | --- | --- |
+| `--bin_clip_end {bootstrap, terminal}` | `bootstrap` | 到达片段末尾的回合用平均奖励外推；或不外推、按起点可达最大回报归一化（全量对照中会放大首步惩罚，暂不推荐） |
+| `--bin_prior {zero, mean}` | `zero` | 未访问分箱的评分取0，或取已访问分箱的全局均值 |
+| `--wm_update {steps, single}` | `steps` | 每次迭代世界模型走10步各2048窗口，或1步20480窗口（表A.5两种读法） |
+
+训练目录另写`sampling_log.csv`（采样熵、最大分箱概率、已访问分箱比例、距片段末尾2 s内的重置比例），`train_log.csv`的列不变。
+
+诊断脚本只读检查点与数据，`--src`可指向检查点所用提交的源码树，以便重放旧代码：
+
+| 脚本 | 用途 |
+| --- | --- |
+| `scripts/make_motion_subset.py` | 从HDF5源随机抽取完整片段，生成小规模子集（CPU） |
+| `scripts/diag_first_step.py` | 附录F.1评估，并记录每段首步的平滑与限位惩罚、去掉首步后的归一化回报 |
+| `scripts/diag_train_episodes.py` | 按训练条件重放，记录每个回合的长度、`ep_ret_norm`及其奖励/惩罚分解，导出分箱状态 |
+| `scripts/diag_bin_difficulty.py` | 从每个1 s起步位置按评估条件跑2 s，生成与分箱方案无关的难度标签 |
+| `scripts/diag_compare_bins.py` | 汇总多次重放：短回合、片段末尾重置、难位置倾斜、采样集中度 |
+| `scripts/watch_train.py` | 监督训练日志，出现异常、到达里程碑或训练结束时退出 |
+
 ## 实现
 
 目录职责参照 [mjlab](https://github.com/mujocolab/mjlab/tree/main/src/mjlab)：
@@ -235,13 +265,28 @@ scripts/
   download_data.py
   check_env.py
   check_data.py
+  check_compile_equiv.py
+  check_cuda_graph.py
   profile_train.py
+  benchmark_collect.py
+  benchmark_paper_two_gpu.py
+  make_motion_subset.py
+  diag_first_step.py
+  diag_train_episodes.py
+  diag_bin_difficulty.py
+  diag_compare_bins.py
+  watch_train.py
+  smrun.sh
 tests/
   test_layout.py
   test_g1_defaults.py
   test_motion_hdf5.py
+  test_merged_source.py
   test_evaluation.py
   test_distributed.py
+  test_bin_returns.py
+  test_learning_math.py
+  test_compile_check.py
 ```
 
 | 路径 | 内容 |
@@ -251,13 +296,13 @@ tests/
 | `supermimic/tasks/tracking/mdp.py` | 93维观测、表A.2奖励、终止、软存活权重、critic特征 |
 | `supermimic/tasks/tracking/rl/networks.py` | 世界模型(MultiHead)、策略(编码器+共享解码器)、critic、RunningNorm |
 | `supermimic/tasks/tracking/rl/buffer.py` | 每环境1000步FIFO回放缓冲、k步窗口与起点采样 |
-| `supermimic/tasks/tracking/motion.py` | CSV/HDF5→50 Hz完整参考、独立差分与FK、目标帧、1 s重置分箱 |
+| `supermimic/tasks/tracking/motion.py` | CSV/HDF5→50 Hz完整参考、独立差分与FK、目标帧、1 s重置分箱（尾箱合并） |
 | `supermimic/tasks/tracking/motion_hdf5.py` | 索引身份白名单、完整源段读取与源库绑定检查 |
 | `supermimic/utils/kinematics.py` | MuJoCo前向运动学（身体位姿/速度） |
 | `supermimic/utils/distributed.py` | 进程/设备绑定、协调错误、梯度平均与全局统计同步 |
 | `supermimic/tasks/tracking/constants.py` | 动作数据关节顺序与跟踪目标，不定义机器人配置 |
 | `supermimic/scripts/evaluate.py` | 附录F.1评估：逐原始段首帧播放、失败计数、两种归一化回报 |
-| `scripts/` | 数据下载、离线数据验证、显式仿真自检与训练剖析（`profile_train.py`） |
+| `scripts/` | 数据下载、离线数据验证、仿真自检、compile/CUDA graph一致性检查、训练剖析与基准、重置采样诊断与训练监督 |
 | `tests/` | 无GPU的结构、HDF5/FK数值、数据选择与分批评估回归；数值测试使用项目依赖 |
 
 在仓库根目录运行上述命令；也可用`python supermimic/scripts/train.py`或
@@ -280,6 +325,8 @@ uv run --frozen python -B -m unittest discover -s tests -v
 | [docs/analysis/formulas.md](docs/analysis/formulas.md) | 公式精讲：每个公式按直觉、拆分、符号、数值算例、代码位置逐项讲解 |
 | [docs/analysis/markdown_math.md](docs/analysis/markdown_math.md) | GitHub公式排版约定：行内公式、独立公式、多行对齐与界面验收 |
 | [docs/analysis/optimization.md](docs/analysis/optimization.md) | 性能优化分析：剖析方法与实测、瓶颈（kernel发射）、按优先级的优化项与验证顺序 |
+| [docs/analysis/reset_sampling.md](docs/analysis/reset_sampling.md) | 按回报重置采样：负`ep_ret_norm`的排查、尾部分箱修正、分箱选项、全量对照、开源实现对照与未解决问题 |
+| [docs/analysis/paper_two_gpu.md](docs/analysis/paper_two_gpu.md) | 双卡短测：表A.5批量口径的两种解读与实测耗时 |
 | [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) | 第三方代码许可与出处 |
 | [CONTRIBUTORS.md](CONTRIBUTORS.md) | 贡献者名单、AI 编码代理署名与提交模板约定 |
 

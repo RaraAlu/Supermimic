@@ -212,7 +212,10 @@ uv run --frozen python scripts/profile_train.py --report logs/profile.json --wai
 | 4096 | 323 ms | 123 ms | 447 ms |
 
 批量从256增到2048只多2 ms，从2048增到4096多44 ms。据此推算2048个窗口的实际计算约45 ms，其余约235 ms与批量无关，
-是kernel发射、Python调度和10次优化器更新的开销（估计）。“论文每次迭代只做1次世界模型更新、本实现多做了10倍”的猜测不成立：表A.5写的就是10批×2048。
+是kernel发射、Python调度和10次优化器更新的开销（估计）。表A.5写的是“10 batches of 2048 windows per update”，
+计算量与本实现一致；但它同时写“每次世界模型更新对应1次策略更新”，算法A.1第4行也只写一次 $`\omega`$ 更新，
+所以“10步各2048”与“1步20480”两种读法都成立（此前把后者判为不成立有误）。`--wm_update single`实现后一种，
+Rara上约快11%而前期收敛慢，见[reset_sampling.md](reset_sampling.md)第7节；A100上未实测。
 
 ### 7.2 `torch.compile`与CUDA graph的组合
 
