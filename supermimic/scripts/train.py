@@ -25,6 +25,10 @@ parser.add_argument("--hist", type=int, default=10)
 parser.add_argument("--wm_window", type=int, default=8)
 parser.add_argument("--wm_batches", type=int, default=10)
 parser.add_argument("--wm_batch", type=int, default=2048)
+parser.add_argument("--wm_update", type=str, default="steps", choices=["steps", "single"],
+                    help="one world-model update per iteration: --wm_batches optimizer steps of --wm_batch windows "
+                         "each (steps), or one step over wm_batches x wm_batch windows (single); paper Table A.5 "
+                         "'10 batches of 2048 windows per update' with one policy update per world-model update admits both")
 parser.add_argument("--pi_batch", type=int, default=4096)
 parser.add_argument("--lr", type=float, default=2e-4)
 parser.add_argument("--gamma", type=float, default=0.99)
@@ -106,6 +110,9 @@ with parallel.coordinated("argument validation"):
     local_envs = parallel.local_size(global_envs, "num_envs")
     local_wm_batch = parallel.local_size(args.wm_batch * scope, "wm_batch")
     local_pi_batch = parallel.local_size(args.pi_batch * scope, "pi_batch")
+    # windows per world-model optimizer step, and optimizer steps per iteration
+    wm_step_batch = local_wm_batch * (args.wm_batches if args.wm_update == "single" else 1)
+    wm_steps = 1 if args.wm_update == "single" else args.wm_batches
     base_lr = args.lr * (math.sqrt(parallel.world_size) if args.lr_scaling == "sqrt" else 1.0)
     if args.buffer_steps < args.wm_window or args.warmup_steps < args.wm_window:
         raise ValueError("buffer_steps and warmup_steps must be at least wm_window")
@@ -133,7 +140,8 @@ with parallel.coordinated("run metadata"):
 with parallel.coordinated("shard manifest"):
     shard_path = Path(args.log_dir) / "shards" / f"world_{parallel.world_size}" / f"rank_{parallel.rank:04d}.json"
     local_reference = {**motion.description, "runtime": {"device": dev, "local_envs": local_envs,
-                        "local_wm_batch": local_wm_batch, "local_pi_batch": local_pi_batch,
+                        "local_wm_batch": local_wm_batch, "wm_step_batch": wm_step_batch, "wm_steps": wm_steps,
+                        "local_pi_batch": local_pi_batch,
                         "batch_scope": args.batch_scope, "global_envs": global_envs, "base_lr": base_lr}}
     shard_path.write_text(json.dumps(local_reference, indent=2, ensure_ascii=False), encoding="utf-8")
 print(f"rank {parallel.rank}/{parallel.world_size} on {dev}: {len(motion.names)} full clips, "
@@ -153,7 +161,7 @@ USE_GRAPH = args.cuda_graph == "on" or (
 if USE_GRAPH and torch.device(dev).type != "cuda":
     raise ValueError("--cuda_graph on needs CUDA")
 # Inside graphs the gradient all-reduce uses the fixed global batch sizes (no host round trip).
-GRAPH_WM_TOTAL = args.wm_batch * scope if USE_GRAPH else None
+GRAPH_WM_TOTAL = args.wm_batch * scope * (args.wm_batches if args.wm_update == "single" else 1) if USE_GRAPH else None
 GRAPH_PI_TOTAL = args.pi_batch * scope if USE_GRAPH else None
 GRAPH_CRITIC = USE_GRAPH and args.cuda_graph_critic == "on" and not args.no_critic
 
@@ -273,7 +281,7 @@ def _wm_step(s, a, xi, s1, mask):
     loss, e_last = wm_err(S_hat, s1, mask)
     opt_wm.zero_grad(set_to_none=True)
     loss.backward()
-    average_gradients(wm, local_wm_batch, total_count=GRAPH_WM_TOTAL)
+    average_gradients(wm, wm_step_batch, total_count=GRAPH_WM_TOTAL)
     grad_norm = nn.utils.clip_grad_norm_(wm.parameters(), 1.0)
     nonfinite[0].logical_or_(~torch.isfinite(grad_norm))
     opt_wm.step()
@@ -286,7 +294,7 @@ wm_step = GraphedCall(_wm_step)
 
 
 def wm_update():
-    w = buffer.sample_windows(local_wm_batch, args.wm_window)
+    w = buffer.sample_windows(wm_step_batch, args.wm_window)
     return wm_step(w["s"], w["a"], w["xi"], w["s1"], w["mask"])
 
 
@@ -516,7 +524,7 @@ for it in range(start_it, args.iterations):
     collect(n, stats)
     if prof:
         torch.cuda.synchronize(); tp1 = time.time()
-    for _ in range(args.wm_batches):
+    for _ in range(wm_steps):
         l, e8 = wm_update()
     if prof:
         torch.cuda.synchronize(); tp2 = time.time()
