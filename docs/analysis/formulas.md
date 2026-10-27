@@ -369,7 +369,9 @@ p_{\mathrm{tilt}} &= \sigma\left( \frac{e_{\mathrm{tilt}} - 0.8}{0.04} \right)
 倾斜正常时 $`p_{\mathrm{tilt}} \approx 0`$ ，于是 $`\hat{d} \approx 0.12`$ 。
 误差到0.25 m时 $`\hat{d} = 0.5`$ ；到0.29 m时约0.88。
 
-代码：`MDP.soft_termination`（宽度参数`tz=0.02`、`tt=0.04`）。
+代码：`MDP.soft_termination`（宽度参数`tz=0.02`、`tt=0.04`）。训练直接使用每步存活概率`MDP.soft_survival`，
+写作 $`\sigma(-x)`$ 而不是 $`1-\sigma(x)`$ ：fp32下 $`x`$ 超过约17时后者精确等于0、梯度也为0
+（Barron等，[arXiv:2610.31642](https://arxiv.org/abs/2610.31642)所说的抵消）；存活权重也直接连乘它，不再经过 $`1-(1-p)`$ 。
 
 ### 3.3 存活权重：活着才能继续拿分
 
