@@ -117,12 +117,20 @@ def collective_worker(rank, root):
             torch.testing.assert_close(probs, expected[local])
             assert abs(float(parallel.reduce(probs.sum())) - 1) < 1e-6
 
+        # Unvisited bins score the mean over every rank's visited bins.
+        all_visits = torch.tensor([1, 0, 1, 1, 0])
+        prior = global_bin_probabilities(returns, torch.full_like(returns, 1 / 5), 1., 5, parallel, all_visits[local])
+        filled = torch.where(all_visits > 0, all_returns, all_returns[all_visits > 0].mean())
+        reference = global_bin_probabilities(filled, torch.full_like(all_returns, 1 / 5), 1., 5, SimpleNamespace(reduce=lambda x, op=None: torch.as_tensor(x, dtype=torch.float64)))
+        torch.testing.assert_close(prior, reference[local])
+
         path = Path(__file__).resolve().parents[1] / "supermimic/tasks/tracking/env.py"
         cls = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.ClassDef) and n.name == "TrackingSim")
         node = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "prepare_sampling")
         ns = {}
         exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
-        env = SimpleNamespace(parallel=parallel, bin_G=returns, bin_w_avg=ema.clone(),
+        env = SimpleNamespace(parallel=parallel, bin_G=returns, bin_w_avg=ema.clone(), bin_prior="zero",
+                              bin_visits=torch.zeros_like(returns, dtype=torch.long),
                               G_max=1., motion=SimpleNamespace(global_num_bins=5))
         ns["prepare_sampling"](env, rank == 0)  # Only one rank has completed episodes.
         soft = torch.softmax(-25 * all_returns, 0)

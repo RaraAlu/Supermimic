@@ -62,6 +62,12 @@ parser.add_argument("--cuda_graph_collect", type=str, default="on", choices=["on
                     help="with CUDA graphs on, replay collection observations, normalizers, policy and action noise")
 parser.add_argument("--collect_overlap", type=str, default="on", choices=["on", "off"],
                     help="enqueue replay writes and world-model statistics before the simulator reset waits for CUDA")
+parser.add_argument("--bin_clip_end", type=str, default="bootstrap", choices=["bootstrap", "terminal"],
+                    help="reset-bin scores: bootstrap episodes that reach the clip end with their mean reward and "
+                         "normalize by the global maximum, or end the return there and normalize by the maximum "
+                         "attainable from each start frame (paper Appendix D.1 leaves this open)")
+parser.add_argument("--bin_prior", type=str, default="zero", choices=["zero", "mean"],
+                    help="score of reset bins without a finished episode: 0, or the mean of visited bins")
 parser.add_argument("--device", type=str, default="cuda:0")
 parser.add_argument("--batch_scope", type=str, default="global", choices=["global", "per_gpu"],
                     help="--num_envs/--wm_batch/--pi_batch are global totals split across ranks, or per-GPU sizes; "
@@ -429,7 +435,8 @@ def policy_update():
 
 # ------------------------------------------------------------------------------------------------
 env = TrackingSim(local_envs, motion, mdp, dev, gamma=args.gamma, parallel=parallel,
-                  graph_reward=USE_GRAPH and args.cuda_graph_env == "on")
+                  graph_reward=USE_GRAPH and args.cuda_graph_env == "on",
+                  bin_clip_end=args.bin_clip_end, bin_prior=args.bin_prior)
 buffer = ReplayBuffer(args.buffer_steps, local_envs, dev)
 obs_hist = torch.zeros(local_envs, Hh, OBS_DIM, device=dev)
 
@@ -484,6 +491,10 @@ collect(args.warmup_steps, stats)
 log_f = open(os.path.join(args.log_dir, "train_log.csv"), "a", encoding="utf-8") if parallel.primary else None
 if parallel.primary and log_f.tell() == 0:
     log_f.write("iteration,wall_h,sim_steps,wm_loss,wm_err8,pi_loss,v_loss,imag_rew,pi_gradnorm,imag_survival,sim_rew,ep_len,ep_ret_norm,term_frac,it_per_s,lr\n")
+# reset-sampling diagnostics in their own file, so resumed runs keep the train_log.csv columns
+samp_f = open(os.path.join(args.log_dir, "sampling_log.csv"), "a", encoding="utf-8") if parallel.primary else None
+if parallel.primary and samp_f.tell() == 0:
+    samp_f.write("iteration,samp_entropy,samp_top1,bins_visited,reset_tail_frac\n")
 t_start = time.time() - wall_offset
 t_log = time.time()
 step_acc = 0.0
@@ -534,9 +545,16 @@ for it in range(start_it, args.iterations):
         term_frac = float(episodes[2] / episodes[3].clamp(min=1))
         row = [it + 1, wall_h, sim_steps, *[means[k] for k in keys],
                float(episodes[0] / episodes[3].clamp(min=1)), float(episodes[1] / episodes[3].clamp(min=1)), term_frac, ips, lr]
+        local_samp = env.sampling_stats()
+        samp = parallel.reduce(local_samp).cpu()
+        top1 = float(parallel.reduce(local_samp[1], torch.distributed.ReduceOp.MAX))
+        samp_row = [it + 1, float(samp[0]) / math.log(max(motion.global_num_bins, 2)), top1,
+                    float(samp[2]) / motion.global_num_bins, float(samp[4] / samp[3].clamp(min=1))]
         if parallel.primary:
             log_f.write(",".join(f"{x:.6g}" if isinstance(x, float) else str(x) for x in row) + "\n")
             log_f.flush()
+            samp_f.write(",".join(f"{x:.6g}" if isinstance(x, float) else str(x) for x in samp_row) + "\n")
+            samp_f.flush()
             print(f"it {it + 1} | {wall_h:.3f} h | wm {row[3]:.4f} e8 {row[4]:.4f} | pi {row[5]:.3f} v {row[6]:.4f} imag_r {row[7]:.3f} surv {row[9]:.3f} "
                   f"| sim_r {row[10]:.3f} ep_len {row[11]:.1f} ep_ret {row[12]:.3f} term {term_frac:.2f} | {ips:.2f} it/s", flush=True)  # fmt: skip
         stats = {k: [] for k in stats}

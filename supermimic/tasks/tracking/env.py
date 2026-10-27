@@ -27,6 +27,9 @@ from supermimic.utils.rotations import mat_to_quat, quat_to_mat, so3_exp
 
 NUM_SUBSTEPS = 4
 PHYSICS_DT = CONTROL_DT / NUM_SUBSTEPS  # 5 ms
+TAIL_STEPS = 100  # resets this close to the clip end (2 s) are reported as tail resets
+BIN_CLIP_END = ("bootstrap", "terminal")
+BIN_PRIOR = ("zero", "mean")
 
 
 def make_sim_cfg() -> SimulationCfg:
@@ -46,7 +49,16 @@ class TrackingSim:
 
     def __init__(self, num_envs: int, motion: MotionLib, mdp: MDP, device: str, gamma: float = 0.99,
                  eval_mode: bool = False, max_episode_steps: int = 500, reset_noise: bool = True,
-                 parallel=None, graph_reward: bool = False):  # fmt: skip
+                 parallel=None, graph_reward: bool = False, bin_clip_end: str = "bootstrap",
+                 bin_prior: str = "zero"):  # fmt: skip
+        """bin_clip_end: "bootstrap" extends episodes that reach the clip end with their mean reward and
+        scores bins against the global maximum return; "terminal" ends the return at the clip end and
+        scores each episode against the maximum attainable from its start frame (only the 500-step
+        cap is bootstrapped). bin_prior: unvisited bins score 0 ("zero") or the mean of visited bins
+        ("mean", whose first episode then replaces the prior instead of being blended into it)."""
+        if bin_clip_end not in BIN_CLIP_END or bin_prior not in BIN_PRIOR:
+            raise ValueError(f"bin_clip_end must be one of {BIN_CLIP_END} and bin_prior one of {BIN_PRIOR}")
+        self.bin_clip_end, self.bin_prior = bin_clip_end, bin_prior
         self.device = dev = device
         self.parallel = parallel if parallel is not None and parallel.enabled else None
         scene_cfg = SceneCfg(
@@ -111,12 +123,17 @@ class TrackingSim:
         self.ep_step = torch.zeros(self.N, dtype=torch.long, device=dev)
         self.a_prev = torch.zeros(self.N, 29, device=dev)
         self.start_bin = torch.zeros(self.N, dtype=torch.long, device=dev)
+        self.start_f = torch.zeros(self.N, dtype=torch.long, device=dev)
         self.ep_disc_ret = torch.zeros(self.N, device=dev)
         self.ep_ret = torch.zeros(self.N, device=dev)
         self.G_max = MAX_STEP_REWARD / (1 - gamma)
+        # per-bin score: discounted return divided by its maximum (G_max, or the start frame's attainable maximum)
         self.bin_G = torch.full((motion.num_bins,), 0.0, device=dev)
+        self.bin_visits = torch.zeros(motion.num_bins, dtype=torch.long, device=dev)
         num_bins = motion.global_num_bins if self.parallel else motion.num_bins
         self.bin_w_avg = torch.full((motion.num_bins,), 1.0 / num_bins, device=dev)
+        self.bin_probs = torch.full((motion.num_bins,), 1.0 / num_bins, device=dev)
+        self.reset_counts = torch.zeros(2, device=dev)  # sampled resets, of which tail resets
         self.done_eval = torch.zeros(self.N, dtype=torch.bool, device=dev)
         self.failed_eval = torch.zeros(self.N, dtype=torch.bool, device=dev)
         if self.parallel:
@@ -139,22 +156,43 @@ class TrackingSim:
         from supermimic.utils.distributed import global_bin_probabilities
 
         if bool(self.parallel.reduce(int(active))):
-            self.bin_probs = global_bin_probabilities(self.bin_G, self.bin_w_avg, self.G_max,
-                                                      self.motion.global_num_bins, self.parallel)
+            visits = self.bin_visits if self.bin_prior == "mean" else None
+            self.bin_probs = global_bin_probabilities(self.bin_G, self.bin_w_avg, 1.0,
+                                                      self.motion.global_num_bins, self.parallel, visits)
 
     def sample_frames(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
         m = self.motion
         if self.parallel:
             probs = self.bin_probs
         else:
-            soft = torch.softmax(-25.0 * self.bin_G / self.G_max, 0)
+            scores = self.bin_G
+            if self.bin_prior == "mean":
+                seen = self.bin_visits > 0
+                scores = torch.where(seen, scores, (scores * seen).sum() / seen.sum().clamp(min=1))
+            soft = torch.softmax(-25.0 * scores, 0)
             self.bin_w_avg.mul_(0.999).add_(0.001 * soft)
             probs = 0.5 / m.num_bins + 0.4 * soft + 0.1 * self.bin_w_avg / self.bin_w_avg.sum()
+            self.bin_probs = probs
         bins = torch.multinomial(probs, n, replacement=True)
         start = m.bin_start[bins]
         end = m.bin_end[bins]  # stays >= 1 step before the clip end
         f = start + (torch.rand(n, device=self.device) * (end - start).float()).long()
+        self.reset_counts[0] += n
+        self.reset_counts[1] += (m.clip_end[m.bin_clip[bins]] - f < TAIL_STEPS).sum()
         return f, bins
+
+    @torch.no_grad()
+    def sampling_stats(self) -> torch.Tensor:
+        """Local sums since the last call: [entropy terms, max prob, visited bins, resets, tail resets].
+
+        The probabilities are global (they sum to 1 across ranks), so summing the entropy terms and
+        visited bins and taking the max of the max over ranks gives the global values.
+        """
+        p = self.bin_probs.double()
+        stats = torch.stack((-(p * (p + 1e-30).log()).sum(), p.max(), (self.bin_visits > 0).sum().double(),
+                             *self.reset_counts.double()))
+        self.reset_counts.zero_()
+        return stats
 
     def reset(self, env_ids: torch.Tensor, frames: torch.Tensor | None = None):
         if len(env_ids) == 0:
@@ -192,6 +230,7 @@ class TrackingSim:
         self.robot.write_joint_state_to_sim(q, qd, env_ids=env_ids)
         self.robot.set_joint_position_target(q, env_ids=env_ids)
         self.f[env_ids] = frames
+        self.start_f[env_ids] = frames
         self.ep_step[env_ids] = 0
         self.a_prev[env_ids] = 0.0
         self.start_bin[env_ids] = bins
@@ -231,7 +270,8 @@ class TrackingSim:
         f1 = f + 1
         r, terms, term = self._reward_termination(S1, f1, a, a_prev)
         clip_end = self.motion.clip_end[self.motion.clip_id[f]]
-        timeout = (f1 >= clip_end) | (ep_step + 1 >= self.max_episode_steps)
+        at_clip_end = f1 >= clip_end
+        timeout = at_clip_end | (ep_step + 1 >= self.max_episode_steps)
         done = term | timeout
         out = {
             "s": flatten_state(S), "a": a.clone(), "a_prev": a_prev, "f": f, "s1": flatten_state(S1), "r": r,
@@ -251,12 +291,20 @@ class TrackingSim:
             return out
         ids = done.nonzero(as_tuple=False).squeeze(-1)
         if len(ids) > 0:
-            # bin return estimate; truncated episodes bootstrap with their mean reward
+            # bin score; truncated episodes bootstrap with their mean reward
             T = self.ep_step[ids].float()
-            boot = torch.where(term[ids], 0.0, (self.gamma**T) * (self.ep_ret[ids] / T) / (1 - self.gamma))
+            ended = term[ids] | (at_clip_end[ids] if self.bin_clip_end == "terminal" else False)
+            boot = torch.where(ended, 0.0, (self.gamma**T) * (self.ep_ret[ids] / T) / (1 - self.gamma))
             G = self.ep_disc_ret[ids] + boot
-            b = self.start_bin[ids]
-            update_bin_returns(self.bin_G, b, G)
+            G_max = self.G_max
+            if self.bin_clip_end == "terminal":
+                # steps from the start frame to the clip end; the 500-step cap bootstraps past it
+                s = self.start_f[ids]
+                left = (self.motion.clip_end[self.motion.clip_id[s]] - s).float()
+                reach = left < self.max_episode_steps
+                G_max = self.G_max * torch.where(reach, 1 - self.gamma**left, 1.0)
+            update_bin_returns(self.bin_G, self.start_bin[ids], G / G_max, visits=self.bin_visits,
+                               replace_first=self.bin_prior == "mean")
             out["ep_len"] = T
             out["ep_ret_norm"] = self.ep_ret[ids] / (T * MAX_STEP_REWARD)
         if self.parallel:

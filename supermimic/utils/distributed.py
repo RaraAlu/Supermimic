@@ -75,24 +75,38 @@ def average_gradients(module, sample_count=1, total_count=None):
 
 
 @torch.no_grad()
-def update_bin_returns(estimates, bins, returns, alpha=0.2):
+def update_bin_returns(estimates, bins, returns, alpha=0.2, visits=None, replace_first=False):
     """Apply one EMA update per bin using its mean episode return in this simulator step.
 
     Several environments can finish in the same bin. Sort them in a stable order and reduce each
     segment before writing: index_put_ with duplicate destinations silently loses observations and
     has undefined results on CUDA. Unique bins retain the original single-episode update exactly.
+    ``visits`` counts finished episodes per bin; with ``replace_first`` a bin's first update takes
+    the observed mean instead of blending it into the initial value.
     """
     if bins.numel() == 0:
         return
     order = torch.argsort(bins, stable=True)
     unique, counts = torch.unique_consecutive(bins[order], return_counts=True)
     means = torch.segment_reduce(returns[order], "mean", lengths=counts)
-    estimates[unique] = (1 - alpha) * estimates[unique] + alpha * means
+    rate = alpha
+    if visits is not None:
+        if replace_first:
+            rate = torch.where(visits[unique] == 0, 1.0, alpha).to(estimates.dtype)
+        visits[unique] += counts.to(visits.dtype)
+    estimates[unique] = (1 - rate) * estimates[unique] + rate * means
 
 
 @torch.no_grad()
-def global_bin_probabilities(returns, ema, maximum_return, num_bins, parallel):
-    """Global 50/40/10 reset weights; sampling remains conditional on the local shard."""
+def global_bin_probabilities(returns, ema, maximum_return, num_bins, parallel, visits=None):
+    """Global 50/40/10 reset weights; sampling remains conditional on the local shard.
+
+    With ``visits``, bins without a finished episode score the global mean of visited bins.
+    """
+    if visits is not None:
+        seen = visits > 0
+        total, count = parallel.reduce(torch.stack(((returns * seen).double().sum(), seen.sum().double())))
+        returns = torch.where(seen, returns, (total / count.clamp(min=1)).to(returns.dtype))
     logits = -25.0 * returns / maximum_return
     maximum = parallel.reduce(logits.max(), dist.ReduceOp.MAX)
     exp = torch.exp(logits.double() - maximum)
