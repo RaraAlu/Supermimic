@@ -248,7 +248,10 @@ RTX 5080 单卡回归、`--nproc-per-node=gpu` 自动启动和多进程检查点
 训练目录另写`sampling_log.csv`（全局分箱权重的熵、最大权重、已访问分箱比例、距片段末尾2 s内的重置比例），`train_log.csv`的列不变。
 熵除以`log(max(全局分箱数, 2))`，访问率除以全部分箱数；禁止重置的分箱也在分母内，因此访问率上限可能小于100%。
 多卡各自在本地分片内重新归一化后抽样，所以`samp_top1`是全局权重的最大值，不是实际重置频率；
-`reset_tail_frac`则按实际抽出的重置计数。当前默认float32路径在全库不可评分时会产生非有限权重，尚无可靠的均匀回退，见[训练流程第4节](docs/analysis/training_pipeline.md)。
+`reset_tail_frac`则按实际抽出的重置计数。全库不可评分时，`e0c923c`已修复退化路径，直接在可重置分箱上均匀分配，返回权重有限且总和为1，见[训练流程第4节](docs/analysis/training_pipeline.md)。
+
+想象推演使用`MDP.soft_survival`直接计算每步存活概率：采用`sigmoid(-x)`，存活权重与GAE直接使用该值，
+避免`1 - sigmoid(x)`和`1 - (1 - keep)`在float32下抵消为0（`4293e90`）。
 
 下列诊断中的策略重放脚本只读检查点与源数据，向`--out`写结果，`--src`可指向某提交的源码树目录。
 `diag_train_episodes.py`未显式传入的采样选项取该源码树的`TrackingSim`默认值，不自动继承检查点；

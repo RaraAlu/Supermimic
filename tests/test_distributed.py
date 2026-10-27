@@ -124,6 +124,14 @@ def collective_worker(rank, root):
         reference = global_bin_probabilities(filled, torch.full_like(all_returns, 1 / 5), 1., 5, SimpleNamespace(reduce=lambda x, op=None: torch.as_tensor(x, dtype=torch.float64)))
         torch.testing.assert_close(prior, reference[local])
 
+        # No scored bin on one rank still sums to 1 globally; on no rank, sampling is uniform.
+        everything = torch.ones_like(returns, dtype=torch.bool)
+        one_rank = global_bin_probabilities(returns, torch.full_like(returns, 1 / 5), 1., 5, parallel, None, everything,
+                                            everything if rank == 1 else ~everything)
+        assert abs(float(parallel.reduce(one_rank.sum())) - 1) < 1e-6
+        none = global_bin_probabilities(returns, torch.full_like(returns, 1 / 5), 1., 5, parallel, None, everything, ~everything)
+        torch.testing.assert_close(none, torch.full_like(returns, 1 / 5))
+
         path = Path(__file__).resolve().parents[1] / "supermimic/tasks/tracking/env.py"
         cls = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.ClassDef) and n.name == "TrackingSim")
         nodes = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in ("prepare_sampling", "_bin_probabilities")]

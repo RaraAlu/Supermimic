@@ -153,14 +153,22 @@ class MDP:
         e_tilt = (rR[..., 2, 2] - R[..., 2, 2]).abs()
         return (e_z > self.cfg.term_height) | (e_tilt > self.cfg.term_tilt)
 
-    def soft_termination(self, S, f, tz: float = 0.02, tt: float = 0.04) -> torch.Tensor:
-        """Differentiable termination probability for imagined rollouts."""
+    def soft_survival(self, S, f, tz: float = 0.02, tt: float = 0.04) -> torch.Tensor:
+        """Differentiable probability of not terminating at this step, for imagined rollouts.
+
+        Written as sigmoid(-x) rather than 1 - sigmoid(x): in fp32 the latter rounds to exactly 0, with a
+        zero gradient, once x exceeds about 17 (the cancellation of Barron et al., "A Fix for Softmax and
+        Cross-Entropy", arXiv:2610.31642). Training multiplies these directly instead of 1 - termination.
+        """
         p, R = S[0], S[1]
         rp, rR = self.motion.root_p[f], self.motion.root_R[f]
         e_z = (rp[..., 2] - p[..., 2]).abs()
         e_tilt = (rR[..., 2, 2] - R[..., 2, 2]).abs()
-        alive = (1 - torch.sigmoid((e_z - self.cfg.term_height) / tz)) * (1 - torch.sigmoid((e_tilt - self.cfg.term_tilt) / tt))
-        return 1 - alive
+        return torch.sigmoid((self.cfg.term_height - e_z) / tz) * torch.sigmoid((self.cfg.term_tilt - e_tilt) / tt)
+
+    def soft_termination(self, S, f, tz: float = 0.02, tt: float = 0.04) -> torch.Tensor:
+        """Differentiable termination probability, 1 - soft_survival."""
+        return 1 - self.soft_survival(S, f, tz, tt)
 
     def critic_features(self, S, f, xi) -> torch.Tensor:
         """Critic input: invariant state, goal, sim context, and robot-vs-reference errors."""

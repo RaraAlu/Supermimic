@@ -142,6 +142,18 @@ class AnalyticHeadsTests(unittest.TestCase):
         S[1] = tilt
         self.assertTrue(bool(self.mdp.termination(tuple(S), self.f).item()))
 
+    def test_soft_survival_keeps_far_terminations_differentiable(self):
+        S = self.reference_state()
+        torch.testing.assert_close(self.mdp.soft_survival(S, self.f), 1 - self.mdp.soft_termination(S, self.f))
+        # 0.6 m above the reference: (0.6 - 0.25) / 0.02 = 17.5, where 1 - sigmoid(x) is exactly 0 in fp32
+        p = (S[0] + torch.tensor([[0.0, 0.0, 0.6]])).requires_grad_(True)
+        keep = self.mdp.soft_survival((p,) + S[1:], self.f)
+        self.assertEqual(float(1 - torch.sigmoid(torch.tensor(17.5))), 0.0)
+        self.assertGreater(float(keep.item()), 0.0)
+        torch.testing.assert_close(keep, torch.sigmoid(torch.tensor([-17.5])), rtol=1e-4, atol=0)
+        keep.sum().backward()
+        self.assertLess(float(p.grad[0, 2]), 0.0)  # higher still lowers survival: the gradient is not lost
+
     def test_observation_noise_and_goal_layout(self):
         S = self.reference_state()
         obs = self.mdp.obs(S, torch.zeros(1, 29), torch.zeros(1, XI_DIM), self.f)

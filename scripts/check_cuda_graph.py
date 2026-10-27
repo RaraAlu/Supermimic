@@ -89,8 +89,8 @@ if g["GRAPH_CRITIC"]:
     sr(wm, False), sr(critic, False)
     out = g["_policy_step"](s["s"], s["xi"], s["f"], s["a_prev"], o_hist)
     sr(wm, True), sr(critic, True)
-    rews, dones, xi_n, S_c, f_c, g_c = out[4:10]
-    ok &= compare("critic_step", critic, g["opt_v"], (rews, dones, xi_n, S_c, f_c, g_c))
+    rews, keeps, xi_n, S_c, f_c, g_c = out[4:10]
+    ok &= compare("critic_step", critic, g["opt_v"], (rews, keeps, xi_n, S_c, f_c, g_c))
 env = g["env"]
 if g["collect_action"].enabled:
     ok &= compare("collect_action", pi, opt_pi,

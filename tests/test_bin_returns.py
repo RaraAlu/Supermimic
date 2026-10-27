@@ -68,6 +68,13 @@ class BinScoreTests(unittest.TestCase):
         plain = global_bin_probabilities(scores, torch.full((4,), 0.25), 1.0, 4, LocalContext)
         torch.testing.assert_close(masked, plain)
 
+    def test_no_scored_bin_samples_uniformly(self):
+        allowed = torch.tensor([True, True, False, True])
+        probs = global_bin_probabilities(torch.zeros(4), torch.full((4,), 0.25), 1.0, 4, LocalContext, None, allowed,
+                                         torch.zeros(4, dtype=torch.bool))
+        self.assertTrue(bool(torch.isfinite(probs).all()))
+        torch.testing.assert_close(probs, torch.tensor([1 / 3, 1 / 3, 0.0, 1 / 3]))
+
 
 class BinReturnTests(unittest.TestCase):
     def test_visits_and_first_update_replacement(self):

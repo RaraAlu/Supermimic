@@ -8,7 +8,7 @@
 4. **数值算例**：代入真实参数算一遍；
 5. **代码位置**：在本仓库哪里实现。
 
-- 依据：论文arXiv:2610.28480v1（标注节号），以及本仓库实现（2026-10-28按`4b4d27a`核对，标注文件路径）。数值示例采用当前默认参数；论文未规定的实现选择另行说明。
+- 依据：论文arXiv:2610.28480v1（标注节号），以及本仓库实现（2026-10-28合并`7e9a317`后核对，标注文件路径）。数值示例采用当前默认参数；论文未规定的实现选择另行说明。
 - 相关：[algorithm.md](algorithm.md)讲论文的整体思路，[training_pipeline.md](training_pipeline.md)讲训练流程。
   本文只讲公式本身，三份可以对照阅读。
 
@@ -369,7 +369,19 @@ p_{\mathrm{tilt}} &= \sigma\left( \frac{e_{\mathrm{tilt}} - 0.8}{0.04} \right)
 倾斜正常时 $`p_{\mathrm{tilt}} \approx 0`$ ，于是 $`\hat{d} \approx 0.12`$ 。
 误差到0.25 m时 $`\hat{d} = 0.5`$ ；到0.29 m时约0.88。
 
-代码：`MDP.soft_termination`（宽度参数`tz=0.02`、`tt=0.04`）。
+代码：`MDP.soft_termination`（宽度参数`tz=0.02`、`tt=0.04`）。训练直接使用每步存活概率`MDP.soft_survival`，
+写作 $`\sigma(-x)`$ 而不是 $`1-\sigma(x)`$ ：fp32下 $`x`$ 超过约17时后者精确等于0、梯度也为0
+（Barron等，[arXiv:2610.31642](https://arxiv.org/abs/2610.31642)所说的抵消）；存活权重也直接连乘它，不再经过 $`1-(1-p)`$ 。
+
+实际送入存活累乘与GAE的是：
+
+```math
+\mathrm{keep}_{t+1}
+=\sigma\left(\frac{0.25-e_z}{0.02}\right)
+ \sigma\left(\frac{0.8-e_{\mathrm{tilt}}}{0.04}\right).
+```
+
+后文公式中的 $`1-\hat d_{t+1}`$ 均代表这个直接计算的值；`soft_termination`保留为兼容接口，训练直接使用`soft_survival`。
 
 ### 3.3 存活权重：活着才能继续拿分
 
@@ -1045,8 +1057,8 @@ P(b)=\mathbb{1}_{b\in A}\left[
 | 历史难度 | 10% | 以前难过的地方，学会后还保留一些练习 |
 
 不可重置的分箱权重为0；可重置但不可评分分箱只分均匀份额。
-上述混合公式要求全局可评分集合非空。全库不可评分时，默认float32实现的历史权重归一化会因分母下溢为0产生非有限权重，
-不能保证回退到均匀分布，见[训练流程第4节](training_pipeline.md)的待修边界说明。
+上述混合公式用于全局可评分集合非空时。全库不可评分时，`e0c923c`已修复退化路径，
+直接返回 $`P(b)=\mathbb{1}_{b\in A}/|A|`$ ，有限且总和为1，见[训练流程第4节](training_pipeline.md)。
 多卡时每个rank在本地分片内再归一化，实际抽样概率为 $`P(b\mid r)=P(b)/\sum_{b'\in A_r}P(b')`$ 。
 日志`samp_top1`和`samp_entropy`统计全局权重快照，不等于跨rank实际重置频率。
 代码：`TrackingSim.sample_frames`、`TrackingSim.step`、`episode_bin_scores`、`global_bin_probabilities`。

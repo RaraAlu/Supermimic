@@ -250,7 +250,7 @@ def _imag_step(S, o_hist, a_prev, f, xi, xi_n, g):
 
 
 def _reward_term(S, f, a, a_prev):
-    return mdp.reward(S, f, a, a_prev), mdp.soft_termination(S, f)
+    return mdp.reward(S, f, a, a_prev), mdp.soft_survival(S, f)
 
 
 def _critic_input(S, f, xi_n, g):
@@ -329,17 +329,19 @@ def sample_valid_starts(B: int):
     return cat(starts), cat(hists)
 
 
-def survival(d):
+def survival(keep):
     """Soft survival weights c_{t+1} = prod_{i<=t} (1 - d_i) along the imagined horizon (dim 0).
 
+    Takes the per-step survival probabilities 1 - d_i themselves (MDP.soft_survival), not d_i, so a
+    near-certain termination is not rounded to exactly 0 by 1 - (1 - p).
     cumprod's backward branches on zeros in its input on the host, which a captured graph cannot do,
     so graphs use the same running product written out step by step.
     """
     if not USE_GRAPH:
-        return torch.cumprod(1 - d, 0)
-    out, c = [], torch.ones_like(d[0])
-    for t in range(d.shape[0]):
-        c = c * (1 - d[t])
+        return torch.cumprod(keep, 0)
+    out, c = [], torch.ones_like(keep[0])
+    for t in range(keep.shape[0]):
+        c = c * keep[t]
         out.append(c)
     return torch.stack(out)
 
@@ -362,15 +364,15 @@ def _policy_step(s_flat, xi, f, a_prev, o_hist):
     flat = lambda xs: torch.stack(xs).flatten(0, 1)  # noqa: E731  (H*B, ...)
     S_all = tuple(flat([St[i] for St in Ss]) for i in range(6))
     f_all = flat(Fs)
-    r, d = reward_term(S_all, f_all, flat(As), flat(Aps))
-    r, d = r.view(HZ, B), d.view(HZ, B)
-    alive = survival(d)  # c_{t+1}
+    r, keep = reward_term(S_all, f_all, flat(As), flat(Aps))
+    r, keep = r.view(HZ, B), keep.view(HZ, B)
+    alive = survival(keep)  # c_{t+1}
     c_t = torch.cat((torch.ones(1, B, device=dev), alive[:-1]), 0)
     disc = args.gamma ** torch.arange(HZ, device=dev, dtype=torch.float32).unsqueeze(-1)
     J = (disc * c_t * r).sum(0)
     c = alive[-1]
     r_sum = (c_t * r).detach().sum(0)
-    rews, dones = r.detach(), d.detach()
+    rews, keeps = r.detach(), keep.detach()
     if not args.no_critic:
         J = J + (args.gamma**HZ) * c * critic(_critic_input(S, f, xi_n, g))
     loss = -J.mean()
@@ -394,14 +396,14 @@ def _policy_step(s_flat, xi, f, a_prev, o_hist):
         f_c = torch.cat((f0.unsqueeze(0), torch.stack(Fs)), 0).flatten()
         g_c = torch.cat((g0.unsqueeze(0), torch.stack(Gs)), 0).flatten(0, 1)
     tq = (tq0, tq1, tq2) if PROFILE else ()
-    return (loss.detach(), gn.detach(), (r_sum / HZ / 0.1).mean(), c.mean().detach(), rews, dones, xi_n,
+    return (loss.detach(), gn.detach(), (r_sum / HZ / 0.1).mean(), c.mean().detach(), rews, keeps, xi_n,
             S_c, f_c, g_c) + tq
 
 
 policy_step = GraphedCall(_policy_step)
 
 
-def _critic_step(rews, dones, xi_n, S_c, f_c, g_c):
+def _critic_step(rews, keeps, xi_n, S_c, f_c, g_c):
     """Fit the critic to GAE(lambda) targets over the imagined transitions (Eq. 3)."""
     B = local_pi_batch
     with torch.no_grad():
@@ -413,7 +415,7 @@ def _critic_step(rews, dones, xi_n, S_c, f_c, g_c):
         R = V[-1]
         targets = []
         for t in range(HZ - 1, -1, -1):
-            R = rews[t] + args.gamma * (1 - dones[t]) * ((1 - args.lam) * V[t + 1] + args.lam * R)
+            R = rews[t] + args.gamma * keeps[t] * ((1 - args.lam) * V[t + 1] + args.lam * R)
             targets.append(R)
         targets = torch.stack(targets[::-1])  # (H, B)
     Xf, Yf = X[:-1].reshape(-1, X.shape[-1]), targets.reshape(-1)
@@ -443,11 +445,11 @@ def policy_update():
     o_hist = mdp.add_noise(o_hist)
     set_requires_grad(wm, False)
     set_requires_grad(critic, False)
-    loss, gn, imag_r, surv, rews, dones, xi_n, S_c, f_c, g_c, *tq = policy_step(s["s"], s["xi"], s["f"], s["a_prev"], o_hist)
+    loss, gn, imag_r, surv, rews, keeps, xi_n, S_c, f_c, g_c, *tq = policy_step(s["s"], s["xi"], s["f"], s["a_prev"], o_hist)
     set_requires_grad(wm, True)
     set_requires_grad(critic, True)
     # ---------------- critic: GAE(lambda) targets over the imagined transitions ----------------
-    v_loss = critic_step(rews, dones, xi_n, S_c, f_c, g_c) if not args.no_critic else torch.zeros(())
+    v_loss = critic_step(rews, keeps, xi_n, S_c, f_c, g_c) if not args.no_critic else torch.zeros(())
     if PROFILE:
         torch.cuda.synchronize()
         tq0, tq1, tq2 = tq
