@@ -18,7 +18,7 @@ compile与CUDA graph叠加后单卡每次迭代从1.457 s降到0.512 s（2.8×�
 | 多进程捕获失效 | NCCL watchdog线程的事件查询使捕获失效 | 多进程捕获用`capture_error_mode="thread_local"` | `e5c8739` |
 | 梯度平均有主机往返 | 要先判断“哪些参数有梯度” | `average_gradients(..., total_count=)`：固定全局样本数时跳过判断，可在图内执行，与通用路径逐位一致 | `e5c8739`，两进程gloo测试 |
 | `RunningNorm`每次更新同步4次 | 冻结判断`count >= max_count`在主机上做 | 改为GPU上`torch.where`选新旧值，缓冲原地写入（图读取的地址不变） | `e6db3e8`，跨冻结点30次更新逐位一致 |
-| 加载检查点后fused Adam失效 | `load_state_dict`用检查点里的`fused`标志覆盖当前设置 | 加载后重新设回 | `213bcbd` |
+| 加载检查点后fused Adam失效，或切换图模式时step/lr位置不符 | `load_state_dict`恢复检查点的优化器标志、学习率类型及step设备，可能与当前模式不同 | 加载后重设`fused/foreach/capturable`；fused或capturable的step移到参数设备，其余移到CPU；仅capturable学习率使用设备张量 | `213bcbd`、`38c9425` |
 | 同一步结束于同一分箱的回合，分箱更新结果不确定 | 对重复索引`index_put_`会互相覆盖，结果未定义；固定输入重复40次得到39种结果 | 先按稳定顺序分组取均值，再做一次 $`0.8\cdot\text{old}+0.2\cdot\text{mean}`$ 更新 | `9852fb4`，CUDA重复40次逐位一致 |
 | 进程退出时卡住 | 包含采样归一化collective的图在销毁NCCL进程组后才释放 | 销毁进程组前先释放图 | 见optimization.md第8.1节 |
 | eager与compile不逐位一致 | 编译后的内核数值不同 | 不追求逐位；严格比较门槛`atol=1e-5, rtol=1e-3`下世界模型参数更新最大差`1.647e-5`，记为未通过；CUDA graph与同一编译路径逐位一致 | `check_compile_equiv.py`，见optimization.md第8.3节 |

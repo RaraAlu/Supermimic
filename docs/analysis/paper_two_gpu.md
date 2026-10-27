@@ -1,5 +1,8 @@
 # 双A100全量数据短测：论文设置与批量口径
 
+本页是2026-10-27的历史短测。当前`4b4d27a`新增了默认过渡期评分与末尾起点限制，启动器未显式覆盖这些选项，
+因此用当前源码重跑下列命令会采用当前采样默认值；复现原数字须使用`paper_two_gpu_results.json`记录的源码版本与配置。
+
 ## 原始证据与尚未明确的部分
 
 核对版本：[SuperMimic arXiv:2610.28480v1 PDF](https://arxiv.org/pdf/2610.28480v1)，
@@ -84,7 +87,7 @@ T_{\mathrm{hours}} = \frac{320{,}000\,t_{\mathrm{iter}}}{3600}.
 
 数据见[汇总与实际rank配置](paper_two_gpu_results.json)及`paper_two_gpu_logs/`的四份原始CSV。
 本测没有对旧版进行相同TF32双卡A/B，不能将历史单卡BF16的2.65%提速直接套到这里。
-严格FP32 eager/compile数值比较仍存在第8.3节记录的误差，短测跑通不消除该差异。
+严格FP32 eager/compile数值比较仍存在[optimization.md第8.3节](optimization.md#83-验证结果与边界)记录的误差，短测跑通不消除该差异。
 
 ## 同行核对与解释（检索日期2026-10-27）
 

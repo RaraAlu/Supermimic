@@ -5,15 +5,17 @@
 - 代码：`fc9b5e8`（尾部分箱合并）、`a2069e2`（`--bin_clip_end`、`--bin_prior`、`sampling_log.csv`）、`d3a8c6b`（`--wm_update`）。
 - 相关：流程见[training_pipeline.md](training_pipeline.md)第3–4节，公式见[formulas.md](formulas.md)第8节。
 - 数字均来自下文列出的检查点与脚本；未在完整训练中验证的结论单独标注。
+- 版本边界：第1–6节是2026-10-27第一轮修正的历史记录，使用不跳过过渡期、不限制段末起点的评分，不能解释为当前默认行为。
+  当前（`4b4d27a`）默认`--bin_skip_steps 50 --reset_margin 100`，短片段首帧不参与自适应采样；后续三轮排查见[reset_curriculum.md](../troubleshooting/reset_curriculum.md)，现行公式见[formulas.md](formulas.md)第8节。
 
 ## 1. 结论
 
 1. 训练日志里按回合平均的`ep_ret_norm`为负，不是策略变差。原因是片段末尾的极短分箱：
    从那里起步的回合只有1–4步，首步（ $`a_{t-1}=0`$ ）的动作平滑惩罚摊不开；
    截断回合又用本回合平均奖励外推bootstrap，这些分箱的 $`G_b`$ 极低，尖锐的softmax把课程重置集中到片段末尾。
-2. 修正后（尾部有效起点少于25个的分箱并入前一个分箱），全量数据上不超过5步的回合从52%降到2.7%，
-   按回合平均的回报从−0.86升到0.83；课程不再落在片段末尾。
-3. 评估分数不受首步惩罚影响：去掉首步后归一化回报只从0.893变为0.894。
+2. 第一轮修正后（尾部有效起点少于25个的分箱并入前一个分箱），本次全量对照中不超过5步的回合从52%降到2.7%，
+   按回合平均的回报从−0.86升到0.83；消除了极短尾箱造成的集中，但后续训练仍发现过渡期与短片段首帧偏差。
+3. 本次评估中首步惩罚影响很小：去掉首步后归一化回报从0.893变为0.894。
 4. 论文没有规定的两处细节（片段末尾的回报处理、未访问分箱的初值）做成选项，默认保持原行为。
    在全量数据上，`terminal`会把首步惩罚重新放大，与均值先验同时使用时单个分箱占43%的重置，暂不采用。
 5. 修正只改变重置分布，不改变奖励、网络或更新规则；对最终训练结果的影响尚待完整训练验证。
@@ -79,7 +81,7 @@
 
 | 项 | 默认 | 选项 | 说明 |
 | --- | --- | --- | --- |
-| 尾部分箱 | 合并 | — | 多分箱片段的最后一个分箱有效起点少于 $`\mathrm{BIN\_FRAMES}/2=25`$ 个时并入前一个，每个分箱保持25–74个起点（`motion.bin_counts`、`bin_end`） |
+| 尾部分箱 | 合并 | — | 多分箱片段的最后一个分箱有效起点少于 $`\mathrm{BIN\_FRAMES}/2=25`$ 个时并入前一个；除整段不足25个起点的短片段外，每个分箱保持25–74个起点（`motion.bin_counts`、`bin_end`） |
 | 片段末尾的回报 | `--bin_clip_end bootstrap` | `terminal` | `terminal`：到达片段末尾不外推，评分为 $`G / (G_{\max}(1-\gamma^{n}))`$ ， $`n`$ 为起点到片段末尾的步数；只有500步上限的截断继续bootstrap |
 | 未访问分箱 | `--bin_prior zero` | `mean` | `mean`：未访问分箱取已访问分箱（多卡全局）的平均评分，分箱的首个回合直接取观测值 |
 | 采样诊断 | 写入 | — | `sampling_log.csv`：采样熵（按全局分箱数归一化）、最大分箱概率、已访问分箱比例、距片段末尾2 s内的重置比例 |
@@ -115,11 +117,11 @@
 512段子集（3695个分箱）上的同类对照：B、C、D三者在单次运行噪声内无差别，都把重置转到难位置（约210–240倍），
 单个分箱占18–34%的重置；子集上所有分箱很快被访问，看不出初值的影响。小样本结论不能外推到全量。
 
-## 6. 未解决的问题
+## 6. 第一轮后仍存在的问题（后续进展另见课程记录）
 
 | 问题 | 现状 | 方向 |
 | --- | --- | --- |
-| 首步平滑惩罚污染分箱评分 | `terminal`下放大，`bootstrap`下由外推掩盖 | 分箱评分不计首步奖励，只改课程信号、不改训练奖励；之后再评估C、D |
+| 首步平滑惩罚污染分箱评分 | 当时推测需去掉首步；后续实测仅去掉首步无效 | 已改为跳过50步过渡期，并排除段末起点及短片段首帧的自适应份额，见[课程记录](../troubleshooting/reset_curriculum.md)第3–5节 |
 | 课程集中度 | 子集上单个分箱占18–34%重置，全量D为43% | 每分箱份额上限或温度，偏离论文温度25，只作消融 |
 | 未访问分箱初值 | 论文未规定；全量上初值0使前期课程以覆盖为主 | 与上一项修正后一起在全量训练中比较 |
 | 计分归属 | 回报只计给起始分箱 | 失败位置计分（BeyondMimic）作消融 |
@@ -161,9 +163,9 @@ python scripts/diag_first_step.py --ckpt CKPT --motion_source subset_512.h5 --ou
 # 难度标签：每个1 s起步位置跑2 s
 python scripts/diag_bin_difficulty.py --ckpt CKPT --motion_source SOURCE.h5 --batch 8192 --out out/labels
 
-# 训练条件重放；--src 指向检查点所用提交的源码树即可重放旧代码，新选项只在本分支可用
-python scripts/diag_train_episodes.py --ckpt CKPT --motion_source SOURCE.h5 --num_envs 8192 --steps 20000 --out out/B
-python scripts/diag_train_episodes.py --ckpt CKPT --motion_source SOURCE.h5 --num_envs 8192 --steps 20000 --bin_clip_end terminal --out out/C
+# 用当前源码复现第一轮B/C的评分与起点范围，须显式关闭后续过渡期/末尾修正
+python scripts/diag_train_episodes.py --ckpt CKPT --motion_source SOURCE.h5 --num_envs 8192 --steps 20000 --bin_skip_steps 0 --reset_margin 0 --out out/B
+python scripts/diag_train_episodes.py --ckpt CKPT --motion_source SOURCE.h5 --num_envs 8192 --steps 20000 --bin_skip_steps 0 --reset_margin 0 --bin_clip_end terminal --out out/C
 
 # 对照（只用后半段回合）
 python scripts/diag_compare_bins.py out/labels/labels.pt out/B out/C
@@ -172,4 +174,6 @@ python scripts/diag_compare_bins.py out/labels/labels.pt out/B out/C
 python3 scripts/watch_train.py RUN_DIR --ref PREVIOUS_RUN_DIR --milestone 10000
 ```
 
-脚本只读检查点与数据，不写训练目录；结果与日志均不入库。
+策略重放脚本只读检查点与源数据，诊断结果写到`--out`；监督脚本只读run日志。
+`--src`接受某提交的源码树目录，不接受提交哈希；未传的采样选项使用该源码的默认值，不自动继承检查点。
+结果与日志均不入库。

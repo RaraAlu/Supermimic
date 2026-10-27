@@ -15,7 +15,7 @@
 - 2026-10-27：修正重置分箱后，在2卡A100上重新开始全量训练（全局8192环境、世界模型10×2048、策略4096、学习率2e-4不乘√2）。
   此前一个run日志中为负的`ep_ret_norm`来自尾部短分箱缺陷，不代表策略变差，见[重置采样分析](docs/analysis/reset_sampling.md)。
 - 依赖版本：以`pyproject.toml`与`uv.lock`为准（mjlab 1.6.0、mujoco-warp 3.11.0、warp-lang 1.18.0、torch 2.14.1+cu130）。
-- 数据：支持 LAFAN1 CSV 与索引白名单选择的原生 50 Hz G1 HDF5；本仓库 MotionLib 生成参考速度和 FK。
+- 数据：支持 LAFAN1 CSV、索引白名单 HDF5 与单文件合并源 HDF5；后两者读取原生 50 Hz 完整动作，由 MotionLib 生成参考速度和 FK。
 - 数据/检查点/日志均不入库。
 
 ## 平台
@@ -128,6 +128,21 @@ uv run --frozen python -m supermimic.scripts.evaluate --run_dir logs/index_smoke
 锁文件中 14 个按 Python 版本区分的同名多版本条目保留，无可操作依赖冲突。
 局域网 `data:3141` 健康检查超时，因此未完成资源缓存同步验收；未改动服务配置。
 
+## 合并源 HDF5 参考数据
+
+`--motion_source SOURCE.h5`直接读取单个`teleopit_motion_hdf5` v1源文件，不需要paired index或`run.json`。
+文件须声明50 Hz，包含float32的`root_pos`、`root_quat_w`（wxyz）、`joint_pos`，
+以及连续覆盖整个帧轴的`source_clip_starts/lengths/fps`；每段至少2帧且均为50 Hz。
+可选`clips/source_relative_path`提供段名，否则生成`clip_000000`等名称。完整格式见[训练流程第2.1节](docs/analysis/training_pipeline.md)。
+
+```bash
+uv run --frozen python -m supermimic.scripts.train --motion_source SOURCE.h5 --log_dir logs/merged
+```
+
+`--motion_dir`、`--motion_index`、`--motion_source`互斥；`--motion_root`只适用于索引入口。
+合并源的指纹绑定文件大小、总帧数和所选段的起点/长度，不计算姿态内容SHA256；
+相同大小且边界不变的姿态替换可能无法被识别。上面的`scripts/check_data.py`只支持索引入口，不能传`--motion_source`。
+
 ## 多卡自动分片
 
 使用 [torchrun](https://docs.pytorch.org/docs/2.14/elastic/run.html) 启动，训练入口从
@@ -194,6 +209,12 @@ CUDA 使用 NCCL，CPU 多进程验证使用 Gloo；不更改内置 G1 配置。
 检查点保持无 DDP 前缀，可用原单进程评估命令加载；评估仍需在其设备加载完整的所选参考库。
 CPU/Gloo 验证不能替代多 GPU NCCL/H100 的吞吐、显存峰值或数值验收。
 
+恢复训练使用`--resume RUN/last.pt`：它包含三类模型、优化器、迭代与计时状态。
+`ckpt_*.pt`只保存策略、世界模型及元数据，用于评估，不能作为训练恢复文件。
+未显式选择数据入口时，恢复会继承检查点的数据路径、子集与源根；其余训练参数仍取当前命令行或默认值，
+不会自动继承旧run的批量、学习率、精度或采样选项，续训时需明确提供。
+加载后会按当前fused/CUDA graph模式重新设置Adam标志、`step`所在设备和学习率类型，随后按当前调度计算学习率。
+
 2026-10-22 本地验证：30 项测试通过，含真实双进程 Gloo 加权梯度/优化器一致性、
 全局归一化、分箱概率及单 rank 错误协调；真实索引双进程训练、5 样本的 3+2 拆分、
 critic 非整除小批次及 2→1→2 进程恢复均跑通。
@@ -208,17 +229,27 @@ RTX 5080 单卡回归、`--nproc-per-node=gpu` 自动启动和多进程检查点
 课程重置被集中到片段末尾，训练日志按回合平均的`ep_ret_norm`也随之为负。
 全量BONES-SEED上，修正把不超过5步的回合从52%降到2.7%。排查、对照与未解决问题见[重置采样分析](docs/analysis/reset_sampling.md)。
 
-论文未规定的细节做成选项，默认保持原行为：
+当前默认跳过重置后前50个转移的分箱评分，并限制段末100步内的重置起点；
+只能从首帧起步的短片段及撑不过过渡期的分箱，只分配均匀采样份额。
+这些调整只改课程信号与重置起点，训练奖励和`ep_ret_norm`仍包含整个回合。
+四轮排查及历史验证见[课程修正记录](docs/troubleshooting/reset_curriculum.md)。可配置项：
 
 | 选项 | 默认 | 含义 |
 | --- | --- | --- |
-| `--bin_clip_end {bootstrap, terminal}` | `bootstrap` | 到达片段末尾的回合用平均奖励外推；或不外推、按起点可达最大回报归一化（全量对照中会放大首步惩罚，暂不推荐） |
+| `--bin_clip_end {bootstrap, terminal}` | `bootstrap` | 到达片段末尾的回合用平均奖励外推；或不外推、按起点可达最大回报归一化（不跳过过渡期的历史对照中会放大短回合偏差） |
 | `--bin_prior {zero, mean}` | `zero` | 未访问分箱的评分取0，或取已访问分箱的全局均值 |
+| `--bin_skip_steps N` | `50` | 不计前N个转移；首个计分奖励为`r[N+1]`，折扣从此重新起算；过渡期内终止计0分，过渡期内截断不更新 |
+| `--reset_margin N` | `100` | 普通起点须满足`f < clip_end - N`；不足的片段仍可从首帧起步，但不参与自适应份额 |
 | `--wm_update {steps, single}` | `steps` | 每次迭代世界模型走10步各2048窗口，或1步20480窗口（表A.5两种读法） |
 
+`--bin_clip_end`的均值、长度与可达最大回报均按跳过过渡期后的区间计算；`--bin_skip_steps 0 --reset_margin 0`恢复尾箱合并后的旧评分与起点范围。
 训练目录另写`sampling_log.csv`（采样熵、最大分箱概率、已访问分箱比例、距片段末尾2 s内的重置比例），`train_log.csv`的列不变。
+熵与访问率的分母仍是全部分箱；禁止重置的分箱也在分母内，因此访问率上限可能小于100%。
 
-诊断脚本只读检查点与数据，`--src`可指向检查点所用提交的源码树，以便重放旧代码：
+下列诊断中的策略重放脚本只读检查点与源数据，向`--out`写结果，`--src`可指向某提交的源码树目录。
+`diag_train_episodes.py`未显式传入的采样选项取该源码树的`TrackingSim`默认值，不自动继承检查点；
+`diag_wm_error.py`仅继承`gamma`、`bin_clip_end`与`bin_prior`，过渡期和末尾范围也取源码默认值。
+`--action_noise`在这两个脚本中独立默认0.1；使用旧检查点时要核对这些条件。
 
 | 脚本 | 用途 |
 | --- | --- |
@@ -295,11 +326,11 @@ tests/
 | --- | --- |
 | `supermimic/scripts/train.py` | 算法A.1：采样→拟合世界模型→想象推演BPTT→critic更新 |
 | `supermimic/tasks/tracking/env.py` | mjlab TrackingSim：50 Hz控制、4×5 ms子步、域随机化、回合重置 |
-| `supermimic/tasks/tracking/mdp.py` | 93维观测、表A.2奖励、终止、软存活权重、critic特征 |
-| `supermimic/tasks/tracking/rl/networks.py` | 世界模型(MultiHead)、策略(编码器+共享解码器)、critic、RunningNorm |
+| `supermimic/tasks/tracking/mdp.py` | 99维观测（93维本体观测加6维参考相对朝向）、表A.2奖励、硬/软终止、critic特征 |
+| `supermimic/tasks/tracking/rl/networks.py` | 预测70维状态增量的世界模型、策略(编码器+共享解码器)、critic、RunningNorm；奖励/观测/终止由MDP解析计算 |
 | `supermimic/tasks/tracking/rl/buffer.py` | 每环境1000步FIFO回放缓冲、k步窗口与起点采样 |
 | `supermimic/tasks/tracking/motion.py` | CSV/HDF5→50 Hz完整参考、独立差分与FK、目标帧、1 s重置分箱（尾箱合并） |
-| `supermimic/tasks/tracking/motion_hdf5.py` | 索引身份白名单、完整源段读取与源库绑定检查 |
+| `supermimic/tasks/tracking/motion_hdf5.py` | 索引身份白名单与合并源两种读取器、完整源段读取、源库绑定与结构指纹 |
 | `supermimic/utils/kinematics.py` | MuJoCo前向运动学（身体位姿/速度） |
 | `supermimic/utils/distributed.py` | 进程/设备绑定、协调错误、梯度平均与全局统计同步 |
 | `supermimic/tasks/tracking/constants.py` | 动作数据关节顺序与跟踪目标，不定义机器人配置 |
@@ -329,6 +360,7 @@ uv run --frozen python -B -m unittest discover -s tests -v
 | [docs/analysis/optimization.md](docs/analysis/optimization.md) | 性能优化分析：剖析方法与实测、瓶颈（kernel发射）、按优先级的优化项与验证顺序 |
 | [docs/analysis/reset_sampling.md](docs/analysis/reset_sampling.md) | 按回报重置采样：负`ep_ret_norm`的排查、尾部分箱修正、分箱选项、全量对照、开源实现对照与未解决问题 |
 | [docs/analysis/paper_two_gpu.md](docs/analysis/paper_two_gpu.md) | 双卡短测：表A.5批量口径的两种解读与实测耗时 |
+| [docs/analysis/doc_code_audit.md](docs/analysis/doc_code_audit.md) | 2026-10-28文档与代码逐项核对：差异、实现依据、修正与验证边界 |
 | [docs/troubleshooting/README.md](docs/troubleshooting/README.md) | 问题与解决记录：重置采样四轮课程跑偏、训练指标判读与监督、性能优化中的正确性问题、平台与远程运维 |
 | [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) | 第三方代码许可与出处 |
 | [CONTRIBUTORS.md](CONTRIBUTORS.md) | 贡献者名单、AI 编码代理署名与提交模板约定 |

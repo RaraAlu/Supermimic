@@ -1,10 +1,14 @@
 # 性能优化分析
 
 - 范围：训练循环的吞吐与显存。只讨论不改变论文算法的优化；会改变算法的项单列在第5节，需要消融后才能采用。
-- 代码版本：提交35b7e23加工作区修复（参考朝向四元数存储、评估按段长分批、梯度有限性每迭代检查一次、多卡批量口径选项）。
+- 版本边界：第1–5节为早期基线分析与候选项，第6–9节为各版本实施和测量记录；2026-10-28按`4b4d27a`校核现行开关，不改写历史数字。
 - 测量：`scripts/profile_train.py`，在Rara（RTX 4070 Ti SUPER 16 GB，Windows，`torch.compile`关闭，bf16）上用LAFAN1 40段测得。
-  结论中凡标“估计”的数字均未实测。H100与Linux（开启`torch.compile`）的数字需要用同一脚本在服务器上复测。
+  结论中凡标“估计”的数字均未实测。Linux/A100的后续实测见第7–9节，H100仍需单独测量。
 - 相关：[training_pipeline.md](training_pipeline.md)第10节给出每次迭代的计算量。
+
+当前默认：有Triton时`--compile auto`启用编译；单CUDA进程且未启用`SM_PROFILE`时`--cuda_graph auto`启用图，可与compile组合。
+多卡须显式`--cuda_graph on`。critic、环境奖励/终止、采样图开关均默认on且依赖总图开关；
+`--collect_overlap on`独立生效，CUDA上默认fused Adam。采样过渡期等算法修正会改变数据分布，不能把早期速度表当作当前版本的同配置重测。
 
 ## 1. 测量方法
 
@@ -13,8 +17,10 @@
 输出每次迭代的GPU忙碌时间、按类别汇总的kernel数与耗时、主机侧的kernel发射与同步次数，以及峰值显存。
 
 ```bash
-uv run --frozen python scripts/profile_train.py --report logs/profile.json --wait 15 -- --num_envs 512 --buffer_steps 100 --wm_batch 512 --pi_batch 512 --iterations 50 --wm_only_iters 10 --warmup_steps 16 --log_dir logs/prof_run
+uv run --frozen python scripts/profile_train.py --report logs/profile.json --wait 15 -- --num_envs 512 --buffer_steps 100 --wm_batch 512 --pi_batch 512 --iterations 50 --wm_only_iters 10 --warmup_steps 16 --cuda_graph off --log_dir logs/prof_run
 ```
+
+必须显式传`--cuda_graph off`：此脚本没有设置`SM_PROFILE`，图重放不会触发推进剖析调度所需的优化器Python钩子。
 
 ## 2. 测量结果
 
@@ -50,7 +56,7 @@ uv run --frozen python scripts/profile_train.py --report logs/profile.json --wai
    其余约6万个kernel平均不到4 µs，大多是旋转、FK、观测、归一化等小张量运算的逐元素kernel。
 3. **对H100目标的含义。** 论文单卡约每次迭代0.11 s（32万次约10 h）。仅按每次2.6 µs计，
    发射6.4万个kernel就需要约0.17 s的CPU时间，已经超过目标。所以在H100上，kernel融合（`torch.compile`或CUDA graph）
-   是达到论文耗时的必要条件，不是锦上添花（估计）。README记录的Linux GPU验证是在`--compile off`下做的，编译路径尚未验证。
+   是达到论文耗时的必要条件，不是锦上添花（估计）。这是早期未验证编译路径时的判断；Linux/A100验证现已记录在第7–8节。
 4. **显存随推演条数近似线性增长。** 3.2 GiB（512）到7.9 GiB（2048），外推到4096约15 GiB以上（估计），
    主体是BPTT保存的32步激活。16 GB卡跑不了论文单卡配置；H100 80 GB的余量需要实测。
 
@@ -61,8 +67,8 @@ uv run --frozen python scripts/profile_train.py --report logs/profile.json --wai
 ### P0：kernel融合（决定能否达到论文耗时）
 
 **3.1 在Linux上启用并验证`torch.compile`。**
-- 现状：`--compile auto`在Linux上默认开启，编译世界模型展开、单步推演、奖励与软终止、critic特征和世界模型误差五段；
-  但这条路径没有经过实测，参考朝向改为`RotationView`后也未在编译下验证。
+- 最初状态：`--compile auto`按是否安装Triton判断，编译世界模型展开、单步推演、奖励与软终止、critic特征和世界模型误差五段；
+  当时尚未实测。现已在A100验证compile与图的组合；eager/compile严格数值比较仍有差异，见第8.3节。
 - 做法：在服务器上分别用`--compile on`和`--compile off`跑`scripts/profile_train.py`，对比kernel数、GPU忙碌率和每次迭代时间；
   检查编译期间的图中断（`TORCH_LOGS=graph_breaks`）与重编译次数。
 - 收益：逐元素与拷贝类kernel（约6万个）是融合的主要对象，预期kernel数下降一个数量级（估计）。
@@ -71,8 +77,8 @@ uv run --frozen python scripts/profile_train.py --report logs/profile.json --wai
 **3.2 对固定形状的阶段使用CUDA graph。**
 - 世界模型拟合（10次 × 8步展开、反传、裁剪、Adam）和想象推演加BPTT的形状每次迭代都相同，适合整段捕获。
 - 前提：捕获区内不能有主机同步（见3.5），优化器要用`capturable=True`，随机数需走CUDA graph安全的生成器。
-- Windows没有Triton，`torch.compile`的Inductor后端不可用，但`torch.compile(backend="cudagraphs")`或手动`torch.cuda.CUDAGraph`不依赖Triton，
-  可以作为Windows开发卡的加速路径（未验证）。
+- Windows所用环境没有Triton，`torch.compile`的Inductor后端不可用；手动`torch.cuda.CUDAGraph`不依赖Triton，
+  已作为Windows开发卡的加速路径验证，见第6节。
 - 风险：实现量中等；捕获后调试困难，需要保留关闭开关。
 - **已实施**（`--cuda_graph`，见第6节）：手动`torch.cuda.CUDAGraph`，Windows可用。
 
@@ -98,13 +104,13 @@ uv run --frozen python scripts/profile_train.py --report logs/profile.json --wai
 | `RunningNorm.update`里的`self.count >= self.max_count`判断 | 采样每步4次 × 2.5步，加critic 1次 | 改为在GPU上按`count < max_count`计算权重，冻结后权重为0，不在主机上分支 |
 | `TrackingSim.step`里的`done.nonzero()`与`len(ids)` | 每个仿真步1次 | mjlab的`Simulation.reset`本身支持掩码；可改为整批按掩码重置，只在需要统计时同步 |
 | `sample_valid_starts`的拒绝采样循环 | 每次策略更新至少1次 | 维护缓冲中“后面还有H帧参考”的有效掩码，直接按掩码抽样 |
-| 策略梯度的`torch.isfinite(gn)`判断 | 1次 | 保留，或改为在GPU上把非有限梯度置零后照常step |
+| 策略梯度的`torch.isfinite(gn)`判断 | 1次 | 图内记录GPU标志，每迭代在写日志和检查点前检查，非有限即中止（现已实施） |
 | 多卡`average_gradients`里的`.tolist()` | 每次梯度平均1次，共31次 | 参数是否被使用在一次运行中固定，首次计算后缓存 |
 
 收益：单看CPU阻塞时间只有16–78 ms，但它们也是CUDA graph捕获的前提（3.2）。
 
-- **已实施的部分**（第6节）：`RunningNorm.update`改为GPU上判断冻结。其余来源未改：采样每步约27次同步来自mjlab按`env_ids`写状态的内部实现，
-  改成整批掩码重置会改变随机数消耗顺序；`done.nonzero()`和拒绝采样各约1–2.5次，且不在CUDA graph捕获范围内。
+- **已实施的部分**：`RunningNorm.update`改为GPU上判断冻结；图内梯度平均走固定样本数路径，非有限梯度改为每迭代统一检查。
+  早期采样每步约27次同步的进一步排查见第7.5节；`done.nonzero()`和拒绝采样仍在图捕获范围外。
 
 **3.6 前向运动学按树深度批量计算。**
 - 现状：`G1Kinematics.forward`按30个刚体逐个串行计算，每个刚体约十个小kernel；奖励、critic特征和参考库构建都会调用。
@@ -153,7 +159,7 @@ uv run --frozen python scripts/profile_train.py --report logs/profile.json --wai
 - 减少每次迭代的世界模型批数（10批）或窗口长度（k=8）；
 - 缩小世界模型或策略网络（2048宽MLP）；
 - 提高更新数据比、缩短想象长度H；
-- 用FP16、BF16或FP8替代论文的TF32做推演（历史BF16测量是性能实验）；
+- 用FP16、BF16或FP8替代论文的TF32后仍声称精度配置相同。当前训练入口默认`--amp bf16`；对齐本文TF32短测须显式用`--amp none`；
 - 用多步动作或降低控制频率减少仿真步数。
 
 ## 6. 实施记录（2026-10-26，分支`perf/systematic-opt`）

@@ -15,12 +15,14 @@
 见[reset_sampling.md](../analysis/reset_sampling.md)与[reset_curriculum.md](reset_curriculum.md)。
 **判读**：两者明显分开时，先看`sampling_log.csv`的`samp_top1`与`reset_tail_frac`，再怀疑策略。
 
-## 2. global批量下学习率多乘了 $`\sqrt{2}`$
+## 2. global批量实验的学习率选择
 
 - 现象：一次run用了`--batch_scope global --lr_scaling sqrt`，学习率为 $`2.83\times10^{-4}`$ 。
-- 原因：global口径下世界模型批（10×2048）与策略批（4096）是两卡总量，与论文单卡相同；
-  论文的 $`\sqrt{2}`$ 是配合每卡4096环境、总批量翻倍的双卡设置（表A.5），用在这里学习率比论文单卡口径高 $`\sqrt{2}`$ 倍。
+- 原因：global口径下世界模型批（10×2048）与策略批（4096）是两卡总量，与论文单卡数值相同；
+  此时再乘 $`\sqrt{2}`$ 会比单卡基础学习率高 $`\sqrt{2}`$ 倍。将论文缩放理解为配合总训练批量翻倍是当前实验的推断，
+  表A.5没有确认优化器批量是全局还是每卡，见[批量口径证据](../analysis/paper_two_gpu.md)。
 - 解决：global口径改用`--lr_scaling none`（ $`2\times10^{-4}`$ ）。之后的run前期`wm_err8`与`imag_rew`略落后，符合学习率降低的预期。
+  这是该次实验的选择；代码允许global批量搭配`none`或`sqrt`，不能由批量口径直接判定哪种符合作者设置。
 - 注意：8192个环境使每次迭代的仿真数据是论文单卡的2倍，global run与论文任何一个口径都不严格对应，按小时比较耗时要打折扣。
   批量口径的两种解读见[paper_two_gpu.md](../analysis/paper_two_gpu.md)。
 
@@ -31,10 +33,12 @@
 
 | 项 | 论文 | 本实现`wm_err8` |
 | --- | --- | --- |
-| 归一化 | 固定的标称误差 | 每维除以 $`\max(\sigma_\Delta, \text{下限})`$ ， $`\sigma_\Delta`$ 是单步增量的滑动标准差，随数据变化 |
+| 归一化 | 固定的标称误差 | 每维除以 $`\max(\sigma_\Delta, \text{下限})`$ ， $`\sigma_\Delta`$ 是单步增量的累计标准差，达到冻结计数前随数据变化 |
 | 数据 | 在线策略rollout | 回放缓冲区的训练窗口 |
 
-`scripts/diag_wm_error.py`在新rollout上按物理单位逐分量测量，并给出几种候选标称误差下的归一化值。
+`scripts/diag_wm_error.py`在新rollout上按物理单位逐分量测量，并给出几种候选标称误差下的归一化平方误差均值。
+它从检查点继承`gamma`、`bin_clip_end`与`bin_prior`，过渡期/末尾限制取`--src`源码的环境默认值，动作噪声由脚本独立默认0.1；
+不会恢复训练中的分箱状态或自动复原全部采样参数。历史检查点的诊断应同时记录源码版本与这些条件。
 8000次迭代的检查点上第8步的值：候选A（训练用的 $`\sigma_\Delta`$ ）0.156，B（`ERR_FLOOR`常数）12.6，
 C（表A.2奖励尺度，只算根）0.00052，D（表A.1传感器噪声半宽）0.481。论文的标称值未知，**不能据此判定是否达到论文水平**。
 
@@ -92,7 +96,8 @@ C（表A.2奖励尺度，只算根）0.00052，D（表A.1传感器噪声半宽�
 | 末尾2 s内的重置 | 高于60% | 高于10% | `reset_margin`下应接近0 |
 | 最大分箱概率 | 高于0.2 | 不变 | 第四轮问题由它发现 |
 
-服务器上的`/root/work/sm_diag/watch_train.py`是当前阈值；仓库里的`scripts/watch_train.py`仍是初始值。
+上表“现在”指该次服务器实验的`/root/work/sm_diag/watch_train.py`，不是仓库默认值。
+截至本次`4b4d27a`核对，仓库`scripts/watch_train.py`仍使用“初始”列（包括1.5倍误差、5%终止率、60%末尾重置），且没有这些阈值的命令行选项。
 
 ## 8. critic输入归一化很早冻结（只分析，未修改）
 
