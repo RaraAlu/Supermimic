@@ -115,7 +115,7 @@ softmax温度25非常尖锐：评分相差0.1，权重相差约12倍；相差0.2
 - `TrackingSim.bin_scored`要求起点早于`clip_end - reset_margin`：短片段仍可从首帧重置，但只分均匀份额（`supermimic/tasks/tracking/env.py`）。
 - 512段子集构造`TrackingSim`：可重置2,676个分箱，评分2,671个，差额5个正是只能从首帧起步的短片段；`skip 0 / margin 0`时全部可重置且全部评分。
 - Rara离线测试61项通过。
-- 全量训练验证进行中：run `supermimic-a100-global-shortfirst-20261027-225157`。
+- 全量训练验证进行中：run `supermimic-a100-global-shortfirst-20261027-225154`。
 
 ### 5.4 为什么第三轮的全量验证没有发现它
 
