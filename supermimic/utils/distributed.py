@@ -98,6 +98,34 @@ def update_bin_returns(estimates, bins, returns, alpha=0.2, visits=None, replace
 
 
 @torch.no_grad()
+def episode_bin_scores(disc_ret, ret, first_r, steps, terminated, at_clip_end, left, gamma, step_max,
+                       clip_end="bootstrap", max_steps=500, skip_first=True):
+    """Normalized reset-bin scores of finished episodes, and which episodes may update their bin.
+
+    disc_ret and ret are the discounted and plain reward sums from the start frame, first_r the first
+    step's reward, steps the episode length, left the steps from the start frame to the clip end.
+    Truncated episodes extend their return with their mean reward ("bootstrap"); with "terminal", an
+    episode that reaches the clip end stops there and is scored against the maximum attainable from
+    its start, and only the max_steps cap is extended.
+
+    With skip_first the score is the return from the second step on: the first step's
+    action-smoothness penalty comes from the zero previous action at reset, not from the bin, and in
+    a few-step episode it dominates the mean reward that the bootstrap extends. A truncated episode
+    with no step after the first carries no other evidence and does not update its bin.
+    """
+    if skip_first:
+        disc_ret, ret = (disc_ret - first_r) / gamma, ret - first_r
+        steps, left, max_steps = steps - 1, left - 1, max_steps - 1
+    valid = terminated | (steps > 0)
+    ended = terminated | at_clip_end if clip_end == "terminal" else terminated
+    G = disc_ret + torch.where(ended, 0.0, gamma**steps * (ret / steps.clamp(min=1)) / (1 - gamma))
+    G_max = torch.full_like(G, step_max / (1 - gamma))
+    if clip_end == "terminal":
+        G_max = G_max * torch.where(left < max_steps, 1 - gamma ** left.clamp(min=1), 1.0)
+    return G / G_max, valid
+
+
+@torch.no_grad()
 def global_bin_probabilities(returns, ema, maximum_return, num_bins, parallel, visits=None):
     """Global 50/40/10 reset weights; sampling remains conditional on the local shard.
 

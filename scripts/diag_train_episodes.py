@@ -30,6 +30,7 @@ parser.add_argument("--action_noise", type=float, default=0.1)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--bin_clip_end", default=None, help="passed to TrackingSim when the source supports it")
 parser.add_argument("--bin_prior", default=None, help="passed to TrackingSim when the source supports it")
+parser.add_argument("--bin_first_step", default=None, help="passed to TrackingSim when the source supports it")
 args = parser.parse_args()
 sys.path.insert(0, str(Path(args.src).resolve()))
 
@@ -61,7 +62,7 @@ pi.eval()  # normalizer statistics stay as saved; training would keep updating t
 w_rate, w_lim = RewardCfg.w_action_rate, RewardCfg.w_joint_limit
 
 N = args.num_envs
-bin_kw = {k: v for k, v in (("bin_clip_end", args.bin_clip_end), ("bin_prior", args.bin_prior)) if v is not None}
+bin_kw = {k: v for k, v in (("bin_clip_end", args.bin_clip_end), ("bin_prior", args.bin_prior), ("bin_first_step", args.bin_first_step)) if v is not None}
 env = TrackingSim(N, motion, mdp, dev, gamma=a_.get("gamma", 0.99), **bin_kw)
 hist = torch.zeros(N, Hh, OBS_DIM, device=dev)
 acc_names = ("track", "rate_pen", "lim_pen", "r", "rate0", "lim0", "r0", "rate_max", "a_absmax", "sat_steps", "rate_max_step")

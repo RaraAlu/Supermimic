@@ -22,7 +22,7 @@ from supermimic.tasks.tracking.constants import FOOT_GEOMS, G1_JOINT_NAMES
 from supermimic.tasks.tracking.mdp import MAX_STEP_REWARD, MDP, flatten_state
 from supermimic.tasks.tracking.motion import CONTROL_DT, MotionLib
 from supermimic.utils.cuda_graph import GraphedCall
-from supermimic.utils.distributed import update_bin_returns
+from supermimic.utils.distributed import episode_bin_scores, update_bin_returns
 from supermimic.utils.rotations import mat_to_quat, quat_to_mat, so3_exp
 
 NUM_SUBSTEPS = 4
@@ -30,6 +30,7 @@ PHYSICS_DT = CONTROL_DT / NUM_SUBSTEPS  # 5 ms
 TAIL_STEPS = 100  # resets this close to the clip end (2 s) are reported as tail resets
 BIN_CLIP_END = ("bootstrap", "terminal")
 BIN_PRIOR = ("zero", "mean")
+BIN_FIRST_STEP = ("skip", "keep")
 
 
 def make_sim_cfg() -> SimulationCfg:
@@ -50,15 +51,18 @@ class TrackingSim:
     def __init__(self, num_envs: int, motion: MotionLib, mdp: MDP, device: str, gamma: float = 0.99,
                  eval_mode: bool = False, max_episode_steps: int = 500, reset_noise: bool = True,
                  parallel=None, graph_reward: bool = False, bin_clip_end: str = "bootstrap",
-                 bin_prior: str = "zero"):  # fmt: skip
+                 bin_prior: str = "zero", bin_first_step: str = "skip"):  # fmt: skip
         """bin_clip_end: "bootstrap" extends episodes that reach the clip end with their mean reward and
         scores bins against the global maximum return; "terminal" ends the return at the clip end and
         scores each episode against the maximum attainable from its start frame (only the 500-step
         cap is bootstrapped). bin_prior: unvisited bins score 0 ("zero") or the mean of visited bins
-        ("mean", whose first episode then replaces the prior instead of being blended into it)."""
-        if bin_clip_end not in BIN_CLIP_END or bin_prior not in BIN_PRIOR:
-            raise ValueError(f"bin_clip_end must be one of {BIN_CLIP_END} and bin_prior one of {BIN_PRIOR}")
-        self.bin_clip_end, self.bin_prior = bin_clip_end, bin_prior
+        ("mean", whose first episode then replaces the prior instead of being blended into it).
+        bin_first_step: score bins from the second step on ("skip") or from the start ("keep");
+        see utils.distributed.episode_bin_scores."""
+        if bin_clip_end not in BIN_CLIP_END or bin_prior not in BIN_PRIOR or bin_first_step not in BIN_FIRST_STEP:
+            raise ValueError(f"bin_clip_end must be one of {BIN_CLIP_END}, bin_prior one of {BIN_PRIOR} "
+                             f"and bin_first_step one of {BIN_FIRST_STEP}")
+        self.bin_clip_end, self.bin_prior, self.bin_first_step = bin_clip_end, bin_prior, bin_first_step
         self.device = dev = device
         self.parallel = parallel if parallel is not None and parallel.enabled else None
         scene_cfg = SceneCfg(
@@ -126,6 +130,7 @@ class TrackingSim:
         self.start_f = torch.zeros(self.N, dtype=torch.long, device=dev)
         self.ep_disc_ret = torch.zeros(self.N, device=dev)
         self.ep_ret = torch.zeros(self.N, device=dev)
+        self.ep_r0 = torch.zeros(self.N, device=dev)  # first step's reward of the current episode
         self.G_max = MAX_STEP_REWARD / (1 - gamma)
         # per-bin score: discounted return divided by its maximum (G_max, or the start frame's attainable maximum)
         self.bin_G = torch.full((motion.num_bins,), 0.0, device=dev)
@@ -280,6 +285,7 @@ class TrackingSim:
         # bookkeeping
         self.ep_disc_ret += (self.gamma ** ep_step.float()) * r
         self.ep_ret += r
+        self.ep_r0 = torch.where(ep_step == 0, r, self.ep_r0)
         self.f = f1
         self.ep_step = ep_step + 1
         self.a_prev = a.clone()
@@ -293,17 +299,12 @@ class TrackingSim:
         if len(ids) > 0:
             # bin score; truncated episodes bootstrap with their mean reward
             T = self.ep_step[ids].float()
-            ended = term[ids] | (at_clip_end[ids] if self.bin_clip_end == "terminal" else False)
-            boot = torch.where(ended, 0.0, (self.gamma**T) * (self.ep_ret[ids] / T) / (1 - self.gamma))
-            G = self.ep_disc_ret[ids] + boot
-            G_max = self.G_max
-            if self.bin_clip_end == "terminal":
-                # steps from the start frame to the clip end; the 500-step cap bootstraps past it
-                s = self.start_f[ids]
-                left = (self.motion.clip_end[self.motion.clip_id[s]] - s).float()
-                reach = left < self.max_episode_steps
-                G_max = self.G_max * torch.where(reach, 1 - self.gamma**left, 1.0)
-            update_bin_returns(self.bin_G, self.start_bin[ids], G / G_max, visits=self.bin_visits,
+            s = self.start_f[ids]
+            left = (self.motion.clip_end[self.motion.clip_id[s]] - s).float()  # start frame to clip end
+            score, valid = episode_bin_scores(self.ep_disc_ret[ids], self.ep_ret[ids], self.ep_r0[ids], T, term[ids],
+                                              at_clip_end[ids], left, self.gamma, MAX_STEP_REWARD, self.bin_clip_end,
+                                              self.max_episode_steps, self.bin_first_step == "skip")
+            update_bin_returns(self.bin_G, self.start_bin[ids][valid], score[valid], visits=self.bin_visits,
                                replace_first=self.bin_prior == "mean")
             out["ep_len"] = T
             out["ep_ret_norm"] = self.ep_ret[ids] / (T * MAX_STEP_REWARD)

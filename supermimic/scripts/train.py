@@ -72,6 +72,10 @@ parser.add_argument("--bin_clip_end", type=str, default="bootstrap", choices=["b
                          "attainable from each start frame (paper Appendix D.1 leaves this open)")
 parser.add_argument("--bin_prior", type=str, default="zero", choices=["zero", "mean"],
                     help="score of reset bins without a finished episode: 0, or the mean of visited bins")
+parser.add_argument("--bin_first_step", type=str, default="skip", choices=["skip", "keep"],
+                    help="score reset bins from each episode's second step on (skip), so the first step's "
+                         "action-smoothness penalty from the zero previous action at reset does not pull resets "
+                         "onto clip ends; keep reproduces runs before this option")
 parser.add_argument("--device", type=str, default="cuda:0")
 parser.add_argument("--batch_scope", type=str, default="global", choices=["global", "per_gpu"],
                     help="--num_envs/--wm_batch/--pi_batch are global totals split across ranks, or per-GPU sizes; "
@@ -444,7 +448,7 @@ def policy_update():
 # ------------------------------------------------------------------------------------------------
 env = TrackingSim(local_envs, motion, mdp, dev, gamma=args.gamma, parallel=parallel,
                   graph_reward=USE_GRAPH and args.cuda_graph_env == "on",
-                  bin_clip_end=args.bin_clip_end, bin_prior=args.bin_prior)
+                  bin_clip_end=args.bin_clip_end, bin_prior=args.bin_prior, bin_first_step=args.bin_first_step)
 buffer = ReplayBuffer(args.buffer_steps, local_envs, dev)
 obs_hist = torch.zeros(local_envs, Hh, OBS_DIM, device=dev)
 
