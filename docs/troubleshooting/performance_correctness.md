@@ -19,6 +19,8 @@ compile与CUDA graph叠加后单卡每次迭代从1.457 s降到0.512 s（2.8×�
 | 梯度平均有主机往返 | 要先判断“哪些参数有梯度” | `average_gradients(..., total_count=)`：固定全局样本数时跳过判断，可在图内执行，与通用路径逐位一致 | `e5c8739`，两进程gloo测试 |
 | `RunningNorm`每次更新同步4次 | 冻结判断`count >= max_count`在主机上做 | 改为GPU上`torch.where`选新旧值，缓冲原地写入（图读取的地址不变） | `e6db3e8`，跨冻结点30次更新逐位一致 |
 | 加载检查点后fused Adam失效 | `load_state_dict`用检查点里的`fused`标志覆盖当前设置 | 加载后重新设回 | `213bcbd` |
+| 旧检查点恢复训练，第一次世界模型更新即CUDA报错 | 非fused、非capturable检查点的Adam step计数在CPU上；加载后改成fused/capturable却没搬step，fused内核把CPU地址当显存读 | 恢复时按当前模式放置：fused或capturable时step放参数所在设备，否则放CPU；学习率在capturable时为设备张量 | `38c9425`；Rara上旧↔新四种组合恢复后都训练到第20次迭代，未修时复现`CUDA error: invalid argument` |
+| 软终止在fp32下被抵消成0 | `1 - sigmoid(x)`在 $`x`$ 超过约17时精确为0、梯度也为0；返回`d = 1 - alive`后存活权重再算`1 - d`，极小的存活概率被舍成0（Barron等，[arXiv:2610.31642](https://arxiv.org/abs/2610.31642)所说的抵消） | `MDP.soft_survival`写作`sigmoid(-x)`，存活权重与GAE直接用每步存活概率 | `4293e90`；图重放与直接执行逐位一致，新增单测覆盖 $`x=17.5`$ |
 | 同一步结束于同一分箱的回合，分箱更新结果不确定 | 对重复索引`index_put_`会互相覆盖，结果未定义；固定输入重复40次得到39种结果 | 先按稳定顺序分组取均值，再做一次 $`0.8\cdot\text{old}+0.2\cdot\text{mean}`$ 更新 | `9852fb4`，CUDA重复40次逐位一致 |
 | 进程退出时卡住 | 包含采样归一化collective的图在销毁NCCL进程组后才释放 | 销毁进程组前先释放图 | 见optimization.md第8.1节 |
 | eager与compile不逐位一致 | 编译后的内核数值不同 | 不追求逐位；严格比较门槛`atol=1e-5, rtol=1e-3`下世界模型参数更新最大差`1.647e-5`，记为未通过；CUDA graph与同一编译路径逐位一致 | `check_compile_equiv.py`，见optimization.md第8.3节 |
