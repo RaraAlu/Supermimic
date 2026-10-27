@@ -18,7 +18,20 @@ from supermimic.utils.rotations import mat_to_6d, mat_to_quat, quat_slerp, quat_
 
 CONTROL_DT = 0.02
 BIN_FRAMES = 50  # 1 s bins for return-based reset sampling
+MIN_TAIL_STARTS = BIN_FRAMES // 2  # a shorter final bin joins the previous one
 FK_CHUNK = 65536
+
+
+def bin_counts(lengths: torch.Tensor) -> torch.Tensor:
+    """Reset bins per clip over its n - 1 start frames (the final frame is never a start).
+
+    A final bin with fewer than MIN_TAIL_STARTS start frames is merged into the previous bin:
+    its episodes would last only a few steps, and their bootstrapped bin returns would pull
+    the return-based reset sampling onto clip ends.
+    """
+    starts = lengths - 1
+    full, tail = starts // BIN_FRAMES, starts % BIN_FRAMES
+    return full + ((tail >= MIN_TAIL_STARTS) | (full == 0)).long()
 
 
 class RotationView:
@@ -116,7 +129,7 @@ class MotionLib:
                           "clip_indices": ids,
                           "frames_per_rank": [sum(lens[i] for i in group) for group in groups],
                           "clips_per_rank": [len(group) for group in groups]}
-        self.global_num_bins = sum((n + BIN_FRAMES - 2) // BIN_FRAMES for n in lens)
+        self.global_num_bins = int(bin_counts(torch.tensor(lens, dtype=torch.long)).sum())
         frames = sum(lens[i] for i in ids)
         self.description = dict(self.global_description, selected_clips=len(ids), selected_frames=frames,
                                 frame_hours=frames / 50 / 3600,
@@ -189,12 +202,15 @@ class MotionLib:
                 self.root_w_local[s:e] = (Rt @ self.root_w[s:e].unsqueeze(-1)).squeeze(-1)
         # Storage windows never participate in these source-clip time-axis bins.
         # The final frame is a target, never a reset start (there must be a next frame).
-        counts = (lengths + BIN_FRAMES - 2) // BIN_FRAMES
+        counts = bin_counts(lengths)
         first_bin = torch.cumsum(counts, 0) - counts
         self.bin_clip = torch.repeat_interleave(torch.arange(len(lens), device=device), counts)
         self.num_bins = int(counts.sum())
         local_bin = torch.arange(self.num_bins, device=device) - first_bin[self.bin_clip]
         self.bin_start = self.clip_start[self.bin_clip] + local_bin * BIN_FRAMES
+        # Reset starts of a bin are [bin_start, bin_end); the last bin runs to the clip's final frame.
+        last = local_bin == counts[self.bin_clip] - 1
+        self.bin_end = torch.where(last, self.clip_end[self.bin_clip], self.bin_start + BIN_FRAMES)
         self.frame_bin = torch.empty(self.num_frames, dtype=torch.long, device=device)
         for start in range(0, self.num_frames, 65536):
             end = min(start + 65536, self.num_frames)

@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from supermimic.tasks.tracking.constants import G1_JOINT_NAMES
-from supermimic.tasks.tracking.motion import MotionLib, check_reference, resolve_motion_args
+from supermimic.tasks.tracking.motion import BIN_FRAMES, MIN_TAIL_STARTS, MotionLib, bin_counts, check_reference, resolve_motion_args
 from supermimic.tasks.tracking.motion_hdf5 import INDEX_FORMAT, IndexedG1Dataset, file_sha256, partition_clips
 from supermimic.utils.kinematics import G1Kinematics
 
@@ -111,6 +111,13 @@ class IndexedMotionTests(unittest.TestCase):
             self.assertEqual(lib.future_frames(end[None], 5).tolist(), [[int(end)] * 5])
             bins = lib.bin_start[lib.bin_clip == clip]
             self.assertTrue(bool((bins < end).all()))
+            # bins partition the clip's start frames [clip_start, clip_end) in order
+            starts, ends = bins, lib.bin_end[lib.bin_clip == clip]
+            self.assertEqual(int(starts[0]), int(lib.clip_start[clip]))
+            self.assertEqual(int(ends[-1]), int(end))
+            self.assertTrue(torch.equal(starts[1:], ends[:-1]))
+            for b in torch.nonzero(lib.bin_clip == clip).flatten().tolist():
+                self.assertTrue(bool((lib.frame_bin[lib.bin_start[b]:lib.bin_end[b]] == b).all()))
         self.assertEqual(int(lib.frame_bin.max()), lib.num_bins - 1)
 
     def test_explicit_subset_has_distinct_fingerprint(self):
@@ -235,6 +242,25 @@ class IndexedMotionTests(unittest.TestCase):
             self.assertEqual(sorted(i for group in groups for i in group), list(range(len(lengths))))
             self.assertTrue(all(groups))
         self.assertEqual(partition_clips(lengths, 1), [list(range(len(lengths)))])
+
+
+class ResetBinTests(unittest.TestCase):
+    def test_short_final_bin_merges_into_previous(self):
+        # clip length -> bins; a clip of n frames has n - 1 reset starts
+        cases = {2: 1, 26: 1, 51: 1, 52: 1, 75: 1, 76: 2, 101: 2, 304: 6, 326: 7, 1030: 21}
+        counts = bin_counts(torch.tensor(list(cases), dtype=torch.long))
+        self.assertEqual(counts.tolist(), list(cases.values()))
+        self.assertEqual(MIN_TAIL_STARTS, BIN_FRAMES // 2)
+
+    def test_every_bin_of_a_multi_bin_clip_has_enough_starts(self):
+        lengths = torch.arange(2, 700)
+        counts = bin_counts(lengths)
+        starts = lengths - 1
+        last = starts - BIN_FRAMES * (counts - 1)  # start frames in each clip's final bin
+        multi = counts > 1
+        self.assertTrue(bool((last[multi] >= MIN_TAIL_STARTS).all()))
+        self.assertTrue(bool((last[multi] < BIN_FRAMES + MIN_TAIL_STARTS).all()))
+        self.assertTrue(torch.equal(last[~multi], starts[~multi]))
 
 
 if __name__ == "__main__":

@@ -152,7 +152,7 @@ class TrackingSim:
             probs = 0.5 / m.num_bins + 0.4 * soft + 0.1 * self.bin_w_avg / self.bin_w_avg.sum()
         bins = torch.multinomial(probs, n, replacement=True)
         start = m.bin_start[bins]
-        end = torch.minimum(start + 50, m.clip_end[m.bin_clip[bins]])  # keep >= 1 step before the clip end
+        end = m.bin_end[bins]  # stays >= 1 step before the clip end
         f = start + (torch.rand(n, device=self.device) * (end - start).float()).long()
         return f, bins
 
