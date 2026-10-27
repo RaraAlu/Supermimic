@@ -227,6 +227,7 @@ RTX 5080 单卡回归、`--nproc-per-node=gpu` 自动启动和多进程检查点
 | `scripts/diag_train_episodes.py` | 按训练条件重放，记录每个回合的长度、`ep_ret_norm`及其奖励/惩罚分解，导出分箱状态 |
 | `scripts/diag_bin_difficulty.py` | 从每个1 s起步位置按评估条件跑2 s，生成与分箱方案无关的难度标签 |
 | `scripts/diag_compare_bins.py` | 汇总多次重放：短回合、片段末尾重置、难位置倾斜、采样集中度 |
+| `scripts/diag_wm_error.py` | 用检查点的策略按训练条件收集新rollout，测世界模型k步预测误差：物理单位逐分量，及几种候选标称误差下的归一化值 |
 | `scripts/watch_train.py` | 监督训练日志，出现异常、到达里程碑或训练结束时退出 |
 
 ## 实现
@@ -275,6 +276,7 @@ scripts/
   diag_train_episodes.py
   diag_bin_difficulty.py
   diag_compare_bins.py
+  diag_wm_error.py
   watch_train.py
   smrun.sh
 tests/
