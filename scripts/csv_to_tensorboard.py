@@ -1,6 +1,7 @@
-"""Write a run's train_log.csv and sampling_log.csv as TensorBoard scalars (read-only on the CSV files).
+"""Write a run's train_log.csv, sampling_log.csv and diag_log.csv as TensorBoard scalars (read-only on the CSV files).
 
-Tags match training's --tensorboard output: train/<column> and sampling/<column>, stepped by iteration.
+Tags match training's --tensorboard output: train/<column>, sampling/<column> and diag/<column>, stepped by
+iteration; a file the run does not have (diag_log.csv exists from the run that added it on) is skipped.
 For runs that started without TensorBoard logging; safe beside a running training, which only appends to the
 CSV files. A resumed row replaces the earlier row of the same iteration, a partly written last line is
 skipped, and rerunning hides the events of the previous conversion (purge_step), so it can be repeated.
@@ -16,7 +17,7 @@ from pathlib import Path
 from torch.utils.tensorboard import SummaryWriter
 
 parser = argparse.ArgumentParser()
-parser.add_argument("run", help="training directory with train_log.csv (and sampling_log.csv)")
+parser.add_argument("run", help="training directory with train_log.csv (and sampling_log.csv, diag_log.csv)")
 parser.add_argument("--out", default=None, help="event directory (default: RUN/tensorboard, where training writes)")
 args = parser.parse_args()
 
@@ -38,7 +39,7 @@ def read_rows(path):
 
 
 run = Path(args.run)
-groups = [("train", *read_rows(run / "train_log.csv")), ("sampling", *read_rows(run / "sampling_log.csv"))]
+groups = [(name, *read_rows(run / f"{name}_log.csv")) for name in ("train", "sampling", "diag")]
 first = min((rows[0]["iteration"] for _, _, rows in groups if rows), default=None)
 if first is None:
     raise SystemExit(f"no complete rows in {run}/train_log.csv or sampling_log.csv")

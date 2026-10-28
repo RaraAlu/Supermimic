@@ -46,6 +46,9 @@ parser.add_argument("--warmup_steps", type=int, default=64, help="sim steps befo
 parser.add_argument("--wm_only_iters", type=int, default=500, help="world-model-only iterations at the start")
 parser.add_argument("--lr_decay_iters", type=int, default=250_000)
 parser.add_argument("--ckpt_every", type=int, default=2000)
+parser.add_argument("--keep_states", type=int, default=3,
+                    help="full training states to keep: last.pt plus the previous saves as last_prev1.pt, ...; a collapse "
+                         "then leaves the state from before it for keep - 1 more saves (1: only last.pt)")
 parser.add_argument("--log_every", type=int, default=50)
 parser.add_argument("--tensorboard", type=str, default="auto", choices=["auto", "on", "off"],
                     help="also write every log row as TensorBoard scalars to LOG_DIR/tensorboard (auto: only if tensorboard is installed)")
@@ -108,6 +111,7 @@ import supermimic.tasks.tracking.rl.networks as networks
 from supermimic.tasks.tracking.rl.buffer import ReplayBuffer
 from supermimic.tasks.tracking.rl.networks import Critic, Policy, WorldModel
 from supermimic.utils.kinematics import G1Kinematics
+from supermimic.utils.checkpoints import rotate_states
 from supermimic.utils.distributed import DistributedContext, average_gradients
 from supermimic.utils.cuda_graph import GraphedCall as CudaGraphCall
 
@@ -423,24 +427,43 @@ def _policy_step(s_flat, xi, f, a_prev, o_hist):
 policy_step = GraphedCall(_policy_step)
 
 
+# critic diagnostics of one update (diag_log.csv): means, maxima, and bin-score statistics added when logging
+DIAG_MEAN = ("v_mean", "v_end_mean", "v_capped_frac", "critic_bias", "z_gt5_frac", "v_input_gradnorm", "critic_gradnorm")
+DIAG_MAX = ("v_max", "z_max")
+
+
 def _critic_step(rews, keeps, xi_n, S_c, f_c, g_c):
-    """Fit the critic to GAE(lambda) targets over the imagined transitions (Eq. 3)."""
+    """Fit the critic to GAE(lambda) targets over the imagined transitions (Eq. 3).
+
+    Besides the loss it returns the diagnostics DIAG_MEAN and DIAG_MAX measured on this update's imagined states:
+    the raw critic values (mean, at the horizon end, maximum, share above the cap), their mean offset from the
+    GAE targets, how far the critic's normalized inputs stray (|z| > 5 share, maximum), the critic's input
+    gradient at the end states (what the policy objective differentiates through) and its parameter gradient norm.
+    """
     B = local_pi_batch
     with torch.no_grad():
         xi_c = xi_n.unsqueeze(0).expand(HZ + 1, -1, -1).flatten(0, 1)
         X = critic_input_c(S_c, f_c, xi_c, g_c).view(HZ + 1, B, -1)
     critic.norm.update(X)
     with torch.no_grad():
-        V = cap_value(critic(X))
+        raw = critic(X)
+        V = cap_value(raw)
         R = V[-1]
         targets = []
         for t in range(HZ - 1, -1, -1):
             R = rews[t] + args.gamma * keeps[t] * ((1 - args.lam) * V[t + 1] + args.lam * R)
             targets.append(R)
         targets = torch.stack(targets[::-1])  # (H, B)
+        z = critic.norm(X).abs()
+        diag_mean = torch.stack((raw.mean(), raw[-1].mean(), (raw > VALUE_CAP).float().mean(), (raw[:-1] - targets).mean(),
+                                 (z > 5).float().mean()))
+        diag_max = torch.stack((raw.max(), z.max()))
+    x_end = X[-1].detach().clone().requires_grad_(True)
+    value_grad = torch.autograd.grad(critic(x_end).sum(), x_end)[0].norm(dim=-1).mean()  # before this update's steps
     Xf, Yf = X[:-1].reshape(-1, X.shape[-1]), targets.reshape(-1)
     n = Xf.shape[0]
     v_loss = torch.zeros(())
+    grad_sum = torch.zeros((), device=dev)
     for _ in range(args.critic_epochs):
         perm = torch.randperm(n, device=dev)
         for i, idx in enumerate(torch.tensor_split(perm, args.critic_minibatches)):
@@ -450,8 +473,10 @@ def _critic_step(rews, keeps, xi_n, S_c, f_c, g_c):
             average_gradients(critic, len(idx), total_count=GRAPH_CRITIC_TOTALS[i] if GRAPH_CRITIC else None)
             grad_norm = nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
             nonfinite[1].logical_or_(~torch.isfinite(grad_norm))
+            grad_sum = grad_sum + grad_norm.detach()
             opt_v.step()
-    return v_loss.detach()
+    diag_mean = torch.cat((diag_mean, torch.stack((value_grad, grad_sum / (args.critic_epochs * args.critic_minibatches)))))
+    return v_loss.detach(), diag_mean, diag_max
 
 
 critic_step = GraphedCall(_critic_step, enabled=GRAPH_CRITIC)
@@ -469,12 +494,15 @@ def policy_update():
     set_requires_grad(wm, True)
     set_requires_grad(critic, True)
     # ---------------- critic: GAE(lambda) targets over the imagined transitions ----------------
-    v_loss = critic_step(rews, keeps, xi_n, S_c, f_c, g_c) if not args.no_critic else torch.zeros(())
+    if args.no_critic:
+        v_loss, diag_mean, diag_max = torch.zeros(()), torch.zeros(len(DIAG_MEAN)), torch.zeros(len(DIAG_MAX))
+    else:
+        v_loss, diag_mean, diag_max = critic_step(rews, keeps, xi_n, S_c, f_c, g_c)
     if PROFILE:
         torch.cuda.synchronize()
         tq0, tq1, tq2 = tq
         print(f"[prof] imagine fwd {1e3*(tq1-tq0):.0f} ms | bwd {1e3*(tq2-tq1):.0f} ms | critic {1e3*(time.time()-tq2):.0f} ms", flush=True)
-    return loss, v_loss, imag_r, gn, surv
+    return loss, v_loss, imag_r, gn, surv, diag_mean, diag_max
 
 
 # ------------------------------------------------------------------------------------------------
@@ -536,6 +564,8 @@ collect(args.warmup_steps, stats)
 TRAIN_COLUMNS = ("iteration", "wall_h", "sim_steps", "wm_loss", "wm_err8", "pi_loss", "v_loss", "imag_rew", "pi_gradnorm",
                  "imag_survival", "sim_rew", "ep_len", "ep_ret_norm", "term_frac", "it_per_s", "lr")
 SAMPLING_COLUMNS = ("iteration", "samp_entropy", "samp_top1", "bins_visited", "reset_tail_frac")
+DIAG_BINS = ("bin_score_mean", "bin_score_min", "nonfinite_scores")  # visited, scorable bins; scores skipped since the last row
+DIAG_COLUMNS = ("iteration", *DIAG_MEAN, *DIAG_MAX, *DIAG_BINS)
 log_f = open(os.path.join(args.log_dir, "train_log.csv"), "a", encoding="utf-8") if parallel.primary else None
 if parallel.primary and log_f.tell() == 0:
     log_f.write(",".join(TRAIN_COLUMNS) + "\n")
@@ -543,13 +573,18 @@ if parallel.primary and log_f.tell() == 0:
 samp_f = open(os.path.join(args.log_dir, "sampling_log.csv"), "a", encoding="utf-8") if parallel.primary else None
 if parallel.primary and samp_f.tell() == 0:
     samp_f.write(",".join(SAMPLING_COLUMNS) + "\n")
-# same rows as the CSV files, tagged train/<column> and sampling/<column>; on resume, purge_step hides
+# critic and reset-score diagnostics, again in their own file so older runs keep their columns
+diag_f = open(os.path.join(args.log_dir, "diag_log.csv"), "a", encoding="utf-8") if parallel.primary else None
+if parallel.primary and diag_f.tell() == 0:
+    diag_f.write(",".join(DIAG_COLUMNS) + "\n")
+# same rows as the CSV files, tagged train/<column>, sampling/<column> and diag/<column>; on resume, purge_step hides
 # the events a previous run wrote after the checkpoint it resumes from (rows up to start_it stay valid)
 tb = SummaryWriter(os.path.join(args.log_dir, "tensorboard"), purge_step=start_it + 1 if start_it else None) if parallel.primary and USE_TENSORBOARD else None
 t_start = time.time() - wall_offset
 t_log = time.time()
 step_acc = 0.0
 agg = {"wm": [], "wm8": [], "pi": [], "v": [], "ir": [], "gn": [], "surv": []}
+diag_agg = {"mean": [], "max": []}
 for it in range(start_it, args.iterations):
     lr = lr_at(it)
     for o in (opt_wm, opt_pi, opt_v):
@@ -573,11 +608,12 @@ for it in range(start_it, args.iterations):
         torch.cuda.synchronize(); tp2 = time.time()
     agg["wm"].append(l), agg["wm8"].append(e8)
     if it >= args.wm_only_iters:
-        pl, vl, ir, gn, surv = policy_update()
+        pl, vl, ir, gn, surv, dmean, dmax = policy_update()
         if prof:
             torch.cuda.synchronize(); tp3 = time.time()
             print(f"[prof] collect {1e3*(tp1-tp0):.0f} ms ({n} steps) | wm {1e3*(tp2-tp1):.0f} ms | policy+critic {1e3*(tp3-tp2):.0f} ms", flush=True)
         agg["pi"].append(pl), agg["v"].append(vl), agg["ir"].append(ir), agg["gn"].append(gn), agg["surv"].append(surv)
+        diag_agg["mean"].append(dmean), diag_agg["max"].append(dmax)
     if bool(nonfinite.any()):
         which = [name for name, bad in zip(("world-model", "critic", "policy"), nonfinite.tolist()) if bad]
         raise FloatingPointError(f"non-finite globally averaged {' and '.join(which)} gradient at iteration {it + 1}")
@@ -601,13 +637,26 @@ for it in range(start_it, args.iterations):
         top1 = float(parallel.reduce(local_samp[1], torch.distributed.ReduceOp.MAX))
         samp_row = [it + 1, float(samp[0]) / math.log(max(motion.global_num_bins, 2)), top1,
                     float(samp[2]) / motion.global_num_bins, float(samp[4] / samp[3].clamp(min=1))]
+        weight = torch.tensor([float(local_pi_batch)], device=dev)
+        d_mean = torch.stack(diag_agg["mean"]).mean(0).to(dev) if diag_agg["mean"] else torch.zeros(len(DIAG_MEAN), device=dev)
+        d_max = torch.stack(diag_agg["max"]).max(0).values.to(dev) if diag_agg["max"] else torch.zeros(len(DIAG_MAX), device=dev)
+        d_mean = parallel.reduce(torch.cat((d_mean * weight, weight))).cpu()
+        d_max = parallel.reduce(d_max, torch.distributed.ReduceOp.MAX).cpu()
+        scored = env.bin_scored & (env.bin_visits > 0)
+        bin_sum = parallel.reduce(torch.stack((torch.where(scored, env.bin_G, 0.0).sum().double(), scored.sum().double()))).cpu()
+        bin_min = float(parallel.reduce(torch.where(scored, env.bin_G, torch.inf).min(), torch.distributed.ReduceOp.MIN))
+        diag_row = [it + 1, *(float(x) for x in d_mean[:-1] / d_mean[-1]), *(float(x) for x in d_max),
+                    float(bin_sum[0] / bin_sum[1].clamp(min=1)), bin_min if math.isfinite(bin_min) else 0.0, float(samp[5])]
         if parallel.primary:
             log_f.write(",".join(f"{x:.6g}" if isinstance(x, float) else str(x) for x in row) + "\n")
             log_f.flush()
             samp_f.write(",".join(f"{x:.6g}" if isinstance(x, float) else str(x) for x in samp_row) + "\n")
             samp_f.flush()
+            diag_f.write(",".join(f"{x:.6g}" if isinstance(x, float) else str(x) for x in diag_row) + "\n")
+            diag_f.flush()
             if tb:
-                for group, names, values in (("train", TRAIN_COLUMNS, row), ("sampling", SAMPLING_COLUMNS, samp_row)):
+                for group, names, values in (("train", TRAIN_COLUMNS, row), ("sampling", SAMPLING_COLUMNS, samp_row),
+                                             ("diag", DIAG_COLUMNS, diag_row)):
                     for name, x in zip(names[1:], values[1:]):
                         tb.add_scalar(f"{group}/{name}", x, it + 1)
                 tb.flush()
@@ -615,6 +664,7 @@ for it in range(start_it, args.iterations):
                   f"| sim_r {row[10]:.3f} ep_len {row[11]:.1f} ep_ret {row[12]:.3f} term {term_frac:.2f} | {ips:.2f} it/s", flush=True)  # fmt: skip
         stats = {k: [] for k in stats}
         agg = {k: [] for k in agg}
+        diag_agg = {k: [] for k in diag_agg}
     if (it + 1) % args.ckpt_every == 0 or it + 1 == args.iterations:
         with parallel.coordinated("checkpoint write"):
             if parallel.primary:
@@ -624,6 +674,7 @@ for it in range(start_it, args.iterations):
                       "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"), "reference": motion.global_description,
                       "distributed": {"world_size": parallel.world_size, "partition_algorithm": motion.partition["algorithm"]}}  # fmt: skip
                 last = os.path.join(args.log_dir, "last.pt")
+                rotate_states(last, args.keep_states)
                 torch.save(ck, last + ".tmp")
                 os.replace(last + ".tmp", last)
                 small = {k: ck[k] for k in ("pi", "wm", "iteration", "wall_time", "sim_steps", "args", "saved_at", "reference", "distributed")}
@@ -632,6 +683,8 @@ for it in range(start_it, args.iterations):
                 os.replace(path + ".tmp", path)
 if log_f:
     log_f.close()
+    samp_f.close()
+    diag_f.close()
 if tb:
     tb.close()
 for captured in (wm_step, policy_step, critic_step, collect_action, env._reward_termination):

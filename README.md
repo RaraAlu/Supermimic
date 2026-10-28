@@ -228,6 +228,22 @@ CSV仍照旧追加。没有开启TensorBoard的旧run可用`scripts/csv_to_tenso
 uv run --frozen tensorboard --logdir logs
 ```
 
+训练目录另写`diag_log.csv`（TensorBoard标签`diag/<列名>`），每次记日志一行，用来在崩溃时判断critic的状态：
+
+| 列 | 含义 |
+| --- | --- |
+| `v_mean`、`v_end_mean`、`v_max` | 想象状态上critic原始估值的均值、推演终点的均值（策略目标对它求导）、最大值 |
+| `v_capped_frac` | 估值超过`--critic_cap`上限的比例 |
+| `critic_bias` | 估值与GAE目标的平均差（拟合得准时接近0） |
+| `z_gt5_frac`、`z_max` | critic归一化后的输入中\|z\|>5的比例与最大值（输入偏离训练分布的程度） |
+| `v_input_gradnorm` | 终点处估值对输入的梯度范数（策略经它回传；崩溃的critic比健康时高约20–30倍） |
+| `critic_gradnorm` | critic参数梯度范数（裁剪前，各次更新的平均） |
+| `bin_score_mean`、`bin_score_min` | 已访问且可评分分箱的分数均值与最小值 |
+| `nonfinite_scores` | 上次记录以来被跳过的非有限分数个数 |
+
+`--keep_states N`（默认3）保留`last.pt`与前N−1次保存`last_prev1.pt`、`last_prev2.pt`……（硬链接，不额外占写入），
+崩溃前的完整状态不会被紧接着的下一次保存覆盖；都是可直接`--resume`的完整状态。
+
 2026-10-22 本地验证：30 项测试通过，含真实双进程 Gloo 加权梯度/优化器一致性、
 全局归一化、分箱概率及单 rank 错误协调；真实索引双进程训练、5 样本的 3+2 拆分、
 critic 非整除小批次及 2→1→2 进程恢复均跑通。

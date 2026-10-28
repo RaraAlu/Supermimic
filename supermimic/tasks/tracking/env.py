@@ -153,6 +153,7 @@ class TrackingSim:
         self.bin_w_avg = torch.full((motion.num_bins,), 1.0 / num_bins, device=dev)
         self.bin_probs = self.bin_allowed.float() / self.bin_allowed.sum().clamp(min=1)
         self.reset_counts = torch.zeros(2, device=dev)  # sampled resets, of which tail resets
+        self.nonfinite_scores = torch.zeros((), device=dev)  # bin scores skipped for being non-finite
         self.done_eval = torch.zeros(self.N, dtype=torch.bool, device=dev)
         self.failed_eval = torch.zeros(self.N, dtype=torch.bool, device=dev)
         if self.parallel:
@@ -194,15 +195,16 @@ class TrackingSim:
 
     @torch.no_grad()
     def sampling_stats(self) -> torch.Tensor:
-        """Local sums since the last call: [entropy terms, max prob, visited bins, resets, tail resets].
+        """Local sums since the last call: [entropy terms, max prob, visited bins, resets, tail resets, skipped scores].
 
         The probabilities are global (they sum to 1 across ranks), so summing the entropy terms and
         visited bins and taking the max of the max over ranks gives the global values.
         """
         p = self.bin_probs.double()
         stats = torch.stack((-(p * (p + 1e-30).log()).sum(), p.max(), (self.bin_visits > 0).sum().double(),
-                             *self.reset_counts.double()))
+                             *self.reset_counts.double(), self.nonfinite_scores.double()))
         self.reset_counts.zero_()
+        self.nonfinite_scores.zero_()
         return stats
 
     def reset(self, env_ids: torch.Tensor, frames: torch.Tensor | None = None):
@@ -316,6 +318,7 @@ class TrackingSim:
                                               self.ep_ret_head[ids], T, term[ids], at_clip_end[ids], left, self.gamma,
                                               MAX_STEP_REWARD, self.bin_clip_end, self.max_episode_steps,
                                               self.bin_skip_steps)
+            self.nonfinite_scores += (~torch.isfinite(score)).sum()
             update_bin_returns(self.bin_G, self.start_bin[ids][valid], score[valid], visits=self.bin_visits,
                                replace_first=self.bin_prior == "mean")
             out["ep_len"] = T
