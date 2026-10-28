@@ -100,9 +100,33 @@ class ReplayStartTests(unittest.TestCase):
             Trainer.sample_valid_starts(fake, 1)
 
 
+class TermRowsTests(unittest.TestCase):
+    def test_summary_shares_do_not_depend_on_detail_limit(self):
+        motion = SimpleNamespace(names=[f"clip{i}" for i in range(12)],
+                                 bin_start=torch.arange(12) * 100, clip_start=torch.arange(12) * 100)
+
+        def report(top):
+            return {"terms": 12, "ends": 24, "starts": 36, "clips": 12,
+                    "top": [(i, 1, 2, 3, i, 1) for i in range(min(top, 12))]}
+
+        fake = SimpleNamespace(motion=motion, parallel=DistributedContext("cpu"),
+                               env=SimpleNamespace(sampler=SimpleNamespace(window_report=report)))
+        for limit in (0, 1, 5, 20):
+            with self.subTest(limit=limit):
+                fake.args = SimpleNamespace(term_top=limit)
+                summary, lines = Trainer.term_rows(fake, 49)
+                self.assertEqual(summary["termwin"], [50, 12, 12, 1 / 12, 10 / 12, 36, 24])
+                self.assertEqual(len(lines), min(limit, 12))
+                if lines:
+                    self.assertEqual(lines[0], [50, "clip0", 1, 2, 0.5, 3, 0.0, 1, 1 / 12])
+
+
 class RunLogTests(unittest.TestCase):
+    LINES = "term_bins"  # 多行、含文字列、不写TensorBoard的表
+
     def rows(self, it):
-        return {group: [it] + [0.5 * it + i for i in range(len(columns) - 1)] for group, (_, columns) in LOG_TABLES.items()}
+        return {group: [it] + [0.5 * it + i for i in range(len(columns) - 1)] for group, (_, columns) in LOG_TABLES.items()
+                if group != self.LINES}
 
     def test_csv_and_tensorboard_rows(self):
         from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
@@ -110,20 +134,26 @@ class RunLogTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log = RunLog(tmp, LOG_TABLES, tensorboard=True)
             log.write(self.rows(50))
+            log.write_lines(self.LINES, [[50, "a/b.csv", 3, 8, 0.375, 40, 2.0, 2, 0.5], [50, "c.csv", 1, 2, 0.5, 10, 0.0, 1, 0.1666667]])
             log.close()
             log = RunLog(tmp, LOG_TABLES)  # 恢复训练：追加写入，不重复表头
             log.write(self.rows(100))
+            log.write_lines(self.LINES, [[100, "a/b.csv", 2, 6, 0.3333333, 30, 2.0, 2, 1.0]])
             log.close()
             for group, (name, columns) in LOG_TABLES.items():
                 with open(Path(tmp) / name, encoding="utf-8") as f:
                     lines = list(csv.reader(f))
                 self.assertEqual(lines[0], list(columns))
+                if group == self.LINES:
+                    self.assertEqual([line[0] for line in lines[1:]], ["50", "50", "100"])
+                    self.assertEqual(lines[1][1:4], ["a/b.csv", "3", "8"])
+                    continue
                 self.assertEqual([line[0] for line in lines[1:]], ["50", "100"])
                 self.assertEqual(lines[1][1], "25")  # 浮点数按6位有效数字写出
             acc = EventAccumulator(str(Path(tmp) / "tensorboard"))
             acc.Reload()
             tags = set(acc.Tags()["scalars"])
-            self.assertEqual(tags, {f"{g}/{c}" for g, (_, columns) in LOG_TABLES.items() for c in columns[1:]})
+            self.assertEqual(tags, {f"{g}/{c}" for g, (_, columns) in LOG_TABLES.items() if g != self.LINES for c in columns[1:]})
             self.assertEqual([(e.step, e.value) for e in acc.Scalars("train/wall_h")], [(50, 25.0)])
 
 

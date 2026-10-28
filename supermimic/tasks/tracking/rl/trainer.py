@@ -38,9 +38,16 @@ TRAIN_COLUMNS = ("iteration", "wall_h", "sim_steps", "wm_loss", "wm_err8", "pi_l
                  "imag_survival", "sim_rew", "ep_len", "ep_ret_norm", "term_frac", "it_per_s", "lr")
 SAMPLING_COLUMNS = ("iteration", "samp_entropy", "samp_top1", "bins_visited", "reset_tail_frac")
 DIAG_COLUMNS = ("iteration", *DIAG_MEAN, *DIAG_MAX, *DIAG_BINS)
-# 日志表：组名（TensorBoard标签前缀）→（CSV文件名, 列名）
+# 终止集中在哪：每--term_log_every次迭代一行汇总（TensorBoard可见），以及这个窗口内终止最多的片段（term_bins.csv，含文字列）
+TERMWIN_COLUMNS = ("iteration", "term_total", "term_clips", "top1_share", "top10_share", "resets_total", "episodes_total")
+# terminations：窗口内从该片段起步而因终止结束的回合数；episodes：从该片段起步而结束的回合数；term_rate＝前者/后者；
+# resets：窗口内被课程抽中的次数（集中程度）；top_bin_s：该片段内终止最多的1 s分箱的起点秒数；share：占窗口全部终止的比例
+TERM_BINS_COLUMNS = ("iteration", "clip", "terminations", "episodes", "term_rate", "resets", "top_bin_s", "top_bin_terms", "share")
+BIN_SECONDS = 50  # 一个重置分箱的帧数（1 s，50 Hz）
+# 日志表：组名（TensorBoard标签前缀）→（CSV文件名, 列名）；term_bins用RunLog.write_lines写多行，不写TensorBoard
 LOG_TABLES = {"train": ("train_log.csv", TRAIN_COLUMNS), "sampling": ("sampling_log.csv", SAMPLING_COLUMNS),
-              "diag": ("diag_log.csv", DIAG_COLUMNS)}
+              "diag": ("diag_log.csv", DIAG_COLUMNS), "termwin": ("termwin_log.csv", TERMWIN_COLUMNS),
+              "term_bins": ("term_bins.csv", TERM_BINS_COLUMNS)}
 
 
 @dataclass(frozen=True)
@@ -190,6 +197,8 @@ class Trainer:
                                graph_reward=self.use_graph and args.cuda_graph_env == "on",
                                bin_clip_end=args.bin_clip_end, bin_prior=args.bin_prior, bin_skip_steps=args.bin_skip_steps,
                                reset_margin=args.reset_margin)
+        if resume:
+            self._restore_bins(resume)
         self.buffer = ReplayBuffer(args.buffer_steps, layout.local_envs, dev)
         self.obs_hist = torch.zeros(layout.local_envs, self.Hh, OBS_DIM, device=dev)
         self.collect_action = self.graphed(self._collect_action, enabled=self.use_graph and args.cuda_graph_collect == "on")
@@ -224,6 +233,26 @@ class Trainer:
                         state["step"] = torch.as_tensor(state["step"], dtype=torch.float32,
                                                         device=p.device if on_device else "cpu").clone()
         self.start_it, self.wall_offset, self.sim_steps = ck["iteration"], ck["wall_time"], ck["sim_steps"]
+
+    def _restore_bins(self, ck: dict):
+        """恢复重置课程（分箱得分、访问数、概率EMA）。分片取决于数据划分，世界大小或分片形状不同就不恢复，课程从零开始。
+        所有rank都要调用，且结论一致（集合通信）。"""
+        sampler, parallel = self.env.sampler, self.parallel
+        state = ck.get("bins")
+        if state is None:
+            print("checkpoint has no reset-curriculum state: bin scores start from zero", flush=True)
+            return
+        shards, rank = state["shards"], parallel.rank
+        ok = (len(shards) == parallel.world_size and state["partition_algorithm"] == self.motion.partition["algorithm"]
+              and all(shards[rank][k].shape == getattr(sampler, k).shape for k in ("scores", "visits", "ema")))
+        if not bool(parallel.reduce(int(ok), torch.distributed.ReduceOp.MIN)):
+            print(f"checkpoint's reset-curriculum state was saved for {len(shards)} rank(s) with "
+                  f"'{state['partition_algorithm']}' and does not fit this shard: bin scores start from zero", flush=True)
+            return
+        sampler.load_state_dict(shards[rank])
+        sampler.prepare(True)  # 多卡：由恢复的得分重算全局概率
+        visited = float((sampler.visits > 0).float().mean())
+        print(f"rank {rank}: restored reset-curriculum state ({100 * visited:.1f}% of this shard's bins visited)", flush=True)
 
     def graphed(self, fn, eager_calls: int = 3, enabled: bool | None = None):
         """CUDA-graph replay of a training step (supermimic.utils.cuda_graph); enabled defaults to --cuda_graph."""
@@ -542,18 +571,39 @@ class Trainer:
         self.diag_agg = {k: [] for k in diag_agg}
         return {"train": row, "sampling": samp_row, "diag": diag_row}
 
-    def checkpoint(self, it: int) -> dict:
-        """完整训练状态（--resume用）；其中pi、wm与元数据另存为评估用的ckpt_*.pt。"""
-        return {"wm": self.wm.state_dict(), "pi": self.pi.state_dict(), "critic": self.critic.state_dict(),
+    def gather_bins(self) -> dict:
+        """各rank的重置课程状态汇总（集合通信，所有rank都要调用；只有主进程拿去存检查点）。"""
+        shards = self.parallel.gather(self.env.sampler.state_dict())
+        return {"shards": shards, "partition_algorithm": self.motion.partition["algorithm"]}
+
+    def term_rows(self, it: int):
+        """自上次调用以来终止集中在哪些片段：返回({"termwin": 汇总行}, [term_bins行...])；所有rank都要调用（集合通信）并清零窗口计数。"""
+        motion, parallel = self.motion, self.parallel
+        report = self.env.sampler.window_report(max(self.args.term_top, 10))
+        top = [(motion.names[clip].replace(",", ";"), terms, ends, starts,
+                (int(motion.bin_start[b]) - int(motion.clip_start[clip])) / BIN_SECONDS, bin_terms)
+               for clip, terms, ends, starts, b, bin_terms in report["top"]]
+        parts = parallel.gather({k: report[k] for k in ("terms", "ends", "starts", "clips")} | {"top": top})
+        total, ends, starts = (sum(p[k] for p in parts) for k in ("terms", "ends", "starts"))
+        clips = sorted((row for p in parts for row in p["top"]), key=lambda row: -row[1])
+        share = lambda n: sum(row[1] for row in clips[:n]) / max(total, 1)  # noqa: E731
+        summary = [it + 1, total, sum(p["clips"] for p in parts), share(1), share(10), starts, ends]
+        lines = [[it + 1, name, n, e, n / max(e, 1), s, offset, bin_terms, n / max(total, 1)]
+                 for name, n, e, s, offset, bin_terms in clips[:self.args.term_top]]
+        return {"termwin": summary}, lines
+
+    def checkpoint(self, it: int, bins: dict | None = None) -> dict:
+        """完整训练状态（--resume用）；其中pi、wm与元数据另存为评估用的ckpt_*.pt。bins是gather_bins()的结果。"""
+        return {"bins": bins, "wm": self.wm.state_dict(), "pi": self.pi.state_dict(), "critic": self.critic.state_dict(),
                 "opt_wm": self.opt_wm.state_dict(), "opt_pi": self.opt_pi.state_dict(), "opt_v": self.opt_v.state_dict(),
                 "iteration": it + 1, "wall_time": time.time() - self.t_start, "sim_steps": self.sim_steps,
                 "args": vars(self.args), "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "reference": self.motion.global_description,
                 "distributed": {"world_size": self.parallel.world_size, "partition_algorithm": self.motion.partition["algorithm"]}}
 
-    def save(self, it: int, log_dir: str, keep_states: int):
+    def save(self, it: int, log_dir: str, keep_states: int, bins: dict | None = None):
         """写last.pt（先轮换旧的）与ckpt_{it+1}.pt；都先写临时文件再原子替换。只在主进程调用。"""
-        ck = self.checkpoint(it)
+        ck = self.checkpoint(it, bins)
         last = os.path.join(log_dir, "last.pt")
         rotate_states(last, keep_states)
         torch.save(ck, last + ".tmp")

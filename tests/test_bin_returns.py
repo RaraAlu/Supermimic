@@ -192,6 +192,41 @@ class BinSamplerTests(unittest.TestCase):
         self.assertEqual(stats[3].item(), 5000)  # 重置次数，读取后清零
         self.assertEqual(s.stats()[3].item(), 0)
 
+    def test_state_round_trip_and_shape_check(self):
+        s = self.sampler
+        s.scores.copy_(torch.tensor([0.9, 0.2, 0.0, 0.7, 0.0, 0.0, 0.0]))
+        s.visits.copy_(torch.tensor([3, 1, 0, 2, 0, 0, 0]))
+        s.ema.copy_(torch.tensor([0.1, 0.3, 0.1, 0.2, 0.1, 0.1, 0.1]))
+        state = s.state_dict()
+        s.scores += 1.0  # state_dict是副本，之后改动采样器不影响它
+        t = BinSampler(self.motion, "cpu", GAMMA, reset_margin=100, skip_steps=50)
+        t.load_state_dict(state)
+        torch.testing.assert_close(t.scores, torch.tensor([0.9, 0.2, 0.0, 0.7, 0.0, 0.0, 0.0]))
+        self.assertEqual(t.visits.tolist(), [3, 1, 0, 2, 0, 0, 0])
+        torch.testing.assert_close(t.ema, torch.tensor([0.1, 0.3, 0.1, 0.2, 0.1, 0.1, 0.1]))
+        state["scores"] = state["scores"][:3]
+        with self.assertRaises(ValueError):
+            t.load_state_dict(state)
+
+    def test_window_report_names_the_clips_where_episodes_end(self):
+        s = self.sampler
+        torch.manual_seed(0)
+        s.sample(1000)
+        self.assertEqual(int(s.window_starts.sum()), 1000)
+        # 五个回合：片段0的分箱1上三个终止、分箱2上一个未终止；片段1的唯一分箱上一个终止
+        n = 5
+        s.record(torch.tensor([50, 60, 70, 120, 300]), torch.tensor([1, 1, 1, 2, 6]), torch.full((n,), 5.0), torch.full((n,), 5.0),
+                 torch.full((n,), 2.0), torch.full((n,), 2.0), torch.full((n,), 80.0),
+                 torch.tensor([True, True, True, False, True]), torch.zeros(n, dtype=torch.bool), STEP_MAX)
+        report = s.window_report(5)
+        self.assertEqual((report["terms"], report["ends"], report["starts"], report["clips"]), (4, 5, 1000, 2))
+        (clip0, terms0, ends0, starts0, bin0, bin_terms0), (clip1, terms1, ends1, _, bin1, bin_terms1) = report["top"]
+        self.assertEqual((clip0, terms0, ends0, bin0, bin_terms0), (0, 3, 4, 1, 3))  # 片段0结束4个回合，3个因终止
+        self.assertEqual((clip1, terms1, ends1, bin1, bin_terms1), (1, 1, 1, 6, 1))
+        self.assertGreater(starts0, 0)  # 片段0的分箱在1000次抽样中被抽中过
+        empty = s.window_report(5)  # 窗口计数已清零
+        self.assertEqual((empty["terms"], empty["ends"], empty["starts"], empty["clips"], empty["top"]), (0, 0, 0, 0, []))
+
     def test_record_updates_scores_of_valid_episodes(self):
         s = self.sampler
         # 第一个回合在过渡期内摔倒（计0分），第二个回合截断在过渡期后（按平均奖励外推）

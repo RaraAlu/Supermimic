@@ -150,6 +150,10 @@ class BinSampler:
         self.probs = self.allowed.float() / self.allowed.sum().clamp(min=1)
         self.reset_counts = torch.zeros(2, device=device)  # sampled resets, of which tail resets
         self.nonfinite = torch.zeros((), device=device)  # bin scores skipped for being non-finite
+        # 自上次window_report以来每个分箱被抽中的次数、从它起步的回合结束数与其中因终止而结束的数（日志用，不进入检查点）
+        self.window_starts = torch.zeros(motion.num_bins, dtype=torch.long, device=device)
+        self.window_ends = torch.zeros(motion.num_bins, dtype=torch.long, device=device)
+        self.window_terms = torch.zeros(motion.num_bins, dtype=torch.long, device=device)
 
     def _probabilities(self, context):
         visits = self.visits if self.prior == "mean" else None
@@ -173,6 +177,7 @@ class BinSampler:
         f = start + (torch.rand(n, device=self.device) * (end - start).float()).long()
         self.reset_counts[0] += n
         self.reset_counts[1] += (m.clip_end[m.bin_clip[bins]] - f < TAIL_STEPS).sum()
+        self.window_starts.index_add_(0, bins, torch.ones_like(bins))
         return f, bins
 
     def record(self, start_f, start_bin, disc_ret, ret, head_disc, head_ret, steps, terminated, at_clip_end, step_max):
@@ -181,7 +186,50 @@ class BinSampler:
         score, valid = episode_bin_scores(disc_ret, ret, head_disc, head_ret, steps, terminated, at_clip_end, left,
                                           self.gamma, step_max, self.clip_end, self.max_steps, self.skip_steps)
         self.nonfinite += (~torch.isfinite(score)).sum()
+        self.window_ends.index_add_(0, start_bin, torch.ones_like(start_bin))
+        died = start_bin[terminated]
+        self.window_terms.index_add_(0, died, torch.ones_like(died))
         update_bin_returns(self.scores, start_bin[valid], score[valid], visits=self.visits, replace_first=self.prior == "mean")
+
+    def state_dict(self) -> dict:
+        """课程状态（本rank分片上每个分箱的得分、访问数与概率EMA），放到CPU；概率由它们重新算出。"""
+        return {"scores": self.scores.cpu().clone(), "visits": self.visits.cpu().clone(), "ema": self.ema.cpu().clone()}
+
+    def load_state_dict(self, state: dict) -> None:
+        """原地写回state_dict()的内容（形状须与本分片一致，否则报错）；之后多卡需调用prepare(True)刷新全局概率。"""
+        for name in ("scores", "visits", "ema"):
+            src, dst = state[name], getattr(self, name)
+            if src.shape != dst.shape:
+                raise ValueError(f"bin state {name} has shape {tuple(src.shape)}, this shard has {tuple(dst.shape)}")
+            dst.copy_(src.to(dst.device))
+
+    @torch.no_grad()
+    def window_report(self, top: int) -> dict:
+        """自上次调用以来终止最多的前top个片段（按片段汇总本rank分片内的分箱），并清零计数。
+
+        返回{"terms"、"ends"、"starts"：窗口内全部的终止数、结束的回合数与抽中次数，"clips"：有终止的片段数，
+        "top"：[(局部片段序号, 终止数, 结束的回合数, 抽中数, 其中终止最多的分箱的局部序号, 该分箱的终止数), ...]}。
+        终止率应除以结束的回合数（它们可能在上个窗口被抽中），不是抽中数。
+        片段不跨rank，所以各rank的前top个合并后就是全局的前top个。"""
+        m = self.motion
+        n_clips = m.clip_start.numel()
+        clip_terms = torch.zeros(n_clips, dtype=torch.long, device=self.device).index_add_(0, m.bin_clip, self.window_terms)
+        clip_ends = torch.zeros(n_clips, dtype=torch.long, device=self.device).index_add_(0, m.bin_clip, self.window_ends)
+        clip_starts = torch.zeros(n_clips, dtype=torch.long, device=self.device).index_add_(0, m.bin_clip, self.window_starts)
+        counts, order = clip_terms.topk(min(top, n_clips))
+        rows = []
+        for count, clip in zip(counts.tolist(), order.tolist()):
+            if count == 0:
+                break
+            in_clip = torch.where(m.bin_clip == clip, self.window_terms, -1)
+            bin_ = int(in_clip.argmax())
+            rows.append((clip, count, int(clip_ends[clip]), int(clip_starts[clip]), bin_, int(self.window_terms[bin_])))
+        report = {"terms": int(self.window_terms.sum()), "ends": int(self.window_ends.sum()),
+                  "starts": int(self.window_starts.sum()), "clips": int((clip_terms > 0).sum()), "top": rows}
+        self.window_terms.zero_()
+        self.window_ends.zero_()
+        self.window_starts.zero_()
+        return report
 
     @torch.no_grad()
     def stats(self) -> torch.Tensor:

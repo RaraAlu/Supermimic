@@ -207,7 +207,8 @@ CUDA 使用 NCCL，CPU 多进程验证使用 Gloo；不更改内置 G1 配置。
 仅主进程写共享训练日志和检查点；日志汇总各进程，回合统计按结束回合数加权。
 各进程的动作索引和帧数清单在日志目录的 `shards/world_N/rank_XXXX.json`。
 全局数据指纹与分片数无关，恢复时可更换卡数并重新分片，仍校验原全局数据选择；
-恢复会重新填充回放缓冲，仿真状态、随机数状态和分箱课程不做逐步恢复。
+恢复会重新填充回放缓冲，仿真状态与随机数状态不做逐步恢复。重置课程（每个分箱的得分、访问数与概率EMA）随`last.pt`保存，
+世界大小与数据划分相同时按rank恢复；不同时打印提示并从零开始（课程会重新建立，与连续训练不再等价）。此前的检查点没有这部分，恢复时同样从零开始。
 检查点保持无 DDP 前缀，可用原单进程评估命令加载；评估仍需在其设备加载完整的所选参考库。
 CPU/Gloo 验证不能替代多 GPU NCCL/H100 的吞吐、显存峰值或数值验收。
 
@@ -240,6 +241,18 @@ uv run --frozen tensorboard --logdir logs
 | `critic_gradnorm` | critic参数梯度范数（裁剪前，各次更新的平均） |
 | `bin_score_mean`、`bin_score_min` | 已访问且可评分分箱的分数均值与最小值 |
 | `nonfinite_scores` | 上次记录以来被跳过的非有限分数个数 |
+
+终止集中在哪里：每`--term_log_every`次迭代（默认500，0为不写）记录一次窗口统计。`termwin_log.csv`（TensorBoard标签`termwin/<列名>`）
+为窗口内的终止总数`term_total`、有终止的片段数`term_clips`、终止最多的1个与前10个片段所占比例`top1_share`/`top10_share`、
+课程抽中次数`resets_total`与结束的回合数`episodes_total`。`term_bins.csv`每次写终止最多的前`--term_top`（默认20）个片段：
+
+| 列 | 含义 |
+| --- | --- |
+| `clip` | 片段名 |
+| `terminations`、`episodes`、`term_rate` | 窗口内从该片段起步、因终止而结束的回合数，从该片段起步而结束的回合数，以及二者之比 |
+| `resets` | 窗口内课程抽中该片段的次数（集中程度） |
+| `top_bin_s`、`top_bin_terms` | 该片段内终止最多的1 s分箱的起点（秒）及其终止数 |
+| `share` | 占窗口全部终止的比例 |
 
 `--keep_states N`（默认3）保留`last.pt`与前N−1次保存`last_prev1.pt`、`last_prev2.pt`……（硬链接，不额外占写入），
 崩溃前的完整状态不会被紧接着的下一次保存覆盖；都是可直接`--resume`的完整状态。
@@ -298,6 +311,7 @@ RTX 5080 单卡回归、`--nproc-per-node=gpu` 自动启动和多进程检查点
 | `scripts/diag_first_step.py` | 附录F.1评估，并记录每段首步的平滑与限位惩罚、去掉首步后的归一化回报 |
 | `scripts/diag_train_episodes.py` | 按训练条件重放，记录每个回合的长度、`ep_ret_norm`及其奖励/惩罚分解，导出分箱状态 |
 | `scripts/diag_bin_difficulty.py` | 从每个1 s起步位置按评估条件跑2 s，生成与分箱方案无关的难度标签 |
+| `scripts/diag_bin_failure_train.py` | 同样的起点按训练条件（随机化与噪声）各重复多次，统计2 s内触发终止的次数，推断训练中的终止来自哪些片段 |
 | `scripts/diag_compare_bins.py` | 汇总多次重放：短回合、片段末尾重置、难位置倾斜、采样集中度 |
 | `scripts/diag_wm_error.py` | 用检查点的策略按训练条件收集新rollout，测世界模型k步预测误差：物理单位逐分量，及几种候选标称误差下的归一化值 |
 | `scripts/diag_critic_bias.py` | 用若干完整训练状态（含critic）交叉评估：各状态的策略收集新rollout，各状态的critic对其估值，报告真实/想象回报偏差、输入标准化超标比例与输入梯度范数 |
@@ -357,6 +371,7 @@ scripts/
   diag_first_step.py
   diag_train_episodes.py
   diag_bin_difficulty.py
+  diag_bin_failure_train.py
   diag_compare_bins.py
   diag_wm_error.py
   diag_critic_bias.py

@@ -42,7 +42,8 @@
 | --- | --- |
 | 大文件`scp`中途断开，主连接随之失效（71.78 MB的权重传到40 MB停止） | 优先把诊断放到服务器上跑，只传小文件；必须传时用`scp -l 8000`限速或分块，传后核对SHA256 |
 | 小检查点`ckpt_*.pt`里没有critic | 只含`pi`、`wm`与元数据；读critic或优化器状态用`last.pt` |
-| 分箱状态不在检查点里 | `BinSampler`的`scores`、`visits`、`ema`不保存；训练时的集中程度只能从`sampling_log.csv`看汇总，重放会重新建立分箱状态，不能还原原run的逐箱课程 |
+| 分箱状态不在检查点里 | 已改：`last.pt`保存各rank的`scores`、`visits`、`ema`，世界大小与划分相同时恢复（之前的检查点仍没有，恢复时课程从零开始）；训练中终止集中在哪些片段由`termwin_log.csv`与`term_bins.csv`记录 |
+| Windows上`torchrun`报`use_libuv was requested but PyTorch was built without libuv support` | Windows版PyTorch未编译libuv（异步IO库，与uv包管理器无关），`torchrun`的rendezvous要用它；本机多进程测试改为直接起N个进程，设置`RANK`、`LOCAL_RANK`、`WORLD_SIZE`、`MASTER_ADDR`、`MASTER_PORT`与`USE_LIBUV=0` |
 
 ## 4. 代码同步
 

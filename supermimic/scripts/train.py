@@ -48,6 +48,9 @@ parser.add_argument("--warmup_steps", type=int, default=64, help="sim steps befo
 parser.add_argument("--wm_only_iters", type=int, default=500, help="world-model-only iterations at the start")
 parser.add_argument("--lr_decay_iters", type=int, default=250_000)
 parser.add_argument("--ckpt_every", type=int, default=2000)
+parser.add_argument("--term_log_every", type=int, default=500,
+                    help="每这么多次迭代写一次终止集中情况（termwin_log.csv与term_bins.csv，见README）；0为不写")
+parser.add_argument("--term_top", type=int, default=20, help="term_bins.csv每次记录终止最多的前几个片段")
 parser.add_argument("--keep_states", type=int, default=3,
                     help="full training states to keep: last.pt plus the previous saves as last_prev1.pt, ...; a collapse "
                          "then leaves the state from before it for keep - 1 more saves (1: only last.pt)")
@@ -189,10 +192,16 @@ def main(argv: list[str] | None = None):
                 r = rows["train"]
                 print(f"it {it + 1} | {r[1]:.3f} h | wm {r[3]:.4f} e8 {r[4]:.4f} | pi {r[5]:.3f} v {r[6]:.4f} imag_r {r[7]:.3f} surv {r[9]:.3f} "
                       f"| sim_r {r[10]:.3f} ep_len {r[11]:.1f} ep_ret {r[12]:.3f} term {r[13]:.2f} | {r[14]:.2f} it/s", flush=True)  # fmt: skip
+        if args.term_log_every and (it + 1) % args.term_log_every == 0:
+            summary, lines = trainer.term_rows(it)  # 集合通信，所有rank都调用
+            if log:
+                log.write(summary)
+                log.write_lines("term_bins", lines)
         if (it + 1) % args.ckpt_every == 0 or it + 1 == args.iterations:
             with parallel.coordinated("checkpoint write"):
+                bins = trainer.gather_bins()  # 集合通信：各rank的课程状态汇到主进程
                 if parallel.primary:
-                    trainer.save(it, args.log_dir, args.keep_states)
+                    trainer.save(it, args.log_dir, args.keep_states, bins)
     if log:
         log.close()
     trainer.close()

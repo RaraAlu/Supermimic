@@ -31,6 +31,12 @@ class RunLog:
                     self.tb.add_scalar(f"{group}/{name}", x, row[0])
             self.tb.flush()
 
+    def write_lines(self, group: str, rows: list) -> None:
+        """一次写多行（如每次记录前若干个片段）；不写TensorBoard，行内可含文字列。"""
+        for row in rows:
+            self.files[group].write(",".join(f"{x:.6g}" if isinstance(x, float) else str(x) for x in row) + "\n")
+        self.files[group].flush()
+
     def close(self):
         for f in self.files.values():
             f.close()
