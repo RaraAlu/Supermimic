@@ -1,6 +1,5 @@
 """CPU/Gloo tests of real collective operations; no CUDA or simulator required."""
 
-import ast
 import copy
 import json
 import os
@@ -15,7 +14,7 @@ import torch
 import torch.multiprocessing as mp
 
 from supermimic.tasks.tracking.rl.networks import RunningNorm
-from supermimic.tasks.tracking.reset_sampling import global_bin_probabilities
+from supermimic.tasks.tracking.reset_sampling import BinSampler, global_bin_probabilities
 from supermimic.utils.distributed import DistributedContext, average_gradients
 
 
@@ -133,24 +132,22 @@ def collective_worker(rank, root):
         none = global_bin_probabilities(returns, torch.full_like(returns, 1 / 5), 1., 5, parallel, None, everything, ~everything)
         torch.testing.assert_close(none, torch.full_like(returns, 1 / 5))
 
-        path = Path(__file__).resolve().parents[1] / "supermimic/tasks/tracking/env.py"
-        cls = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.ClassDef) and n.name == "TrackingSim")
-        nodes = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in ("prepare_sampling", "_bin_probabilities")]
-        ns = {"global_bin_probabilities": global_bin_probabilities}
-        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), ns)
-        everywhere = torch.ones_like(returns, dtype=torch.bool)
-        env = SimpleNamespace(parallel=parallel, bin_G=returns, bin_w_avg=ema.clone(), bin_prior="zero",
-                              bin_visits=torch.zeros_like(returns, dtype=torch.long), bin_allowed=everywhere,
-                              bin_scored=everywhere, G_max=1., motion=SimpleNamespace(global_num_bins=5))
-        env._bin_probabilities = lambda context: ns["_bin_probabilities"](env, context)
-        ns["prepare_sampling"](env, rank == 0)  # Only one rank has completed episodes.
+        # BinSampler.prepare：每个分箱自成一段长片段，都可重置、可评分
+        n = len(returns)
+        bin_start = torch.arange(n) * 2000
+        motion = SimpleNamespace(num_bins=n, global_num_bins=5, bin_clip=torch.arange(n), clip_start=bin_start,
+                                 clip_end=bin_start + 1000, bin_start=bin_start, bin_end=bin_start + 50)
+        sampler = BinSampler(motion, "cpu", 0.99, parallel)
+        assert bool(sampler.allowed.all() and sampler.scored.all())
+        sampler.scores, sampler.ema = returns.clone(), ema.clone()
+        sampler.prepare(rank == 0)  # Only one rank has completed episodes.
         soft = torch.softmax(-25 * all_returns, 0)
         expected_ema.mul_(0.999).add_(0.001 * soft)
         expected = 0.5 / 5 + 0.4 * soft + 0.1 * expected_ema / expected_ema.sum()
-        torch.testing.assert_close(env.bin_probs, expected[local])
-        before = env.bin_w_avg.clone()
-        ns["prepare_sampling"](env, False)  # No rank resets: do not advance the EMA.
-        torch.testing.assert_close(env.bin_w_avg, before, rtol=0, atol=0)
+        torch.testing.assert_close(sampler.probs, expected[local])
+        before = sampler.ema.clone()
+        sampler.prepare(False)  # No rank resets: do not advance the EMA.
+        torch.testing.assert_close(sampler.ema, before, rtol=0, atol=0)
 
         # A failure on only one rank must reach its peers before the next collective.
         try:

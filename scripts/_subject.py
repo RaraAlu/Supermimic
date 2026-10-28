@@ -96,6 +96,15 @@ class Subject:
         module.load_state_dict(state)
         return module.eval()  # 归一化统计量保持检查点中的值；训练时才会继续更新
 
+    @staticmethod
+    def bin_state(env) -> dict:
+        """环境的重置分箱状态（分数、概率、访问数）：分箱移入BinSampler之前的源码树直接挂在TrackingSim上，
+        更早的源码树没有概率与访问数，对应项为None。"""
+        sampler = getattr(env, "sampler", None)
+        if sampler is not None:
+            return {"bin_G": sampler.scores, "bin_probs": sampler.probs, "bin_visits": sampler.visits}
+        return {"bin_G": env.bin_G, "bin_probs": getattr(env, "bin_probs", None), "bin_visits": getattr(env, "bin_visits", None)}
+
     # ---------------- 仿真环境 ----------------
     def make_env(self, num_envs, motion, mdp, *, run_args=None, inherit=(), **options):
         """源码树中的TrackingSim。

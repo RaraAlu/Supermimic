@@ -4,7 +4,9 @@ import unittest
 
 import torch
 
-from supermimic.tasks.tracking.reset_sampling import episode_bin_scores, global_bin_probabilities, update_bin_returns
+from types import SimpleNamespace
+
+from supermimic.tasks.tracking.reset_sampling import BinSampler, episode_bin_scores, global_bin_probabilities, update_bin_returns
 from supermimic.utils.distributed import DistributedContext, LocalContext
 
 GAMMA, STEP_MAX = 0.99, 0.1
@@ -163,6 +165,43 @@ class BinReturnTests(unittest.TestCase):
                 reference = values.clone()
             else:
                 self.assertTrue(torch.equal(values, reference))
+
+
+class BinSamplerTests(unittest.TestCase):
+    def setUp(self):
+        # 两段：长段300帧分成6箱，短段60帧只有1箱（不足reset_margin，只能从首帧起步）
+        lengths = torch.tensor([300, 60])
+        clip_start = torch.tensor([0, 300])
+        bin_start = torch.tensor([0, 50, 100, 150, 200, 250, 300])
+        self.motion = SimpleNamespace(
+            num_bins=7, global_num_bins=7, bin_clip=torch.tensor([0, 0, 0, 0, 0, 0, 1]), clip_start=clip_start,
+            clip_end=clip_start + lengths - 1, clip_id=torch.repeat_interleave(torch.arange(2), lengths),
+            bin_start=bin_start, bin_end=torch.tensor([50, 100, 150, 200, 250, 299, 359]))
+        self.sampler = BinSampler(self.motion, "cpu", GAMMA, reset_margin=100, skip_steps=50)
+
+    def test_reset_range_respects_clip_end_margin(self):
+        s = self.sampler
+        self.assertEqual(s.allowed.tolist(), [True, True, True, True, False, False, True])
+        self.assertEqual(s.scored.tolist(), [True, True, True, True, False, False, False])
+        torch.manual_seed(0)
+        frames, bins = s.sample(5000)
+        self.assertTrue(bool((frames >= self.motion.bin_start[bins]).all() and (frames < s.reset_end[bins]).all()))
+        self.assertTrue(bool((frames[bins == 3] < 199).all()))  # 不在段尾100帧内起步
+        self.assertTrue(bool((frames[bins == 6] == 300).all()))  # 短段只从首帧起步
+        stats = s.stats()
+        self.assertEqual(stats[3].item(), 5000)  # 重置次数，读取后清零
+        self.assertEqual(s.stats()[3].item(), 0)
+
+    def test_record_updates_scores_of_valid_episodes(self):
+        s = self.sampler
+        # 第一个回合在过渡期内摔倒（计0分），第二个回合截断在过渡期后（按平均奖励外推）
+        steps = torch.tensor([10.0, 80.0])
+        ret = torch.tensor([0.5, 8.0])
+        s.record(torch.tensor([0, 50]), torch.tensor([0, 1]), ret * 0.9, ret, ret * 0.9, torch.tensor([0.5, 4.0]),
+                 steps, torch.tensor([True, False]), torch.tensor([False, False]), STEP_MAX)
+        self.assertEqual(s.visits.tolist(), [1, 1, 0, 0, 0, 0, 0])
+        self.assertEqual(s.scores[0].item(), 0.0)
+        self.assertGreater(s.scores[1].item(), 0.0)
 
 
 if __name__ == "__main__":

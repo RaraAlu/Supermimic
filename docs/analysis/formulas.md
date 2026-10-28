@@ -93,7 +93,7 @@ G_{\max} = \sum_{i=0}^{\infty} \gamma^i \times 0.1 = \frac{0.1}{1 - \gamma} = \f
 
 这个10会在第8节的重置采样里用到，作为“回报做到多好算满分”的尺子。
 
-代码：`supermimic/tasks/tracking/env.py`中的`self.G_max`。
+代码：`supermimic/tasks/tracking/reset_sampling.py`中`episode_bin_scores`的`G_max`；训练的critic上限`value_cap`也取这个值。
 
 ## 2. 奖励函数
 
@@ -1004,7 +1004,7 @@ u &= G'/G_{\max},\qquad G_{\max}=0.1/(1-\gamma).
 ```
 
 硬终止时不外推；前S步内硬终止计0分，前S步内仅截断则没有可用证据，不更新。
-代码`bin_G`已经存归一化评分，对同一步结束于同一分箱的有效回合先取均值，再更新一次EMA：
+代码`BinSampler.scores`已经存归一化评分，对同一步结束于同一分箱的有效回合先取均值，再更新一次EMA：
 
 ```math
 \mathrm{bin\_G}_b\leftarrow0.8\,\mathrm{bin\_G}_b+0.2\,\operatorname{mean}(u)
@@ -1061,7 +1061,7 @@ P(b)=\mathbb{1}_{b\in A}\left[
 直接返回 $`P(b)=\mathbb{1}_{b\in A}/|A|`$ ，有限且总和为1，见[训练流程第4节](training_pipeline.md)。
 多卡时每个rank在本地分片内再归一化，实际抽样概率为 $`P(b\mid r)=P(b)/\sum_{b'\in A_r}P(b')`$ 。
 日志`samp_top1`和`samp_entropy`统计全局权重快照，不等于跨rank实际重置频率。
-代码：`TrackingSim.sample_frames`、`TrackingSim.step`、`episode_bin_scores`、`global_bin_probabilities`。
+代码：`reset_sampling.py`中的`BinSampler.sample`、`BinSampler.record`、`BinSampler.prepare`、`episode_bin_scores`、`global_bin_probabilities`，由`TrackingSim.step`与`TrackingSim.reset`调用。
 
 ## 9. 学习率调度
 

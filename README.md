@@ -317,6 +317,8 @@ mjlab默认开启自碰撞，不再提供`--self_collision`开关；旧关闭自
 在当前默认环境下的评估结果，不应与原环境结果直接比较。
 当前仍是自定义世界模型训练循环，不是mjlab的`ManagerBasedRlEnv`或PPO任务注册。
 保留现有`uv`非安装模式，不引入`src/`或打包后端；HDF5 读取新增 `h5py` 依赖。
+理由：诊断脚本的`--src`靠`sys.path`决定载入哪份源码树，可编辑安装的导入钩子可能抢先载入本仓库；
+各机器（Windows、Linux、训练服务器）也无需构建后端或在移动目录后重装。代价是各入口用`sys.path.insert`加入仓库根目录。
 
 ```text
 supermimic/
@@ -386,7 +388,7 @@ tests/
 | `supermimic/tasks/tracking/rl/buffer.py` | 每环境1000步FIFO回放缓冲、k步窗口与起点采样 |
 | `supermimic/tasks/tracking/motion.py` | CSV/HDF5→50 Hz完整参考、独立差分与FK、目标帧、1 s重置分箱（尾箱合并） |
 | `supermimic/tasks/tracking/motion_hdf5.py` | 索引身份白名单与合并源两种读取器、完整源段读取、源库绑定与结构指纹 |
-| `supermimic/tasks/tracking/reset_sampling.py` | 附录D.1重置分箱：回合评分、分箱EMA与跨rank全局重置概率 |
+| `supermimic/tasks/tracking/reset_sampling.py` | 附录D.1重置分箱：回合评分、分箱EMA、跨rank全局重置概率，以及维护分箱状态、抽取重置帧的`BinSampler` |
 | `supermimic/utils/kinematics.py` | MuJoCo前向运动学（身体位姿/速度） |
 | `supermimic/utils/distributed.py` | 进程/设备绑定、协调错误、梯度平均与全局统计同步 |
 | `supermimic/utils/run_log.py` | 训练日志：每组一份CSV，可选同时写TensorBoard标量 |

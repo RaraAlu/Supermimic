@@ -169,8 +169,8 @@ with open(out_dir / "worst_episodes.csv", "w", newline="", encoding="utf-8") as 
         w.writerow([motion.names[int(E["clip"][i])]] + [f"{float(E[c][i]):.4f}" for c in cols]
                    + [f"{float(parts[k][i]):.4f}" for k in ("track", "rate_pen", "lim_pen")])
 torch.save(E, out_dir / "episodes.pt")
-probs = getattr(env, "bin_probs", None)
-torch.save({"bin_start": motion.bin_start.cpu(), "bin_clip": motion.bin_clip.cpu(), "bin_G": env.bin_G.cpu(),
-            "bin_probs": None if probs is None else probs.cpu(),
-            "bin_visits": getattr(env, "bin_visits", torch.zeros(0)).cpu()}, out_dir / "bins.pt")
+bins = subject.bin_state(env)
+torch.save({"bin_start": motion.bin_start.cpu(), "bin_clip": motion.bin_clip.cpu(), "bin_G": bins["bin_G"].cpu(),
+            "bin_probs": None if bins["bin_probs"] is None else bins["bin_probs"].cpu(),
+            "bin_visits": (torch.zeros(0) if bins["bin_visits"] is None else bins["bin_visits"]).cpu()}, out_dir / "bins.pt")
 print(json.dumps(summary, indent=2, ensure_ascii=False))

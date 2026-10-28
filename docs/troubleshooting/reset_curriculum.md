@@ -67,7 +67,7 @@ softmax温度25非常尖锐：评分相差0.1，权重相差约12倍；相差0.2
 | --- | --- | --- |
 | `--bin_skip_steps` | 50 | 跳过前50个转移，从零基步号50（第51个奖励）起算并重置折扣原点；过渡期内摔倒计0分，过渡期内截断不更新分箱 |
 | `--reset_margin` | 100 | 普通起点须`f < clip_end - 100`；整段最多100步时只保留首帧 |
-| 可评分掩码`bin_scored` | — | 起点撑不过过渡期的分箱只参与均匀份额，不进softmax与历史权重 |
+| 可评分掩码`scored` | — | 起点撑不过过渡期的分箱只参与均匀份额，不进softmax与历史权重 |
 
 `global_bin_probabilities`增加`allowed`/`scored`掩码；单进程改走同一函数（`LocalContext`），不再维护第二份公式。两个参数都为0时与原行为一致。
 
@@ -112,8 +112,8 @@ softmax温度25非常尖锐：评分相差0.1，权重相差约12倍；相差0.2
 
 ### 5.3 修正与验证
 
-- `TrackingSim.bin_scored`要求分箱起点早于`clip_end - reset_margin`且剩余步数大于`bin_skip_steps`：短片段仍可从首帧重置，但只分均匀份额（`supermimic/tasks/tracking/env.py`）。
-  掩码排除的是评分对softmax与历史权重的影响；有效结束回合仍可能写入`bin_G/bin_visits`，不应把“不评分”理解为完全不记账。
+- `BinSampler.scored`要求分箱起点早于`clip_end - reset_margin`且剩余步数大于`bin_skip_steps`：短片段仍可从首帧重置，但只分均匀份额（`supermimic/tasks/tracking/reset_sampling.py`）。
+  掩码排除的是评分对softmax与历史权重的影响；有效结束回合仍可能写入`BinSampler`的`scores/visits`，不应把“不评分”理解为完全不记账。
 - 512段子集构造`TrackingSim`：可重置2,676个分箱，评分2,671个，差额5个正是只能从首帧起步的短片段；`skip 0 / margin 0`时全部可重置且全部评分。
 - Rara离线测试61项通过。
 - 全量训练：run `supermimic-a100-global-shortfirst-20261027-225154`，参数与上一个run相同。

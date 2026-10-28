@@ -520,7 +520,8 @@ class Trainer:
         term_frac = float(episodes[2] / episodes[3].clamp(min=1))
         row = [it + 1, wall_h, self.sim_steps, *[means[k] for k in keys],
                float(episodes[0] / episodes[3].clamp(min=1)), float(episodes[1] / episodes[3].clamp(min=1)), term_frac, ips, lr]
-        local_samp = env.sampling_stats()
+        sampler = env.sampler
+        local_samp = sampler.stats()
         samp = parallel.reduce(local_samp).cpu()
         top1 = float(parallel.reduce(local_samp[1], torch.distributed.ReduceOp.MAX))
         samp_row = [it + 1, float(samp[0]) / math.log(max(motion.global_num_bins, 2)), top1,
@@ -531,9 +532,9 @@ class Trainer:
         d_max = torch.stack(diag_agg["max"]).max(0).values.to(dev) if diag_agg["max"] else torch.zeros(len(DIAG_MAX), device=dev)
         d_mean = parallel.reduce(torch.cat((d_mean * weight, weight))).cpu()
         d_max = parallel.reduce(d_max, torch.distributed.ReduceOp.MAX).cpu()
-        scored = env.bin_scored & (env.bin_visits > 0)
-        bin_sum = parallel.reduce(torch.stack((torch.where(scored, env.bin_G, 0.0).sum().double(), scored.sum().double()))).cpu()
-        bin_min = float(parallel.reduce(torch.where(scored, env.bin_G, torch.inf).min(), torch.distributed.ReduceOp.MIN))
+        scored = sampler.scored & (sampler.visits > 0)
+        bin_sum = parallel.reduce(torch.stack((torch.where(scored, sampler.scores, 0.0).sum().double(), scored.sum().double()))).cpu()
+        bin_min = float(parallel.reduce(torch.where(scored, sampler.scores, torch.inf).min(), torch.distributed.ReduceOp.MIN))
         diag_row = [it + 1, *(float(x) for x in d_mean[:-1] / d_mean[-1]), *(float(x) for x in d_max),
                     float(bin_sum[0] / bin_sum[1].clamp(min=1)), bin_min if math.isfinite(bin_min) else 0.0, float(samp[5])]
         self.stats = {k: [] for k in stats}
