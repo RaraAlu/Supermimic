@@ -264,6 +264,10 @@ RTX 5080 单卡回归、`--nproc-per-node=gpu` 自动启动和多进程检查点
 想象推演使用`MDP.soft_survival`直接计算每步存活概率：采用`sigmoid(-x)`，存活权重与GAE直接使用该值，
 避免`1 - sigmoid(x)`和`1 - (1 - keep)`在float32下抵消为0（`4293e90`）。
 
+`--critic_cap {on, off}`（默认`on`）把critic估值在GAE自举和策略目标中限制到`MAX_STEP_REWARD / (1 - gamma)`以内（`gamma`为0.99时为10，
+每步奖励不超过`MAX_STEP_REWARD`）：回归仍拟合原始输出，高估会被拉回而策略追不上它，对正确的critic没有影响。
+重置分箱的分数在softmax前限制到[0, 1]，非有限分数不更新分箱，原因见[问题与解决记录](docs/troubleshooting/training_metrics.md)第11节。
+
 下列诊断中的策略重放脚本只读检查点与源数据，向`--out`写结果，`--src`可指向某提交的源码树目录。
 `diag_train_episodes.py`未显式传入的采样选项取该源码树的`TrackingSim`默认值，不自动继承检查点；
 `diag_wm_error.py`仅继承`gamma`、`bin_clip_end`与`bin_prior`，过渡期和末尾范围也取源码默认值。
@@ -277,6 +281,7 @@ RTX 5080 单卡回归、`--nproc-per-node=gpu` 自动启动和多进程检查点
 | `scripts/diag_bin_difficulty.py` | 从每个1 s起步位置按评估条件跑2 s，生成与分箱方案无关的难度标签 |
 | `scripts/diag_compare_bins.py` | 汇总多次重放：短回合、片段末尾重置、难位置倾斜、采样集中度 |
 | `scripts/diag_wm_error.py` | 用检查点的策略按训练条件收集新rollout，测世界模型k步预测误差：物理单位逐分量，及几种候选标称误差下的归一化值 |
+| `scripts/diag_critic_bias.py` | 用若干完整训练状态（含critic）交叉评估：各状态的策略收集新rollout，各状态的critic对其估值，报告真实/想象回报偏差、输入标准化超标比例与输入梯度范数 |
 | `scripts/watch_train.py` | 监督训练日志，出现异常、到达里程碑或训练结束时退出 |
 | `scripts/csv_to_tensorboard.py` | 把run的`train_log.csv`与`sampling_log.csv`写成TensorBoard标量，标签与`--tensorboard`相同 |
 
@@ -327,6 +332,7 @@ scripts/
   diag_bin_difficulty.py
   diag_compare_bins.py
   diag_wm_error.py
+  diag_critic_bias.py
   watch_train.py
   csv_to_tensorboard.py
   smrun.sh

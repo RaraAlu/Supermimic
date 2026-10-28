@@ -113,6 +113,8 @@ def episode_bin_scores(disc_ret, ret, head_disc, head_ret, steps, terminated, at
     which costs reward for about a second regardless of the bin, and in a short episode that cost
     dominates the mean reward the bootstrap extends. An episode that falls within the transient
     still scores 0; one truncated within it carries no other evidence and does not update its bin.
+    A non-finite score (a diverged simulation) never updates its bin: one NaN estimate would stay in
+    the bin for good and make every later weight computation fall back to the uniform distribution.
     """
     if skip_steps:
         disc_ret, ret = (disc_ret - head_disc) / gamma**skip_steps, ret - head_ret
@@ -123,7 +125,8 @@ def episode_bin_scores(disc_ret, ret, head_disc, head_ret, steps, terminated, at
     G_max = torch.full_like(G, step_max / (1 - gamma))
     if clip_end == "terminal":
         G_max = G_max * torch.where(left < max_steps, 1 - gamma ** left.clamp(min=1), 1.0)
-    return G / G_max, valid
+    score = G / G_max
+    return score, valid & torch.isfinite(score)
 
 
 @torch.no_grad()
@@ -136,7 +139,14 @@ def global_bin_probabilities(returns, ema, maximum_return, num_bins, parallel, v
     and the EMA. Bins that can never produce a score take only the uniform share, so an unscorable
     bin stuck at its initial score cannot attract the adaptive share. With no scored bin on any rank
     (every clip too short to score), the adaptive half joins the uniform share.
+
+    Scores are clamped to [0, maximum_return], the range a working policy produces. Below 0 the
+    penalties outweigh the tracking reward; after a policy collapse many bins score far below 0,
+    and exp(-25 * score) then turns the softmax into a single bin that takes the whole 40% share
+    (0.48 of the weight in the 2026-10-28 run) and fills the replay buffer with one failure.
+    Clamped, all failing bins tie and share it. Scores in range are unchanged.
     """
+    returns = torch.nan_to_num(returns, nan=0.0).clamp(0.0, maximum_return)
     if allowed is None:
         allowed = torch.ones_like(returns, dtype=torch.bool)
     else:

@@ -37,6 +37,11 @@ parser.add_argument("--action_noise", type=float, default=0.1)
 parser.add_argument("--critic_epochs", type=int, default=5)
 parser.add_argument("--critic_minibatches", type=int, default=4)
 parser.add_argument("--no_critic", action="store_true")
+parser.add_argument("--critic_cap", type=str, default="on", choices=["on", "off"],
+                    help="bound the critic's value by the best possible return MAX_STEP_REWARD / (1 - gamma) wherever it is "
+                         "used (GAE bootstrap and the policy objective's terminal value); the regression still fits the "
+                         "raw output, so an overshoot is pulled back while the policy cannot chase it. Never changes a "
+                         "correct critic")
 parser.add_argument("--warmup_steps", type=int, default=64, help="sim steps before any update")
 parser.add_argument("--wm_only_iters", type=int, default=500, help="world-model-only iterations at the start")
 parser.add_argument("--lr_decay_iters", type=int, default=250_000)
@@ -96,7 +101,8 @@ import torch
 import torch.nn as nn
 
 from supermimic.tasks.tracking.env import TrackingSim
-from supermimic.tasks.tracking.mdp import CRITIC_EXTRA, INV_DIM, MDP, OBS_DIM, invariant_features, normalize_xi, unflatten_state
+from supermimic.tasks.tracking.mdp import (CRITIC_EXTRA, INV_DIM, MAX_STEP_REWARD, MDP, OBS_DIM, invariant_features, normalize_xi,
+                                           unflatten_state)
 from supermimic.tasks.tracking.motion import MotionLib, check_reference, resolve_motion_args
 import supermimic.tasks.tracking.rl.networks as networks
 from supermimic.tasks.tracking.rl.buffer import ReplayBuffer
@@ -259,6 +265,15 @@ def _critic_input(S, f, xi_n, g):
     return torch.cat((mdp.critic_features(S, f, xi_n), g), -1)
 
 
+# every per-step reward is at most MAX_STEP_REWARD (the tracking kernels are <= 1, the penalties <= 0), so no
+# discounted return, and no correct critic value, exceeds MAX_STEP_REWARD / (1 - gamma) (10 at gamma 0.99)
+VALUE_CAP = MAX_STEP_REWARD / (1 - args.gamma) if args.critic_cap == "on" else math.inf
+
+
+def cap_value(v):
+    return v.clamp(max=VALUE_CAP)
+
+
 USE_COMPILE = args.compile == "on" or (args.compile == "auto" and importlib.util.find_spec("triton") is not None)
 USE_TENSORBOARD = args.tensorboard == "on" or (args.tensorboard == "auto" and importlib.util.find_spec("tensorboard") is not None)
 if USE_TENSORBOARD:
@@ -379,7 +394,7 @@ def _policy_step(s_flat, xi, f, a_prev, o_hist):
     r_sum = (c_t * r).detach().sum(0)
     rews, keeps = r.detach(), keep.detach()
     if not args.no_critic:
-        J = J + (args.gamma**HZ) * c * critic(_critic_input(S, f, xi_n, g))
+        J = J + (args.gamma**HZ) * c * cap_value(critic(_critic_input(S, f, xi_n, g)))
     loss = -J.mean()
     if PROFILE:
         torch.cuda.synchronize(); tq1 = time.time()
@@ -416,7 +431,7 @@ def _critic_step(rews, keeps, xi_n, S_c, f_c, g_c):
         X = critic_input_c(S_c, f_c, xi_c, g_c).view(HZ + 1, B, -1)
     critic.norm.update(X)
     with torch.no_grad():
-        V = critic(X)
+        V = cap_value(critic(X))
         R = V[-1]
         targets = []
         for t in range(HZ - 1, -1, -1):

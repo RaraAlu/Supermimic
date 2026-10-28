@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from supermimic.tasks.tracking.constants import G1_JOINT_NAMES
-from supermimic.tasks.tracking.mdp import OBS_DIM, MDP, STATE_DIM, XI_DIM
+from supermimic.tasks.tracking.mdp import MAX_STEP_REWARD, OBS_DIM, MDP, STATE_DIM, XI_DIM
 from supermimic.tasks.tracking.motion import MotionLib
 from supermimic.tasks.tracking.rl.buffer import ReplayBuffer
 from supermimic.tasks.tracking.rl.networks import WorldModel
@@ -131,6 +131,15 @@ class AnalyticHeadsTests(unittest.TestCase):
         self.assertGreater(float(reward.item()), 0.08)
         self.assertFalse(bool(self.mdp.termination(S, self.f).any()))
         self.assertLess(float(self.mdp.soft_termination(S, self.f).item()), 1e-3)
+
+    def test_reward_never_exceeds_the_step_maximum_that_bounds_the_critic(self):
+        torch.manual_seed(0)
+        S0 = self.reference_state()
+        for scale in (0.0, 0.05, 0.3, 1.0):
+            S = tuple(x if i == 1 else x + scale * torch.randn_like(x) for i, x in enumerate(S0))  # index 1 is a rotation matrix
+            r = self.mdp.reward(S, self.f, scale * torch.randn(1, 29), torch.zeros(1, 29))
+            self.assertLessEqual(float(r.item()), MAX_STEP_REWARD + 1e-9)
+        self.assertAlmostEqual(MAX_STEP_REWARD / (1 - 0.99), 10.0)  # train.py's critic value cap at gamma 0.99
 
     def test_termination_triggers_on_height_and_tilt(self):
         S = list(self.reference_state())

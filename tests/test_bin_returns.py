@@ -75,6 +75,34 @@ class BinScoreTests(unittest.TestCase):
         self.assertTrue(bool(torch.isfinite(probs).all()))
         torch.testing.assert_close(probs, torch.tensor([1 / 3, 1 / 3, 0.0, 1 / 3]))
 
+    def test_collapsed_scores_do_not_concentrate_the_softmax(self):
+        n = 100
+        healthy = torch.linspace(0.6, 0.9, n)
+        collapsed = healthy.clone()
+        collapsed[:10] = torch.linspace(-3.0, -0.5, 10)  # failing bins whose penalties outweigh the tracking reward
+        ema = torch.full((n,), 1.0 / n)
+        probs = global_bin_probabilities(collapsed, ema.clone(), 1.0, n, LocalContext)
+        self.assertLess(float(probs.max()), 0.4 / 10 + 0.1)  # the failing bins tie instead of one taking the whole share
+        torch.testing.assert_close(probs.sum(), torch.tensor(1.0))
+        torch.testing.assert_close(probs[:10], probs[0].expand(10))
+        # scores inside [0, 1] are untouched
+        clamped_free = global_bin_probabilities(healthy, ema.clone(), 1.0, n, LocalContext)
+        manual = torch.softmax(-25.0 * healthy.double(), 0).float()
+        kept = 0.999 * ema + 0.001 * manual.float()  # the EMA share is updated in place before it is read
+        torch.testing.assert_close(clamped_free, 0.5 / n + 0.4 * manual.float() + 0.1 * kept / kept.sum(), atol=1e-7, rtol=1e-5)
+
+    def test_non_finite_score_neither_updates_a_bin_nor_poisons_the_weights(self):
+        disc = torch.tensor([1.0, float("nan"), 2.0])
+        ret, hd, hr = disc.clone(), torch.zeros(3), torch.zeros(3)
+        steps = torch.full((3,), 200.0)
+        score, valid = episode_bin_scores(disc, ret, hd, hr, steps, torch.zeros(3, dtype=torch.bool),
+                                          torch.zeros(3, dtype=torch.bool), torch.full((3,), 1000.0), GAMMA, STEP_MAX)
+        self.assertEqual(valid.tolist(), [True, False, True])
+        probs = global_bin_probabilities(torch.tensor([0.8, float("nan"), 0.7, float("inf")]), torch.full((4,), 0.25), 1.0, 4,
+                                         LocalContext)
+        self.assertTrue(bool(torch.isfinite(probs).all()))
+        torch.testing.assert_close(probs.sum(), torch.tensor(1.0))
+
 
 class BinReturnTests(unittest.TestCase):
     def test_visits_and_first_update_replacement(self):
