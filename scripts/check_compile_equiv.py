@@ -1,6 +1,6 @@
 """Compare eager and compiled updates from the same model, optimizer and RNG state.
 
-Extra arguments are forwarded to train.py. The compiler uses fallback_random=True so that
+Extra arguments are forwarded to supermimic.scripts.train.setup. The compiler uses fallback_random=True so that
 both paths receive identical noise; this checks arithmetic, not equivalence of the two RNG
 implementations. The normal training path keeps its default compiler RNG implementation.
 
@@ -15,7 +15,6 @@ from contextlib import contextmanager
 import copy
 import os
 from pathlib import Path
-import runpy
 import sys
 
 REPO = str(Path(__file__).resolve().parents[1])
@@ -27,7 +26,7 @@ from torch.utils._pytree import tree_flatten
 
 @contextmanager
 def kernel_scope(namespace, kernels):
-    """Functions share their module globals: switch the actual lookup table for each path."""
+    """在namespace（Trainer实例的属性字典）中临时换上另一组内核；各更新步骤都经它查找内核。"""
     original = {key: namespace[key] for key in kernels}
     namespace.update(kernels)
     try:
@@ -77,18 +76,22 @@ def main():
     options, training_args = parser.parse_known_args()
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         parser.error("this arithmetic comparison runs on one GPU; use check_cuda_graph.py for multi-GPU replay checks")
-    sys.argv = ["train.py", "--num_envs", "512", "--buffer_steps", "100", "--wm_batch", "512",
-                "--pi_batch", "512", "--warmup_steps", "40", "--motion_limit", "8",
-                "--log_dir", os.path.join(REPO, "logs", "check_compile_equiv"), *training_args,
-                "--iterations", "0", "--cuda_graph", "off", "--compile", "off"]
-    g = runpy.run_module("supermimic.scripts.train", run_name="__main__")
-    eager_kernels = {name: g[name] for name in ("wm_rollout", "wm_err", "imag_step", "reward_term", "critic_input_c")}
+    from supermimic.scripts import train
+    from supermimic.tasks.tracking.mdp import unflatten_state
+    from supermimic.tasks.tracking.rl.trainer import set_requires_grad
+
+    _, parallel, trainer = train.setup(["--num_envs", "512", "--buffer_steps", "100", "--wm_batch", "512",
+                                        "--pi_batch", "512", "--warmup_steps", "40", "--motion_limit", "8",
+                                        "--log_dir", os.path.join(REPO, "logs", "check_compile_equiv"), *training_args,
+                                        "--iterations", "0", "--cuda_graph", "off", "--compile", "off"])
+    kernels_namespace = vars(trainer)
+    eager_kernels = {name: getattr(trainer, name) for name in ("wm_rollout", "wm_err", "imag_step", "reward_term", "critic_input_c")}
     compiled_kernels = {name: torch.compile(fn, options={"fallback_random": True}) for name, fn in eager_kernels.items()}
     print("compiler RNG: fallback_random=True (identical noise for arithmetic comparison)", flush=True)
 
     def compare(name, module, optimizer, inputs, pre=lambda: None, post=lambda: None):
-        fn = g[f"_{name}"]
-        with kernel_scope(fn.__globals__, eager_kernels):
+        fn = getattr(trainer, f"_{name}")
+        with kernel_scope(kernels_namespace, eager_kernels):
             pre()
             fn(*inputs)  # initialize Adam state before taking the baseline
             post()
@@ -100,8 +103,8 @@ def main():
             restore_training_state(module, optimizer, saved_model, saved_opt)
             torch.set_rng_state(cpu_rng)
             torch.cuda.set_rng_state(cuda_rng)
-            g["nonfinite"].zero_()
-            with kernel_scope(fn.__globals__, kernels):
+            trainer.nonfinite.zero_()
+            with kernel_scope(kernels_namespace, kernels):
                 pre()
                 try:
                     outputs = fn(*inputs)
@@ -118,16 +121,18 @@ def main():
                    for label, a, b in zip(("outputs", "model", "parameter_updates", "optimizer"), left, right)]
         return all(results)
 
-    w = g["buffer"].sample_windows(g["local_wm_batch"], g["args"].wm_window)
-    ok = compare("wm_step", g["wm"], g["opt_wm"], (w["s"], w["a"], w["xi"], w["s1"], w["mask"]))
-    s, h = g["sample_valid_starts"](g["local_pi_batch"])
+    w = trainer.buffer.sample_windows(trainer.layout.local_wm_batch, trainer.args.wm_window)
+    ok = compare("wm_step", trainer.wm, trainer.opt_wm, (w["s"], w["a"], w["xi"], w["s1"], w["mask"]))
+    s, h = trainer.sample_valid_starts(trainer.layout.local_pi_batch)
     with torch.no_grad():
-        history = g["mdp"].add_noise(g["mdp"].obs(g["unflatten_state"](h["s"]), h["a_prev"], h["xi"], h["f"]))
-    set_grad = g["set_requires_grad"]
-    ok &= compare("policy_step", g["pi"], g["opt_pi"], (s["s"], s["xi"], s["f"], s["a_prev"], history),
-                  pre=lambda: (set_grad(g["wm"], False), set_grad(g["critic"], False)),
-                  post=lambda: (set_grad(g["wm"], True), set_grad(g["critic"], True)))
+        history = trainer.mdp.add_noise(trainer.mdp.obs(unflatten_state(h["s"]), h["a_prev"], h["xi"], h["f"]))
+    wm, critic = trainer.wm, trainer.critic
+    ok &= compare("policy_step", trainer.pi, trainer.opt_pi, (s["s"], s["xi"], s["f"], s["a_prev"], history),
+                  pre=lambda: (set_requires_grad(wm, False), set_requires_grad(critic, False)),
+                  post=lambda: (set_requires_grad(wm, True), set_requires_grad(critic, True)))
     print(f"RESULT {'PASS' if ok else 'FAIL'} (atol={options.atol}, rtol={options.rtol})", flush=True)
+    trainer.close()
+    parallel.close()
     return 0 if ok else 1
 
 

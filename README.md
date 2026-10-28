@@ -330,10 +330,14 @@ supermimic/
     rl/
       buffer.py
       networks.py
+      trainer.py
   utils/
+    checkpoints.py
+    cuda_graph.py
     distributed.py
     kinematics.py
     rotations.py
+    run_log.py
   scripts/
     train.py
     evaluate.py
@@ -366,6 +370,7 @@ tests/
   test_distributed.py
   test_bin_returns.py
   test_subject.py
+  test_trainer.py
   test_learning_math.py
   test_compile_check.py
   test_tensorboard_log.py
@@ -373,7 +378,8 @@ tests/
 
 | 路径 | 内容 |
 | --- | --- |
-| `supermimic/scripts/train.py` | 算法A.1：采样→拟合世界模型→想象推演BPTT→critic更新 |
+| `supermimic/scripts/train.py` | 训练入口：命令行、分布式进程、数据加载与运行目录；`setup()`供检查脚本得到预热后的Trainer |
+| `supermimic/tasks/tracking/rl/trainer.py` | 算法A.1：采样→拟合世界模型→想象推演BPTT→critic更新，以及日志行与检查点 |
 | `supermimic/tasks/tracking/env.py` | mjlab TrackingSim：50 Hz控制、4×5 ms子步、域随机化、回合重置 |
 | `supermimic/tasks/tracking/mdp.py` | 99维观测（93维本体观测加6维参考相对朝向）、表A.2奖励、硬/软终止、critic特征 |
 | `supermimic/tasks/tracking/rl/networks.py` | 预测70维状态增量的世界模型、策略(编码器+共享解码器)、critic、RunningNorm；奖励/观测/终止由MDP解析计算 |
@@ -383,6 +389,7 @@ tests/
 | `supermimic/tasks/tracking/reset_sampling.py` | 附录D.1重置分箱：回合评分、分箱EMA与跨rank全局重置概率 |
 | `supermimic/utils/kinematics.py` | MuJoCo前向运动学（身体位姿/速度） |
 | `supermimic/utils/distributed.py` | 进程/设备绑定、协调错误、梯度平均与全局统计同步 |
+| `supermimic/utils/run_log.py` | 训练日志：每组一份CSV，可选同时写TensorBoard标量 |
 | `supermimic/tasks/tracking/constants.py` | 动作数据关节顺序与跟踪目标，不定义机器人配置 |
 | `supermimic/scripts/evaluate.py` | 附录F.1评估：逐原始段首帧播放、失败计数、两种归一化回报 |
 | `scripts/` | 数据下载、离线数据验证、仿真自检、compile/CUDA graph一致性检查、训练剖析与基准、重置采样诊断与训练监督 |

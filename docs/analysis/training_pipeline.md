@@ -42,7 +42,9 @@ flowchart TD
 | TrackingSim | `supermimic/tasks/tracking/env.py` |
 | ReplayBuffer | `supermimic/tasks/tracking/rl/buffer.py` |
 | WorldModel、Policy、Critic | `supermimic/tasks/tracking/rl/networks.py` |
-| 训练循环 | `supermimic/scripts/train.py` |
+| 训练入口（命令行、进程、数据与运行目录） | `supermimic/scripts/train.py` |
+| Trainer（模型、优化器、各更新步骤、日志行与检查点） | `supermimic/tasks/tracking/rl/trainer.py` |
+| 训练日志（CSV与TensorBoard） | `supermimic/utils/run_log.py` |
 
 ### 1.2 主循环（论文算法A.1）
 

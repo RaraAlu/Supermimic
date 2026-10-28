@@ -103,14 +103,6 @@ class EvaluationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fingerprint mismatch"):
             self.evaluate(FakeEnv(2, self.motion), self.ck)
 
-    def test_short_replay_sampling_is_bounded(self):
-        ns = {"buffer": SimpleNamespace(sample_starts=lambda b, h: ({"f": torch.tensor([1])}, {})),
-              "HZ": 32, "Hh": 1,
-              "motion": SimpleNamespace(clip_end=torch.tensor([1]), clip_id=torch.tensor([0, 0]))}
-        sample = load_function("supermimic/scripts/train.py", "sample_valid_starts", ns)
-        with self.assertRaisesRegex(RuntimeError, "too few starts"):
-            sample(1)
-
 
 if __name__ == "__main__":
     unittest.main()

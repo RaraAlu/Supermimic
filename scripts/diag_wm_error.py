@@ -81,7 +81,7 @@ def per_dim(pos, rot, lin, ang, q, qd):
 
 
 nan = float("nan")  # dims a candidate does not define are excluded from its mean
-err_floor = per_dim(3e-3, 5e-3, 2e-2, 5e-2, 3e-3, 5e-2)  # train.py ERR_FLOOR
+err_floor = per_dim(3e-3, 5e-3, 2e-2, 5e-2, 3e-3, 5e-2)  # supermimic/tasks/tracking/rl/trainer.py的ERR_FLOOR
 c = RewardCfg
 # D: projected-gravity noise 0.05 stands in for orientation; root position and linear velocity are not observed
 candidates = {

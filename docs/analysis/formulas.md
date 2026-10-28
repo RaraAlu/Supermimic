@@ -409,7 +409,7 @@ c_1 = 0.9, \quad c_2 = 0.81, \quad c_3 = 0.729
 在想象推演里 $`\hat{d}`$ 是可导的，所以 $`\hat{c}`$ 也可导：策略做出“更歪”的动作，会让后面所有步的 $`\hat{c}`$ 一起变小，
 梯度就会把它往“站稳”的方向推。
 
-代码：`supermimic/scripts/train.py`中的`survival`，由`_policy_step`调用；直接执行用`cumprod`，CUDA graph用等价的逐步连乘以避免反向时主机同步。
+代码：`supermimic/tasks/tracking/rl/trainer.py`中的`survival`，由`Trainer._policy_step`调用；直接执行用`cumprod`，CUDA graph用等价的逐步连乘以避免反向时主机同步。
 
 ## 4. 动作与观测
 
@@ -699,7 +699,7 @@ m_j = \prod_{i=0}^{j-2} \left( 1 - \mathrm{done}_i \right),\qquad j=1,\ldots,k
 论文允许每个预测头“要么学、要么直接算”，直接算的头不计损失。本实现的奖励、观测、终止都用第2–4节的公式直接算，
 所以只剩第一项“状态”。
 
-代码：`train.py`中的`_wm_rollout`、`_wm_err`、`ERR_FLOOR`；掩码在`ReplayBuffer.sample_windows`。
+代码：`trainer.py`中的`Trainer._wm_rollout`、`Trainer._wm_err`、`ERR_FLOOR`；掩码在`ReplayBuffer.sample_windows`。
 
 ## 6. 策略：在世界模型里想象，再求导
 
@@ -953,7 +953,7 @@ $`\lambda = 0.95`$ 、 $`\gamma = 0.99`$ 时，每往后一步，权重乘以 $`
 
 实现把这 $`32 \times 4096 = 131{,}072`$ 个样本打乱，分4个小批，重复5轮，共20次参数更新。
 
-代码：`train.py`中`policy_update`的critic部分。
+代码：`trainer.py`中的`Trainer._critic_step`，目标由`gae_targets`计算。
 
 ## 8. 按回报重置采样
 
@@ -1098,7 +1098,7 @@ $`n`$ 为迭代次数， $`\mathrm{lr}_0 = 2 \times 10^{-4}`$ 。
 | 250,000 | 0.030 | 衰减结束 |
 | 320,000 | 0.030 | 训练结束 |
 
-代码：`train.py`中的`lr_at`。
+代码：`trainer.py`中的`lr_at`。
 
 ## 10. 评估指标
 
