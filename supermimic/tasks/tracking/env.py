@@ -19,10 +19,11 @@ from mjlab.terrains import TerrainEntityCfg
 from mjlab.utils.lab_api.string import resolve_matching_names_values
 
 from supermimic.tasks.tracking.constants import FOOT_GEOMS, G1_JOINT_NAMES
-from supermimic.tasks.tracking.mdp import MAX_STEP_REWARD, MDP, flatten_state
+from supermimic.tasks.tracking.mdp import MAX_STEP_REWARD, MDP, NUM_J, XI_COM, XI_DIM, XI_JOINT, flatten_state
 from supermimic.tasks.tracking.motion import CONTROL_DT, MotionLib
+from supermimic.tasks.tracking.reset_sampling import episode_bin_scores, global_bin_probabilities, update_bin_returns
 from supermimic.utils.cuda_graph import GraphedCall
-from supermimic.utils.distributed import LocalContext, episode_bin_scores, global_bin_probabilities, update_bin_returns
+from supermimic.utils.distributed import LocalContext
 from supermimic.utils.rotations import mat_to_quat, quat_to_mat, so3_exp
 
 NUM_SUBSTEPS = 4
@@ -57,7 +58,7 @@ class TrackingSim:
         cap is bootstrapped). bin_prior: unvisited bins score 0 ("zero") or the mean of visited bins
         ("mean", whose first episode then replaces the prior instead of being blended into it).
         bin_skip_steps: bins are scored from this step of each episode on, past the reset transient
-        (see utils.distributed.episode_bin_scores). reset_margin: no reset starts within this many
+        (see reset_sampling.episode_bin_scores). reset_margin: no reset starts within this many
         steps of a clip's end (a clip shorter than that starts only at its first frame); such first
         frames and bins that cannot outlast the transient take only the uniform share. Both 0
         reproduce the earlier scores."""
@@ -103,8 +104,8 @@ class TrackingSim:
             raise RuntimeError("mjlab G1 action scales do not cover every motion-data joint")
         self.alpha = torch.tensor(scales, device=dev)
 
-        # ---- sim context xi = [friction, joint offsets(29), torso com offset(3)] ----
-        self.xi = torch.zeros(self.N, 33, device=dev)
+        # ---- sim context xi = [friction, joint offsets, torso com offset(3)] ----
+        self.xi = torch.zeros(self.N, XI_DIM, device=dev)
         if eval_mode:
             self.xi[:, 0] = 1.0
         else:
@@ -117,7 +118,7 @@ class TrackingSim:
                 ),
                 -1,
             )
-            self.xi[:, 30:33] = com
+            self.xi[:, XI_COM] = com
             default_com = self.sim.get_default_field("body_ipos")[self._torso_body]
             self.sim.model.body_ipos[:, self._torso_body] = default_com + com
             self.sim.recompute_constants(RecomputeLevel.set_const)
@@ -128,7 +129,7 @@ class TrackingSim:
         # ---- episode bookkeeping ----
         self.f = torch.zeros(self.N, dtype=torch.long, device=dev)
         self.ep_step = torch.zeros(self.N, dtype=torch.long, device=dev)
-        self.a_prev = torch.zeros(self.N, 29, device=dev)
+        self.a_prev = torch.zeros(self.N, NUM_J, device=dev)
         self.start_bin = torch.zeros(self.N, dtype=torch.long, device=dev)
         self.start_f = torch.zeros(self.N, dtype=torch.long, device=dev)
         self.ep_disc_ret = torch.zeros(self.N, device=dev)
@@ -252,7 +253,7 @@ class TrackingSim:
         self.ep_disc_head[env_ids] = 0.0
         self.ep_ret_head[env_ids] = 0.0
         if not self.eval_mode:
-            self.xi[env_ids, 1:30] = torch.empty(n, 29, device=dev).uniform_(-0.01, 0.01)
+            self.xi[env_ids, XI_JOINT] = torch.empty(n, NUM_J, device=dev).uniform_(-0.01, 0.01)
 
     def _reward_termination_eager(self, S1, f1, a, a_prev):
         r, terms = self.mdp.reward(S1, f1, a, a_prev, terms=True)
@@ -275,7 +276,7 @@ class TrackingSim:
         xi = self.xi.clone()
         a_prev = self.a_prev.clone()
         ep_step = self.ep_step.clone()
-        target = self.default_q + xi[:, 1:30] + self.alpha * a
+        target = self.default_q + xi[:, XI_JOINT] + self.alpha * a
         self.robot.set_joint_position_target(target)
         for _ in range(NUM_SUBSTEPS):
             self.scene.write_data_to_sim()

@@ -72,7 +72,7 @@ class EvaluationTests(unittest.TestCase):
                                       goal=lambda f, k: torch.zeros(len(f), 73 * k))
         ns = {"torch": torch, "TrackingSim": FakeEnv, "motion": self.motion, "C": 5,
               "check_reference": check_reference, "dev": "cpu", "Policy": FakePolicy,
-              "networks": SimpleNamespace(), "OBS_DIM": 1, "MAX_STEP_REWARD": 0.1,
+              "networks": SimpleNamespace(), "OBS_DIM": 1, "GOAL_FRAME_DIM": 73, "MAX_STEP_REWARD": 0.1,
               "mdp": SimpleNamespace(obs=lambda s, a, xi, f: torch.zeros(len(f), 1))}
         self.evaluate = load_function("supermimic/scripts/evaluate.py", "evaluate", ns)
         self.ck = {"args": {"goal_frames": 1, "hist": 2}, "pi": {},

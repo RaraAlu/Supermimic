@@ -21,6 +21,7 @@ sys.path.insert(0, REPO)
 import torch
 from torch.utils._pytree import tree_map
 
+from supermimic.tasks.tracking.mdp import NUM_J
 from supermimic.utils.cuda_graph import GraphedCall
 from supermimic.utils.distributed import DistributedContext
 
@@ -103,7 +104,7 @@ overlap_same = True
 for _ in range(3):
     saved = [{k: v.clone() for k, v in norm.state_dict().items()} for norm in norms]
     ptr, size = buffer.ptr, buffer.size
-    action = torch.randn(env.N, 29, device=env.device)
+    action = torch.randn(env.N, NUM_J, device=env.device)
     with torch.no_grad():
         transition = env.step(action, after_step=store)
     expected = [{k: v.clone() for k, v in norm.state_dict().items()} for norm in norms]
@@ -119,7 +120,7 @@ print(f"rank {rank} collection overlap: replay row and world-model normalizers b
 ok &= overlap_same
 if env._reward_termination.enabled:
     S1, f1 = env.state(), env.f + 1
-    a, a_prev = torch.randn(env.N, 29, device=env.device), env.a_prev.clone()
+    a, a_prev = torch.randn(env.N, NUM_J, device=env.device), env.a_prev.clone()
     eager_out = env._reward_termination_eager(S1, f1, a, a_prev)
     graphed = GraphedCall(env._reward_termination_eager, eager_calls=0, thread_local=g["parallel"].enabled)
     graphed(S1, f1, a, a_prev)  # capture, then replay

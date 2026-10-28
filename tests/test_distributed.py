@@ -15,7 +15,8 @@ import torch
 import torch.multiprocessing as mp
 
 from supermimic.tasks.tracking.rl.networks import RunningNorm
-from supermimic.utils.distributed import DistributedContext, average_gradients, global_bin_probabilities
+from supermimic.tasks.tracking.reset_sampling import global_bin_probabilities
+from supermimic.utils.distributed import DistributedContext, average_gradients
 
 
 def collective_worker(rank, root):

@@ -15,12 +15,13 @@ import numpy as np
 from supermimic.tasks.tracking.constants import G1_JOINT_NAMES
 
 INDEX_FORMAT = "mjbones_human23_g1_nominal_hdf5_v1_index"
-ARRAY_SHAPES = {"root_pos": 3, "root_quat_w": 4, "joint_pos": 29}
+NUM_J = len(G1_JOINT_NAMES)
+ARRAY_SHAPES = {"root_pos": 3, "root_quat_w": 4, "joint_pos": NUM_J}
 
 
 def reference_bytes_per_frame(tracked: int) -> int:
     """Resident reference bytes per frame: root p/quat/v/w, q, qd, root-frame v/w, per-body p/quat/v/w, two int64 maps."""
-    return 4 * (3 + 4 + 3 + 3 + 29 + 29 + 3 + 3 + tracked * (3 + 4 + 3 + 3)) + 16
+    return 4 * (3 + 4 + 3 + 3 + NUM_J + NUM_J + 3 + 3 + tracked * (3 + 4 + 3 + 3)) + 16
 
 
 def partition_clips(lengths, world_size):
@@ -48,7 +49,7 @@ def file_sha256(path: Path) -> str:
 
 def validate_pose_arrays(p, quat, joints, name: str) -> None:
     n = len(p)
-    for key, array, width in (("root_pos", p, 3), ("root_quat_w", quat, 4), ("joint_pos", joints, 29)):
+    for key, array, width in (("root_pos", p, 3), ("root_quat_w", quat, 4), ("joint_pos", joints, NUM_J)):
         if array.shape != (n, width) or n < 2:
             raise ValueError(f"{name}: invalid {key} shape {array.shape}; need at least two frames")
         if not np.isfinite(array).all():

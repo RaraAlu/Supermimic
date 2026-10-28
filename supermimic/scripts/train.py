@@ -104,9 +104,9 @@ import torch
 import torch.nn as nn
 
 from supermimic.tasks.tracking.env import TrackingSim
-from supermimic.tasks.tracking.mdp import (CRITIC_EXTRA, INV_DIM, MAX_STEP_REWARD, MDP, OBS_DIM, invariant_features, normalize_xi,
-                                           unflatten_state)
-from supermimic.tasks.tracking.motion import MotionLib, check_reference, resolve_motion_args
+from supermimic.tasks.tracking.mdp import (CRITIC_EXTRA, INV_DIM, MAX_STEP_REWARD, MDP, NUM_J, OBS_DIM, invariant_features,
+                                           normalize_xi, unflatten_state)
+from supermimic.tasks.tracking.motion import GOAL_FRAME_DIM, MotionLib, check_reference, resolve_motion_args
 import supermimic.tasks.tracking.rl.networks as networks
 from supermimic.tasks.tracking.rl.buffer import ReplayBuffer
 from supermimic.tasks.tracking.rl.networks import Critic, Policy, WorldModel
@@ -167,7 +167,7 @@ print(f"rank {parallel.rank}/{parallel.world_size} on {dev}: {len(motion.names)}
       f"{motion.num_frames} local frames, reference {motion.description['reference_tensor_bytes'] / 1024**3:.3f} GiB", flush=True)
 mdp = MDP(kin, motion, kin.default_q)
 K, Hh, HZ = args.goal_frames, args.hist, args.horizon
-GOAL_DIM = 73 * K
+GOAL_DIM = GOAL_FRAME_DIM * K
 CRITIC_IN = INV_DIM + CRITIC_EXTRA + GOAL_DIM
 
 wm = WorldModel().to(dev)
@@ -233,7 +233,7 @@ if parallel.enabled:
 
 # per-component floors on the error normalization (pos, rot, lin vel, ang vel, q, qd increments)
 ERR_FLOOR = torch.cat((torch.full((3,), 3e-3), torch.full((3,), 5e-3), torch.full((3,), 2e-2), torch.full((3,), 5e-2),
-                       torch.full((29,), 3e-3), torch.full((29,), 5e-2))).to(dev)  # fmt: skip
+                       torch.full((NUM_J,), 3e-3), torch.full((NUM_J,), 5e-2))).to(dev)  # fmt: skip
 
 
 def _wm_rollout(s, a, xi):

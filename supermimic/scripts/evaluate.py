@@ -45,7 +45,7 @@ import torch
 import supermimic.tasks.tracking.rl.networks as networks
 from supermimic.tasks.tracking.env import TrackingSim
 from supermimic.tasks.tracking.mdp import MAX_STEP_REWARD, OBS_DIM, MDP
-from supermimic.tasks.tracking.motion import MotionLib, check_reference, resolve_motion_args
+from supermimic.tasks.tracking.motion import GOAL_FRAME_DIM, MotionLib, check_reference, resolve_motion_args
 from supermimic.tasks.tracking.rl.networks import Policy
 from supermimic.utils.kinematics import G1Kinematics
 
@@ -71,7 +71,7 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     a_ = ck["args"]
     K, Hh = a_["goal_frames"], a_["hist"]
     networks.AMP_DTYPE = torch.bfloat16 if a_.get("amp", "none") == "bf16" else None
-    pi = Policy(OBS_DIM, 73 * K, hist=Hh).to(dev)
+    pi = Policy(OBS_DIM, GOAL_FRAME_DIM * K, hist=Hh).to(dev)
     pi.load_state_dict(ck["pi"])
     pi.eval()
     ids = torch.arange(env.N, device=dev)

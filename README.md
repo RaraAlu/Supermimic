@@ -323,6 +323,7 @@ supermimic/
     mdp.py
     motion.py
     motion_hdf5.py
+    reset_sampling.py
     rl/
       buffer.py
       networks.py
@@ -374,6 +375,7 @@ tests/
 | `supermimic/tasks/tracking/rl/buffer.py` | 每环境1000步FIFO回放缓冲、k步窗口与起点采样 |
 | `supermimic/tasks/tracking/motion.py` | CSV/HDF5→50 Hz完整参考、独立差分与FK、目标帧、1 s重置分箱（尾箱合并） |
 | `supermimic/tasks/tracking/motion_hdf5.py` | 索引身份白名单与合并源两种读取器、完整源段读取、源库绑定与结构指纹 |
+| `supermimic/tasks/tracking/reset_sampling.py` | 附录D.1重置分箱：回合评分、分箱EMA与跨rank全局重置概率 |
 | `supermimic/utils/kinematics.py` | MuJoCo前向运动学（身体位姿/速度） |
 | `supermimic/utils/distributed.py` | 进程/设备绑定、协调错误、梯度平均与全局统计同步 |
 | `supermimic/tasks/tracking/constants.py` | 动作数据关节顺序与跟踪目标，不定义机器人配置 |

@@ -11,29 +11,32 @@ from dataclasses import dataclass
 
 import torch
 
-from supermimic.tasks.tracking.motion import CONTROL_DT, MotionLib
+from supermimic.tasks.tracking.constants import TRACKED_BODIES
+from supermimic.tasks.tracking.motion import CONTROL_DT, NUM_J, MotionLib
 from supermimic.utils.kinematics import G1Kinematics
 from supermimic.utils.rotations import mat_to_6d, quat_to_mat, mat_to_quat, rot_angle_sq, yaw_mat
 
-STATE_DIM = 71
-OBS_DIM = 29 + 29 + 3 + 3 + 29 + 6
-XI_DIM = 33
-NUM_J = 29
+STATE_DIM = 3 + 4 + 3 + 3 + NUM_J + NUM_J  # flatten_state的排列：p、四元数、v、w、q、qd
+OBS_DIM = NUM_J + NUM_J + 3 + 3 + NUM_J + 6
+# 仿真上下文 xi = [摩擦系数, 关节零位偏移, 躯干质心偏移]
+XI_JOINT = slice(1, 1 + NUM_J)
+XI_COM = slice(1 + NUM_J, 4 + NUM_J)
+XI_DIM = 4 + NUM_J
 
 # Table A.1 sensor noise (uniform half-widths), plus the reference-relative orientation
 OBS_NOISE = torch.cat(
     (
-        torch.full((29,), 0.01),
-        torch.full((29,), 0.5),
+        torch.full((NUM_J,), 0.01),
+        torch.full((NUM_J,), 0.5),
         torch.full((3,), 0.2),
         torch.full((3,), 0.05),
-        torch.zeros(29),
+        torch.zeros(NUM_J),
         torch.full((6,), 0.05),
     )
 )
 # normalization of the obs before the policy (qd and angular velocity are large)
 OBS_SCALE = torch.cat(
-    (torch.ones(29), torch.full((29,), 0.1), torch.full((3,), 0.25), torch.ones(3), torch.ones(29), torch.ones(6))
+    (torch.ones(NUM_J), torch.full((NUM_J,), 0.1), torch.full((3,), 0.25), torch.ones(3), torch.ones(NUM_J), torch.ones(6))
 )
 MAX_STEP_REWARD = (4 * 1.0 + 2 * 0.5) * CONTROL_DT
 
@@ -59,7 +62,8 @@ def flatten_state(S) -> torch.Tensor:
 
 
 def unflatten_state(x: torch.Tensor):
-    return x[..., 0:3], quat_to_mat(x[..., 3:7]), x[..., 7:10], x[..., 10:13], x[..., 13:42], x[..., 42:71]
+    qd0 = 13 + NUM_J
+    return x[..., 0:3], quat_to_mat(x[..., 3:7]), x[..., 7:10], x[..., 10:13], x[..., 13:qd0], x[..., qd0:STATE_DIM]
 
 
 def invariant_features(S) -> torch.Tensor:
@@ -80,7 +84,7 @@ def invariant_features(S) -> torch.Tensor:
     )
 
 
-INV_DIM = 1 + 6 + 3 + 3 + 29 + 29
+INV_DIM = 1 + 6 + 3 + 3 + NUM_J + NUM_J
 
 
 class MDP:
@@ -98,7 +102,7 @@ class MDP:
         """Noise-free proprioceptive observation (+ reference-relative root orientation)."""
         p, R, v, w, q, qd = S
         Rt = R.transpose(-1, -2)
-        dq0 = xi[..., 1:30]
+        dq0 = xi[..., XI_JOINT]
         g_b = -R[..., 2, :]  # R^T (0,0,-1)
         rel = mat_to_6d(Rt @ self.motion.root_R[f])
         return torch.cat((q - self.default_q - dq0, qd, (Rt @ w.unsqueeze(-1)).squeeze(-1), g_b, a_prev, rel), -1)
@@ -107,16 +111,20 @@ class MDP:
         return o + (2 * torch.rand_like(o) - 1) * self.obs_noise
 
     # ---------------- reward / termination ----------------
+    def _anchored_ref_bodies(self, p, R, rp, rR, f):
+        """重新锚定到机器人根部（xy与偏航）的参考刚体位置，同BeyondMimic；另返回偏航差dR。"""
+        dR = yaw_mat(R @ rR.transpose(-1, -2))
+        anchor = torch.cat((p[..., :2], rp[..., 2:3]), -1)
+        ref_bp = anchor.unsqueeze(-2) + ((dR.unsqueeze(-3) @ (self.motion.body_p[f] - rp.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1))
+        return ref_bp, dR
+
     def reward(self, S, f, a, a_prev, terms: bool = False):
         """Per-step reward (already multiplied by dt) comparing S with reference frame f."""
         c, m = self.cfg, self.motion
         p, R, v, w, q, qd = S
         bp, bR, bv, bw = self.kin.forward(p, R, v, w, q, qd)
         rp, rR = m.root_p[f], m.root_R[f]
-        # reference bodies re-anchored to the robot's root (xy + yaw), as in BeyondMimic
-        dR = yaw_mat(R @ rR.transpose(-1, -2))
-        anchor = torch.cat((p[..., :2], rp[..., 2:3]), -1)
-        ref_bp = anchor.unsqueeze(-2) + ((dR.unsqueeze(-3) @ (m.body_p[f] - rp.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1))
+        ref_bp, dR = self._anchored_ref_bodies(p, R, rp, rR, f)
         ref_bR = dR.unsqueeze(-3) @ m.body_R[f]
         e_pos = ((ref_bp - bp) ** 2).sum(-1).mean(-1)
         e_ori = rot_angle_sq(ref_bR, bR).mean(-1)
@@ -178,17 +186,15 @@ class MDP:
         Ht = H.transpose(-1, -2)
         rp, rR = m.root_p[f], m.root_R[f]
         bp = self.kin.forward(p, R, v, w, q, qd)[0]
-        dR = yaw_mat(R @ rR.transpose(-1, -2))
-        anchor = torch.cat((p[..., :2], rp[..., 2:3]), -1)
-        ref_bp = anchor.unsqueeze(-2) + ((dR.unsqueeze(-3) @ (m.body_p[f] - rp.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1))
+        ref_bp = self._anchored_ref_bodies(p, R, rp, rR, f)[0]
         e_body = (Ht.unsqueeze(-3) @ (ref_bp - bp).unsqueeze(-1)).squeeze(-1).flatten(-2)
         e_root = (Ht @ (rp - p).unsqueeze(-1)).squeeze(-1)
         rel = mat_to_6d(R.transpose(-1, -2) @ rR)
         return torch.cat((invariant_features(S), m.q[f] - q, e_body, e_root, rel, xi), -1)
 
 
-CRITIC_EXTRA = 29 + 14 * 3 + 3 + 6 + XI_DIM
+CRITIC_EXTRA = NUM_J + len(TRACKED_BODIES) * 3 + 3 + 6 + XI_DIM
 
 
 def normalize_xi(xi: torch.Tensor) -> torch.Tensor:
-    return torch.cat(((xi[..., :1] - 0.75) / 0.45, xi[..., 1:30] / 0.01, xi[..., 30:33] / 0.05), -1)
+    return torch.cat(((xi[..., :1] - 0.75) / 0.45, xi[..., XI_JOINT] / 0.01, xi[..., XI_COM] / 0.05), -1)

@@ -153,7 +153,7 @@ R_b^{\mathrm{des}} &= \Delta R\, R_{\mathrm{ref},b}
 
 括号里是“这个部位相对参考骨盆在哪”，乘 $`\Delta R`$ 把它转到机器人的朝向，再加到锚点上。
 
-代码：`supermimic/tasks/tracking/mdp.py`中`MDP.reward`的`dR`、`anchor`、`ref_bp`、`ref_bR`。
+代码：`supermimic/tasks/tracking/mdp.py`中`MDP._anchored_ref_bodies`的`dR`、`anchor`、`ref_bp`（`MDP.reward`与`MDP.critic_features`共用），以及`MDP.reward`的`ref_bR`。
 
 ### 2.3 六个“像不像”的打分项
 

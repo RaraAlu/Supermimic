@@ -4,8 +4,8 @@ import unittest
 
 import torch
 
-from supermimic.utils.distributed import (DistributedContext, LocalContext, episode_bin_scores, global_bin_probabilities,
-                                          update_bin_returns)
+from supermimic.tasks.tracking.reset_sampling import episode_bin_scores, global_bin_probabilities, update_bin_returns
+from supermimic.utils.distributed import DistributedContext, LocalContext
 
 GAMMA, STEP_MAX = 0.99, 0.1
 

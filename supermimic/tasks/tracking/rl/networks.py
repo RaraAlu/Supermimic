@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from supermimic.tasks.tracking.mdp import INV_DIM, NUM_J, XI_DIM, invariant_features
-from supermimic.utils.rotations import so3_exp, yaw_mat
+from supermimic.utils.rotations import so3_exp, so3_log, yaw_mat
 from supermimic.utils.distributed import global_moments
 
 
@@ -86,8 +86,6 @@ class WorldModel(nn.Module):
     @staticmethod
     def targets(S, S1):
         """Frame-local increments from S to S1 (the regression targets)."""
-        from supermimic.utils.rotations import so3_log
-
         p, R, v, w, q, qd = S
         p1, R1, v1, w1, q1, qd1 = S1
         H = yaw_mat(R)
@@ -118,24 +116,8 @@ class WorldModel(nn.Module):
 
     @staticmethod
     def state_error(S_hat, S):
-        """Frame-local state error components (same layout as ``targets``)."""
-        from supermimic.utils.rotations import so3_log
-
-        p, R, v, w, q, qd = S
-        ph, Rh, vh, wh, qh, qdh = S_hat
-        H = yaw_mat(R)
-        Rt = R.transpose(-1, -2)
-        return torch.cat(
-            (
-                (H.transpose(-1, -2) @ (ph - p).unsqueeze(-1)).squeeze(-1),
-                so3_log(Rt @ Rh),
-                (Rt @ (vh - v).unsqueeze(-1)).squeeze(-1),
-                (Rt @ (wh - w).unsqueeze(-1)).squeeze(-1),
-                qh - q,
-                qdh - qd,
-            ),
-            -1,
-        )
+        """以真实状态S为锚点的局部系状态误差，即从S到S_hat的增量。"""
+        return WorldModel.targets(S, S_hat)
 
 
 class Policy(nn.Module):

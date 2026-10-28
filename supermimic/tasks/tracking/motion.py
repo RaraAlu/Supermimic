@@ -12,11 +12,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from supermimic.tasks.tracking.motion_hdf5 import reference_bytes_per_frame
+from supermimic.tasks.tracking.motion_hdf5 import NUM_J, reference_bytes_per_frame
 from supermimic.utils.kinematics import G1Kinematics
 from supermimic.utils.rotations import mat_to_6d, mat_to_quat, quat_slerp, quat_to_mat, so3_log, yaw_mat
 
 CONTROL_DT = 0.02
+# 每个未来帧的目标特征：当前偏航系下的根位置与6D朝向、根系速度、q、qd
+GOAL_FRAME_DIM = 3 + 6 + 3 + 3 + NUM_J + NUM_J
 BIN_FRAMES = 50  # 1 s bins for return-based reset sampling
 MIN_TAIL_STARTS = BIN_FRAMES // 2  # a shorter final bin joins the previous one
 FK_CHUNK = 65536
@@ -158,7 +160,7 @@ class MotionLib:
         self.clip_end = self.clip_start + lengths - 1
         self.clip_id = torch.repeat_interleave(torch.arange(len(lens), device=device), lengths)
         for key, shape in (("root_p", (3,)), ("root_quat", (4,)), ("root_v", (3,)),
-                           ("root_w", (3,)), ("q", (29,)), ("qd", (29,))):
+                           ("root_w", (3,)), ("q", (NUM_J,)), ("qd", (NUM_J,))):
             setattr(self, key, torch.empty((self.num_frames, *shape), device=device))
         offset = 0
         for i, (p, quat, j) in enumerate(clips):
@@ -275,7 +277,7 @@ class MotionLib:
         rot = mat_to_6d(Ht @ self.root_R[fut])
         feats = torch.cat(
             (dp, rot, self.root_v_local[fut], self.root_w_local[fut], self.q[fut], self.qd[fut] * 0.1), -1
-        )  # (B,K,73)
+        )  # (B,K,GOAL_FRAME_DIM)
         return feats.reshape(f.shape[0], -1)
 
     def ref_state(self, f: torch.Tensor):

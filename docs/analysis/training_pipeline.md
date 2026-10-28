@@ -36,6 +36,7 @@ flowchart TD
 | MotionLib | `supermimic/tasks/tracking/motion.py` |
 | IndexedG1Dataset / MergedG1Dataset（索引白名单 / 合并源读取） | `supermimic/tasks/tracking/motion_hdf5.py` |
 | 分布式上下文、梯度与全局统计同步 | `supermimic/utils/distributed.py` |
+| 重置分箱评分与全局重置概率 | `supermimic/tasks/tracking/reset_sampling.py` |
 | G1Kinematics | `supermimic/utils/kinematics.py` |
 | MDP | `supermimic/tasks/tracking/mdp.py` |
 | TrackingSim | `supermimic/tasks/tracking/env.py` |

@@ -68,7 +68,7 @@ class G1Kinematics:
         self.tracked_idx = [bodies.index(n) for n in tracked]
         self.num_bodies = len(bodies)
         # joint limits (in G1_JOINT_NAMES order)
-        lo, hi = np.zeros(29), np.zeros(29)
+        lo, hi = np.zeros(len(G1_JOINT_NAMES)), np.zeros(len(G1_JOINT_NAMES))
         for j in range(m.njnt):
             n = m.joint(j).name
             if n in jname_to_idx:

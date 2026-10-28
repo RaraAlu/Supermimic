@@ -5,13 +5,13 @@ from __future__ import annotations
 
 import torch
 
-from supermimic.tasks.tracking.mdp import STATE_DIM, XI_DIM
+from supermimic.tasks.tracking.mdp import NUM_J, STATE_DIM, XI_DIM
 
 FIELDS = {
     "s": (STATE_DIM, torch.float32),
     "s1": (STATE_DIM, torch.float32),
-    "a": (29, torch.float32),
-    "a_prev": (29, torch.float32),
+    "a": (NUM_J, torch.float32),
+    "a_prev": (NUM_J, torch.float32),
     "xi": (XI_DIM, torch.float32),
     "r": ((), torch.float32),
     "f": ((), torch.long),
