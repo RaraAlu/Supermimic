@@ -176,4 +176,5 @@ python3 scripts/watch_train.py RUN_DIR --ref PREVIOUS_RUN_DIR --milestone 10000
 
 策略重放脚本只读检查点与源数据，诊断结果写到`--out`；监督脚本只读run日志。
 `--src`接受某提交的源码树目录，不接受提交哈希；未传的采样选项使用该源码的默认值，不自动继承检查点。
+每个结果的`summary.json`在`subject`字段记录源码路径、提交、是否有未提交修改与实际环境选项。
 结果与日志均不入库。

@@ -8,12 +8,12 @@ rollout triggers the training termination. The labels are independent of any res
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
+import _subject
+
 parser = argparse.ArgumentParser()
-parser.add_argument("--src", default=str(Path(__file__).resolve().parents[1]),
-                    help="source tree to import supermimic from (default: this repository; pass a checkpoint's commit to replay it)")
+parser.add_argument("--src", default=_subject.DEFAULT_SRC, help=_subject.SRC_HELP)
 parser.add_argument("--ckpt", required=True)
 parser.add_argument("--motion_source", required=True)
 parser.add_argument("--out", required=True)
@@ -21,28 +21,17 @@ parser.add_argument("--device", default="cuda:0")
 parser.add_argument("--steps", type=int, default=100)
 parser.add_argument("--batch", type=int, default=2048)
 args = parser.parse_args()
-sys.path.insert(0, str(Path(args.src).resolve()))
+subject = _subject.Subject(args.src, args.device)
 
 import torch
-
-import supermimic.tasks.tracking.rl.networks as networks
-from supermimic.tasks.tracking.env import TrackingSim
-from supermimic.tasks.tracking.mdp import OBS_DIM, MDP
-from supermimic.tasks.tracking.motion import MotionLib
-from supermimic.tasks.tracking.rl.networks import Policy
-from supermimic.utils.kinematics import G1Kinematics
 
 dev = args.device
 ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
 a_ = ck["args"]
 K, Hh = a_["goal_frames"], a_["hist"]
-networks.AMP_DTYPE = torch.bfloat16 if a_.get("amp", "none") == "bf16" else None
-kin = G1Kinematics(dev)
-motion = MotionLib.from_source(args.motion_source, kin, dev)
-mdp = MDP(kin, motion, kin.default_q)
-pi = Policy(OBS_DIM, 73 * K, hist=Hh).to(dev)
-pi.load_state_dict(ck["pi"])
-pi.eval()
+subject.set_amp(a_)
+motion, mdp = subject.reference(args.motion_source)
+pi = subject.policy(ck)
 
 starts = []
 for c in range(len(motion.names)):
@@ -51,7 +40,7 @@ for c in range(len(motion.names)):
 starts = torch.tensor(starts, device=dev)
 P = len(starts)
 failed = torch.zeros(P, dtype=torch.bool, device=dev)
-env = TrackingSim(min(args.batch, P), motion, mdp, dev, eval_mode=True)
+env = subject.make_env(min(args.batch, P), motion, mdp, eval_mode=True)
 with torch.no_grad():
     for b0 in range(0, P, env.N):
         cnt = min(env.N, P - b0)
@@ -79,6 +68,6 @@ clip = motion.clip_id[starts]
 torch.save({"start": starts.cpu(), "clip": clip.cpu(), "offset": (starts - motion.clip_start[clip]).cpu(),
             "clip_len": motion.clip_len[clip].cpu(), "failed": failed.cpu()}, out / "labels.pt")
 summary = {"positions": P, "hard": int(failed.sum()), "hard_frac": round(float(failed.float().mean()), 4),
-           "clips_with_hard": int(len(torch.unique(clip[failed])))}
+           "clips_with_hard": int(len(torch.unique(clip[failed]))), "subject": subject.provenance()}
 (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 print(json.dumps(summary, indent=2))

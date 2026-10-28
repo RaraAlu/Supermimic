@@ -13,13 +13,13 @@ Run from the repository root; --src selects the source tree (default: this repos
 import argparse
 import csv
 import json
-import sys
 import time
 from pathlib import Path
 
+import _subject
+
 parser = argparse.ArgumentParser()
-parser.add_argument("--src", default=str(Path(__file__).resolve().parents[1]),
-                    help="source tree to import supermimic from (default: this repository; pass a checkpoint's commit to replay it)")
+parser.add_argument("--src", default=_subject.DEFAULT_SRC, help=_subject.SRC_HELP)
 parser.add_argument("--ckpt", required=True)
 parser.add_argument("--motion_source", required=True)
 parser.add_argument("--out", required=True)
@@ -28,21 +28,17 @@ parser.add_argument("--num_envs", type=int, default=2048)
 parser.add_argument("--steps", type=int, default=2000)
 parser.add_argument("--action_noise", type=float, default=0.1)
 parser.add_argument("--seed", type=int, default=0)
-parser.add_argument("--bin_clip_end", default=None, help="passed to TrackingSim when the source supports it")
-parser.add_argument("--bin_prior", default=None, help="passed to TrackingSim when the source supports it")
-parser.add_argument("--bin_skip_steps", type=int, default=None, help="passed to TrackingSim when the source supports it")
-parser.add_argument("--reset_margin", type=int, default=None, help="passed to TrackingSim when the source supports it")
+parser.add_argument("--bin_clip_end", default=None, help="passed to TrackingSim; an error if the source lacks it")
+parser.add_argument("--bin_prior", default=None, help="passed to TrackingSim; an error if the source lacks it")
+parser.add_argument("--bin_skip_steps", type=int, default=None, help="passed to TrackingSim; an error if the source lacks it")
+parser.add_argument("--reset_margin", type=int, default=None, help="passed to TrackingSim; an error if the source lacks it")
 args = parser.parse_args()
-sys.path.insert(0, str(Path(args.src).resolve()))
+subject = _subject.Subject(args.src, args.device)
 
 import torch
 
-import supermimic.tasks.tracking.rl.networks as networks
-from supermimic.tasks.tracking.env import TrackingSim
-from supermimic.tasks.tracking.mdp import MAX_STEP_REWARD, OBS_DIM, MDP, RewardCfg
-from supermimic.tasks.tracking.motion import CONTROL_DT, MotionLib
-from supermimic.tasks.tracking.rl.networks import Policy
-from supermimic.utils.kinematics import G1Kinematics
+from supermimic.tasks.tracking.mdp import MAX_STEP_REWARD, NUM_J, OBS_DIM, RewardCfg
+from supermimic.tasks.tracking.motion import CONTROL_DT
 
 torch.manual_seed(args.seed)
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -53,19 +49,15 @@ out_dir.mkdir(parents=True, exist_ok=True)
 ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
 a_ = ck["args"]
 K, Hh = a_["goal_frames"], a_["hist"]
-networks.AMP_DTYPE = torch.bfloat16 if a_.get("amp", "none") == "bf16" else None
-kin = G1Kinematics(dev)
-motion = MotionLib.from_source(args.motion_source, kin, dev)
-mdp = MDP(kin, motion, kin.default_q)
-pi = Policy(OBS_DIM, 73 * K, hist=Hh).to(dev)
-pi.load_state_dict(ck["pi"])
-pi.eval()  # normalizer statistics stay as saved; training would keep updating them
+subject.set_amp(a_)
+motion, mdp = subject.reference(args.motion_source)
+pi = subject.policy(ck)
 w_rate, w_lim = RewardCfg.w_action_rate, RewardCfg.w_joint_limit
 
 N = args.num_envs
-bin_kw = {k: v for k, v in (("bin_clip_end", args.bin_clip_end), ("bin_prior", args.bin_prior), ("bin_skip_steps", args.bin_skip_steps),
-                                       ("reset_margin", args.reset_margin)) if v is not None}
-env = TrackingSim(N, motion, mdp, dev, gamma=a_.get("gamma", 0.99), **bin_kw)
+# 未显式传入的采样选项取源码树的默认值，不从检查点继承
+bin_kw = {k: getattr(args, k) for k in ("bin_clip_end", "bin_prior", "bin_skip_steps", "reset_margin") if getattr(args, k) is not None}
+env = subject.make_env(N, motion, mdp, run_args=a_, inherit=("gamma",), **bin_kw)
 hist = torch.zeros(N, Hh, OBS_DIM, device=dev)
 acc_names = ("track", "rate_pen", "lim_pen", "r", "rate0", "lim0", "r0", "rate_max", "a_absmax", "sat_steps", "rate_max_step")
 acc = {k: torch.zeros(N, device=dev) for k in acc_names}
@@ -81,7 +73,7 @@ with torch.no_grad():
         f_start = torch.where(fresh, env.f, f_start)
         o = mdp.add_noise(mdp.obs(S, env.a_prev, env.xi, env.f))
         hist = torch.where(fresh[:, None, None], o.unsqueeze(1).expand_as(hist), torch.cat((hist[:, 1:], o.unsqueeze(1)), 1))
-        a = torch.clamp(pi(hist, motion.goal(env.f, K)) + args.action_noise * torch.randn(N, 29, device=dev), -20, 20)
+        a = torch.clamp(pi(hist, motion.goal(env.f, K)) + args.action_noise * torch.randn(N, NUM_J, device=dev), -20, 20)
         out = env.step(a)
         r, terms, done = out["r"], out["terms"], out["done"]
         rate_pen = w_rate * terms["action_rate"] * CONTROL_DT
@@ -149,7 +141,7 @@ order = torch.argsort(E["ep_ret_norm"])
 worst_k = max(1, n // 100)
 worst = order[:worst_k]
 summary = {
-    "ckpt": args.ckpt, "iteration": ck.get("iteration"), "num_envs": N, "steps": args.steps, "elapsed_s": round(elapsed, 1),
+    "ckpt": args.ckpt, "iteration": ck.get("iteration"), "subject": subject.provenance(), "num_envs": N, "steps": args.steps, "elapsed_s": round(elapsed, 1),
     "episodes": n, "split_check_max_abs_err": check,
     "ep_ret_norm": q(E["ep_ret_norm"]),
     "step_weighted_return": round(float(E["r"].sum() / den.sum()), 4),

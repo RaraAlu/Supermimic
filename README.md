@@ -285,13 +285,16 @@ RTX 5080 单卡回归、`--nproc-per-node=gpu` 自动启动和多进程检查点
 重置分箱的分数在softmax前限制到[0, 1]，非有限分数不更新分箱，原因见[问题与解决记录](docs/troubleshooting/training_metrics.md)第11节。
 
 下列诊断中的策略重放脚本只读检查点与源数据，向`--out`写结果，`--src`可指向某提交的源码树目录。
-`diag_train_episodes.py`未显式传入的采样选项取该源码树的`TrackingSim`默认值，不自动继承检查点；
-`diag_wm_error.py`仅继承`gamma`、`bin_clip_end`与`bin_prior`，过渡期和末尾范围也取源码默认值。
+各脚本经`scripts/_subject.py`载入该源码树并确认实际导入的就是它，与版本有关的兼容处理也集中在那里；
+`summary.json`的`subject`字段记录源码路径、提交、工作区是否有未提交修改（`dirty`）与实际传给`TrackingSim`的选项。
+`diag_train_episodes.py`未显式传入的采样选项取该源码树的`TrackingSim`默认值，不自动继承检查点，显式传入而源码树不支持的选项直接报错；
+`diag_wm_error.py`与`diag_critic_bias.py`仅在检查点有且源码树支持时继承`gamma`、`bin_clip_end`与`bin_prior`，过渡期和末尾范围也取源码默认值。
 `--action_noise`在这两个脚本中独立默认0.1；使用旧检查点时要核对这些条件。
 
 | 脚本 | 用途 |
 | --- | --- |
 | `scripts/make_motion_subset.py` | 从HDF5源随机抽取完整片段，生成小规模子集（CPU） |
+| `scripts/_subject.py` | 诊断脚本的被测源码树（`--src`）：载入校验、策略/世界模型/critic加载、按源码树支持的选项建环境 |
 | `scripts/diag_first_step.py` | 附录F.1评估，并记录每段首步的平滑与限位惩罚、去掉首步后的归一化回报 |
 | `scripts/diag_train_episodes.py` | 按训练条件重放，记录每个回合的长度、`ep_ret_norm`及其奖励/惩罚分解，导出分箱状态 |
 | `scripts/diag_bin_difficulty.py` | 从每个1 s起步位置按评估条件跑2 s，生成与分箱方案无关的难度标签 |
@@ -344,6 +347,7 @@ scripts/
   benchmark_collect.py
   benchmark_paper_two_gpu.py
   make_motion_subset.py
+  _subject.py
   diag_first_step.py
   diag_train_episodes.py
   diag_bin_difficulty.py
@@ -361,6 +365,7 @@ tests/
   test_evaluation.py
   test_distributed.py
   test_bin_returns.py
+  test_subject.py
   test_learning_math.py
   test_compile_check.py
   test_tensorboard_log.py

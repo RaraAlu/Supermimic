@@ -21,12 +21,12 @@ curriculum, and the policy acts with training's action and observation noise.
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
+import _subject
+
 parser = argparse.ArgumentParser()
-parser.add_argument("--src", default=str(Path(__file__).resolve().parents[1]),
-                    help="source tree to import supermimic from (default: this repository)")
+parser.add_argument("--src", default=_subject.DEFAULT_SRC, help=_subject.SRC_HELP)
 parser.add_argument("--states", nargs="+", required=True, help="checkpoints with wm, pi, critic and args")
 parser.add_argument("--motion_source", required=True)
 parser.add_argument("--out", required=True)
@@ -40,16 +40,11 @@ parser.add_argument("--chunk", type=int, default=4096, help="imagined sequences 
 parser.add_argument("--action_noise", type=float, default=0.1)
 parser.add_argument("--seed", type=int, default=0)
 args = parser.parse_args()
-sys.path.insert(0, str(Path(args.src).resolve()))
+subject = _subject.Subject(args.src, args.device)
 
 import torch
 
-import supermimic.tasks.tracking.rl.networks as networks
-from supermimic.tasks.tracking.env import TrackingSim
-from supermimic.tasks.tracking.mdp import CRITIC_EXTRA, INV_DIM, NUM_J, OBS_DIM, MDP, normalize_xi, unflatten_state
-from supermimic.tasks.tracking.motion import MotionLib
-from supermimic.tasks.tracking.rl.networks import Critic, Policy, WorldModel
-from supermimic.utils.kinematics import G1Kinematics
+from supermimic.tasks.tracking.mdp import NUM_J, OBS_DIM, normalize_xi, unflatten_state
 
 torch.backends.cuda.matmul.allow_tf32 = True
 dev = args.device
@@ -59,20 +54,10 @@ out_dir.mkdir(parents=True, exist_ok=True)
 cks = {Path(p).stem: torch.load(p, map_location="cpu", weights_only=False) for p in args.states}
 a0 = next(iter(cks.values()))["args"]
 K, Hh, HZ, gamma, lam = a0["goal_frames"], a0["hist"], a0["horizon"], a0["gamma"], a0["lam"]
-networks.AMP_DTYPE = torch.bfloat16 if a0.get("amp", "none") == "bf16" else None
-kin = G1Kinematics(dev)
-motion = MotionLib.from_source(args.motion_source, kin, dev)
-mdp = MDP(kin, motion, kin.default_q)
-models = {}
-for name, ck in cks.items():
-    wm, pi, critic = WorldModel().to(dev), Policy(OBS_DIM, 73 * K, hist=Hh).to(dev), Critic(INV_DIM + CRITIC_EXTRA + 73 * K).to(dev)
-    wm.load_state_dict(ck["wm"]), pi.load_state_dict(ck["pi"]), critic.load_state_dict(ck["critic"])
-    models[name] = (wm.eval(), pi.eval(), critic.eval())
-
-
-# per-step survival probability as the source tree computes it: older trees (before 4293e90) only have
-# soft_termination and train with 1 - that, which is also what this reproduces for them
-survival_prob = mdp.soft_survival if hasattr(mdp, "soft_survival") else (lambda S, f: 1 - mdp.soft_termination(S, f))
+subject.set_amp(a0)
+motion, mdp = subject.reference(args.motion_source)
+models = {name: (subject.world_model(ck), subject.policy(ck), subject.critic(ck)) for name, ck in cks.items()}
+survival_prob = subject.survival_prob(mdp)
 
 
 def critic_input(S, f, xi_n):
@@ -91,11 +76,10 @@ def collect(pi):
     torch.manual_seed(args.seed)
     N = args.num_envs
     T = (args.starts - 1) * args.start_stride + args.mc_steps + 1
-    env = TrackingSim(N, motion, mdp, dev, gamma=gamma, bin_clip_end=a0.get("bin_clip_end", "bootstrap"),
-                      bin_prior=a0.get("bin_prior", "zero"))
+    env = subject.make_env(N, motion, mdp, run_args=a0, inherit=("gamma", "bin_clip_end", "bin_prior"))
     hist = torch.zeros(N, Hh, OBS_DIM, device=dev)
-    rec = {"s": torch.empty(T, N, 71, device=dev), "f": torch.empty(T, N, dtype=torch.long, device=dev),
-           "xi": torch.empty(T, N, 33, device=dev), "r": torch.empty(T, N, device=dev),
+    rec = {"s": torch.empty(T, N, subject.STATE_DIM, device=dev), "f": torch.empty(T, N, dtype=torch.long, device=dev),
+           "xi": torch.empty(T, N, subject.XI_DIM, device=dev), "r": torch.empty(T, N, device=dev),
            "term": torch.empty(T, N, dtype=torch.bool, device=dev), "done": torch.empty(T, N, dtype=torch.bool, device=dev)}
     starts = {"hist": [], "a_prev": []}
     with torch.no_grad():
@@ -160,7 +144,7 @@ def imagine(wm, pi, rec, st):
     return {k: torch.cat(v, 1) if k != "ok" else v for k, v in out.items()}
 
 
-summary = {"states": {n: int(ck["iteration"]) for n, ck in cks.items()}, "num_envs": args.num_envs, "mc_steps": args.mc_steps,
+summary = {"states": {n: int(ck["iteration"]) for n, ck in cks.items()}, "subject": subject.provenance(), "num_envs": args.num_envs, "mc_steps": args.mc_steps,
            "horizon": HZ, "tail_weight": round(gamma**args.mc_steps, 4), "pairs": {}}
 for pn, (wm, pi, _) in models.items():
     rec, st = collect(pi)

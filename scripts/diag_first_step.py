@@ -11,29 +11,25 @@ Run from the repository root; --src selects the source tree (default: this repos
 import argparse
 import csv
 import json
-import sys
 import time
 from pathlib import Path
 
+import _subject
+
 parser = argparse.ArgumentParser()
-parser.add_argument("--src", default=str(Path(__file__).resolve().parents[1]),
-                    help="source tree to import supermimic from (default: this repository; pass a checkpoint's commit to replay it)")
+parser.add_argument("--src", default=_subject.DEFAULT_SRC, help=_subject.SRC_HELP)
 parser.add_argument("--ckpt", required=True)
 parser.add_argument("--motion_source", required=True)
 parser.add_argument("--out", required=True)
 parser.add_argument("--device", default="cuda:0")
 parser.add_argument("--transient_steps", type=int, default=20)
 args = parser.parse_args()
-sys.path.insert(0, str(Path(args.src).resolve()))
+subject = _subject.Subject(args.src, args.device)
 
 import torch
 
-import supermimic.tasks.tracking.rl.networks as networks
-from supermimic.tasks.tracking.env import TrackingSim
-from supermimic.tasks.tracking.mdp import MAX_STEP_REWARD, OBS_DIM, MDP, RewardCfg
-from supermimic.tasks.tracking.motion import CONTROL_DT, MotionLib
-from supermimic.tasks.tracking.rl.networks import Policy
-from supermimic.utils.kinematics import G1Kinematics
+from supermimic.tasks.tracking.mdp import MAX_STEP_REWARD, RewardCfg
+from supermimic.tasks.tracking.motion import CONTROL_DT
 
 torch.backends.cuda.matmul.allow_tf32 = True
 dev = args.device
@@ -43,17 +39,13 @@ out_dir.mkdir(parents=True, exist_ok=True)
 ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
 a_ = ck["args"]
 K, Hh = a_["goal_frames"], a_["hist"]
-networks.AMP_DTYPE = torch.bfloat16 if a_.get("amp", "none") == "bf16" else None
-kin = G1Kinematics(dev)
-motion = MotionLib.from_source(args.motion_source, kin, dev)
-mdp = MDP(kin, motion, kin.default_q)
+subject.set_amp(a_)
+motion, mdp = subject.reference(args.motion_source)
 C = len(motion.names)
-pi = Policy(OBS_DIM, 73 * K, hist=Hh).to(dev)
-pi.load_state_dict(ck["pi"])
-pi.eval()
+pi = subject.policy(ck)
 w_rate, w_lim = RewardCfg.w_action_rate, RewardCfg.w_joint_limit
 
-env = TrackingSim(C, motion, mdp, dev, eval_mode=True)
+env = subject.make_env(C, motion, mdp, eval_mode=True)
 ids = torch.arange(C, device=dev)
 clip_end = motion.clip_end[ids]
 T_tr = args.transient_steps
@@ -119,7 +111,7 @@ def q(x, ps=(0.0, 0.1, 0.5, 0.9, 1.0)):
 
 
 summary = {
-    "ckpt": args.ckpt, "iteration": ck.get("iteration"), "clips": C, "frames": int(motion.clip_len.sum()),
+    "ckpt": args.ckpt, "iteration": ck.get("iteration"), "subject": subject.provenance(), "clips": C, "frames": int(motion.clip_len.sum()),
     "elapsed_s": round(elapsed, 1), "steps": step, "n_failed": int(failed.sum()),
     "norm_return": round(float(norm.mean()), 4),
     "norm_return_wo_first_step": round(float(norm_wo_first.mean()), 4),

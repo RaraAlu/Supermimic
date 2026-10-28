@@ -16,12 +16,12 @@ k steps from each logged start on the logged actions, exactly like training's wo
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
+import _subject
+
 parser = argparse.ArgumentParser()
-parser.add_argument("--src", default=str(Path(__file__).resolve().parents[1]),
-                    help="source tree to import supermimic from (default: this repository)")
+parser.add_argument("--src", default=_subject.DEFAULT_SRC, help=_subject.SRC_HELP)
 parser.add_argument("--ckpt", required=True, help="checkpoint with wm, pi and args")
 parser.add_argument("--motion_source", required=True)
 parser.add_argument("--out", required=True)
@@ -35,16 +35,11 @@ parser.add_argument("--chunk", type=int, default=16384, help="windows per world-
 parser.add_argument("--action_noise", type=float, default=0.1)
 parser.add_argument("--seed", type=int, default=0)
 args = parser.parse_args()
-sys.path.insert(0, str(Path(args.src).resolve()))
+subject = _subject.Subject(args.src, args.device)
 
 import torch
 
-import supermimic.tasks.tracking.rl.networks as networks
-from supermimic.tasks.tracking.env import TrackingSim
-from supermimic.tasks.tracking.mdp import NUM_J, OBS_DIM, MDP, RewardCfg, normalize_xi, unflatten_state
-from supermimic.tasks.tracking.motion import MotionLib
-from supermimic.tasks.tracking.rl.networks import Policy, WorldModel
-from supermimic.utils.kinematics import G1Kinematics
+from supermimic.tasks.tracking.mdp import NUM_J, OBS_DIM, RewardCfg, normalize_xi, unflatten_state
 
 torch.manual_seed(args.seed)
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -55,23 +50,17 @@ out_dir.mkdir(parents=True, exist_ok=True)
 ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
 a_ = ck["args"]
 K, Hh, k = a_["goal_frames"], a_["hist"], args.window
-networks.AMP_DTYPE = torch.bfloat16 if a_.get("amp", "none") == "bf16" else None
-kin = G1Kinematics(dev)
-motion = MotionLib.from_source(args.motion_source, kin, dev)
-mdp = MDP(kin, motion, kin.default_q)
-wm = WorldModel().to(dev)
-wm.load_state_dict(ck["wm"])
-pi = Policy(OBS_DIM, 73 * K, hist=Hh).to(dev)
-pi.load_state_dict(ck["pi"])
-wm.eval(), pi.eval()
+subject.set_amp(a_)
+motion, mdp = subject.reference(args.motion_source)
+wm = subject.world_model(ck)
+pi = subject.policy(ck)
 
 # ---- fresh transitions from the checkpoint's policy under the training setup ----
 N, T = args.num_envs, args.steps
-env = TrackingSim(N, motion, mdp, dev, gamma=a_.get("gamma", 0.99),
-                  bin_clip_end=a_.get("bin_clip_end", "bootstrap"), bin_prior=a_.get("bin_prior", "zero"))
+env = subject.make_env(N, motion, mdp, run_args=a_, inherit=("gamma", "bin_clip_end", "bin_prior"))
 hist = torch.zeros(N, Hh, OBS_DIM, device=dev)
-rec = {"s": torch.empty(T, N, 71, device=dev), "s1": torch.empty(T, N, 71, device=dev),
-       "a": torch.empty(T, N, NUM_J, device=dev), "xi": torch.empty(T, N, 33, device=dev),
+rec = {"s": torch.empty(T, N, subject.STATE_DIM, device=dev), "s1": torch.empty(T, N, subject.STATE_DIM, device=dev),
+       "a": torch.empty(T, N, NUM_J, device=dev), "xi": torch.empty(T, N, subject.XI_DIM, device=dev),
        "done": torch.empty(T, N, dtype=torch.bool, device=dev)}
 with torch.no_grad():
     for step in range(args.warmup + T):
@@ -156,7 +145,7 @@ blocks = {"pos": slice(0, 3), "rot": slice(3, 6), "linvel": slice(6, 9), "angvel
           "q": slice(12, 12 + NUM_J), "qd": slice(12 + NUM_J, 70)}
 rms_k = (sq_sum[k - 1] / count[k - 1]).sqrt()
 summary = {
-    "ckpt": args.ckpt, "iteration": ck.get("iteration"), "num_envs": N, "recorded_steps": T, "window": k,
+    "ckpt": args.ckpt, "iteration": ck.get("iteration"), "subject": subject.provenance(), "num_envs": N, "recorded_steps": T, "window": k,
     "windows_valid_at_step_k": int(count[k - 1]), "windows_total": int(len(idx_t)),
     f"step_{k}_physical": {name: q(v) for name, v in last.items()},
     "mean_per_step_physical": {name: [round(float(x), 5) for x in (step_sum[name] / count)] for name in comp},
