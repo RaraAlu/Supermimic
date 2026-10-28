@@ -7,7 +7,7 @@
 | 分册 | 内容 |
 | --- | --- |
 | [reset_curriculum.md](reset_curriculum.md) | 按回报重置采样的四轮课程跑偏：尾部极短分箱、首步惩罚假设、重置过渡期、短片段首帧 |
-| [training_metrics.md](training_metrics.md) | 指标判读与监督：`ep_ret_norm`、学习率口径、`wm_err8`、短暂崩溃、覆盖率、监督阈值、critic归一化、评估显存、3 h检查点的子集评估、critic高估引发的崩溃 |
+| [training_metrics.md](training_metrics.md) | 指标判读与监督：`ep_ret_norm`、学习率口径、`wm_err8`、短暂崩溃、覆盖率、监督阈值、critic归一化、评估显存、检查点的子集评估（按迭代数对齐论文）、critic高估引发的崩溃 |
 | [performance_correctness.md](performance_correctness.md) | compile、CUDA graph、fused Adam与多卡带来的正确性问题 |
 | [platform_ops.md](platform_ops.md) | Windows/Linux共用仓库、远程服务器连接与传输、代码同步、运行管理 |
 
