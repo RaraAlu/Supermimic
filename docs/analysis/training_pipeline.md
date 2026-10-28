@@ -694,7 +694,7 @@ flowchart LR
   `--num_envs`、`--wm_batch`、`--pi_batch`默认是全局总量，按rank均分、余数分给靠前的rank；
   `--batch_scope per_gpu`时是每卡大小，全局总量随卡数增长。
 - 每次更新前先跨卡按本地样本数加权平均梯度，再统一裁剪；分箱softmax与历史权重也做全局归约。
-  只有主进程写`train_log.csv`、`reference.json`与检查点，每个rank另写自己的分片清单。
+  只有主进程写`train_log.csv`、`reference.json`、TensorBoard事件与检查点，每个rank另写自己的分片清单。
 - 检查点不带DDP前缀，可由单进程评估加载；恢复时比对已有全局数据指纹，允许更换卡数并重新分片，
   但回放缓冲、仿真状态与随机数状态不恢复，因此多卡与单卡的结果不应假设逐步等价。
 - 论文表A.5的双卡设置把学习率乘√2；`--lr_scaling sqrt`把基础学习率乘以√WORLD_SIZE（双卡即√2，更多卡是按同一规则外推），默认不缩放。

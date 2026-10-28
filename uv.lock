@@ -3048,6 +3048,7 @@ dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "tensorboard" },
     { name = "torch" },
 ]
 
@@ -3056,6 +3057,7 @@ requires-dist = [
     { name = "h5py", specifier = ">=3.12,<4" },
     { name = "mjlab", specifier = "==1.6.0" },
     { name = "numpy" },
+    { name = "tensorboard", specifier = ">=2.21.0" },
     { name = "torch", specifier = ">=2.7.0", index = "https://download.pytorch.org/whl/cu130" },
 ]
 

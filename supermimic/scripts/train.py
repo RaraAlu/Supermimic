@@ -42,6 +42,8 @@ parser.add_argument("--wm_only_iters", type=int, default=500, help="world-model-
 parser.add_argument("--lr_decay_iters", type=int, default=250_000)
 parser.add_argument("--ckpt_every", type=int, default=2000)
 parser.add_argument("--log_every", type=int, default=50)
+parser.add_argument("--tensorboard", type=str, default="auto", choices=["auto", "on", "off"],
+                    help="also write every log row as TensorBoard scalars to LOG_DIR/tensorboard (auto: only if tensorboard is installed)")
 source = parser.add_mutually_exclusive_group()
 source.add_argument("--motion_dir", type=str, default=None)
 source.add_argument("--motion_index", type=str, default=None)
@@ -258,6 +260,9 @@ def _critic_input(S, f, xi_n, g):
 
 
 USE_COMPILE = args.compile == "on" or (args.compile == "auto" and importlib.util.find_spec("triton") is not None)
+USE_TENSORBOARD = args.tensorboard == "on" or (args.tensorboard == "auto" and importlib.util.find_spec("tensorboard") is not None)
+if USE_TENSORBOARD:
+    from torch.utils.tensorboard import SummaryWriter  # fails here, before warmup, when "on" lacks the package
 maybe_compile = torch.compile if USE_COMPILE else (lambda fn: fn)
 wm_rollout = maybe_compile(_wm_rollout)
 wm_err = maybe_compile(_wm_err)
@@ -513,13 +518,19 @@ def collect(n_steps: int, stats: dict):
 stats = {"r": [], "ep_len": [], "ep_ret": [], "term": [], "done": []}
 # The replay buffer is not checkpointed, so resumed runs also need fresh transitions.
 collect(args.warmup_steps, stats)
+TRAIN_COLUMNS = ("iteration", "wall_h", "sim_steps", "wm_loss", "wm_err8", "pi_loss", "v_loss", "imag_rew", "pi_gradnorm",
+                 "imag_survival", "sim_rew", "ep_len", "ep_ret_norm", "term_frac", "it_per_s", "lr")
+SAMPLING_COLUMNS = ("iteration", "samp_entropy", "samp_top1", "bins_visited", "reset_tail_frac")
 log_f = open(os.path.join(args.log_dir, "train_log.csv"), "a", encoding="utf-8") if parallel.primary else None
 if parallel.primary and log_f.tell() == 0:
-    log_f.write("iteration,wall_h,sim_steps,wm_loss,wm_err8,pi_loss,v_loss,imag_rew,pi_gradnorm,imag_survival,sim_rew,ep_len,ep_ret_norm,term_frac,it_per_s,lr\n")
+    log_f.write(",".join(TRAIN_COLUMNS) + "\n")
 # reset-sampling diagnostics in their own file, so resumed runs keep the train_log.csv columns
 samp_f = open(os.path.join(args.log_dir, "sampling_log.csv"), "a", encoding="utf-8") if parallel.primary else None
 if parallel.primary and samp_f.tell() == 0:
-    samp_f.write("iteration,samp_entropy,samp_top1,bins_visited,reset_tail_frac\n")
+    samp_f.write(",".join(SAMPLING_COLUMNS) + "\n")
+# same rows as the CSV files, tagged train/<column> and sampling/<column>; on resume, purge_step hides
+# the events a previous run wrote after the checkpoint it resumes from (rows up to start_it stay valid)
+tb = SummaryWriter(os.path.join(args.log_dir, "tensorboard"), purge_step=start_it + 1 if start_it else None) if parallel.primary and USE_TENSORBOARD else None
 t_start = time.time() - wall_offset
 t_log = time.time()
 step_acc = 0.0
@@ -580,6 +591,11 @@ for it in range(start_it, args.iterations):
             log_f.flush()
             samp_f.write(",".join(f"{x:.6g}" if isinstance(x, float) else str(x) for x in samp_row) + "\n")
             samp_f.flush()
+            if tb:
+                for group, names, values in (("train", TRAIN_COLUMNS, row), ("sampling", SAMPLING_COLUMNS, samp_row)):
+                    for name, x in zip(names[1:], values[1:]):
+                        tb.add_scalar(f"{group}/{name}", x, it + 1)
+                tb.flush()
             print(f"it {it + 1} | {wall_h:.3f} h | wm {row[3]:.4f} e8 {row[4]:.4f} | pi {row[5]:.3f} v {row[6]:.4f} imag_r {row[7]:.3f} surv {row[9]:.3f} "
                   f"| sim_r {row[10]:.3f} ep_len {row[11]:.1f} ep_ret {row[12]:.3f} term {term_frac:.2f} | {ips:.2f} it/s", flush=True)  # fmt: skip
         stats = {k: [] for k in stats}
@@ -601,6 +617,8 @@ for it in range(start_it, args.iterations):
                 os.replace(path + ".tmp", path)
 if log_f:
     log_f.close()
+if tb:
+    tb.close()
 for captured in (wm_step, policy_step, critic_step, collect_action, env._reward_termination):
     captured.close()
 parallel.close()

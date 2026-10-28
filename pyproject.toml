@@ -8,6 +8,7 @@ dependencies = [
     "torch>=2.7.0",
     "numpy",
     "h5py>=3.12,<4",
+    "tensorboard>=2.21.0",
 ]
 
 [tool.uv]

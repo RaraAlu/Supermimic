@@ -217,6 +217,17 @@ CPU/Gloo 验证不能替代多 GPU NCCL/H100 的吞吐、显存峰值或数值�
 不会自动继承旧run的批量、学习率、精度或采样选项，续训时需明确提供。
 加载后会按当前fused/CUDA graph模式重新设置Adam标志、`step`所在设备和学习率类型，随后按当前调度计算学习率。
 
+### TensorBoard
+
+`--tensorboard {auto, on, off}`（默认`auto`：装有tensorboard时开启，它随mjlab安装）让主进程把每条日志同时写成TensorBoard标量，
+位于`LOG_DIR/tensorboard`：`train/<列名>`与`sampling/<列名>`，列名与`train_log.csv`、`sampling_log.csv`相同，步数为迭代数。
+只在记日志时写入，不增加GPU同步。恢复训练时，旧run在恢复点之后写下的事件会被隐藏（`purge_step`），曲线不会重叠；
+CSV仍照旧追加。没有开启TensorBoard的旧run可用`scripts/csv_to_tensorboard.py`从CSV补写同名标量，只读CSV，可在训练进行中运行、可重复运行。
+
+```bash
+uv run --frozen tensorboard --logdir logs
+```
+
 2026-10-22 本地验证：30 项测试通过，含真实双进程 Gloo 加权梯度/优化器一致性、
 全局归一化、分箱概率及单 rank 错误协调；真实索引双进程训练、5 样本的 3+2 拆分、
 critic 非整除小批次及 2→1→2 进程恢复均跑通。
@@ -267,6 +278,7 @@ RTX 5080 单卡回归、`--nproc-per-node=gpu` 自动启动和多进程检查点
 | `scripts/diag_compare_bins.py` | 汇总多次重放：短回合、片段末尾重置、难位置倾斜、采样集中度 |
 | `scripts/diag_wm_error.py` | 用检查点的策略按训练条件收集新rollout，测世界模型k步预测误差：物理单位逐分量，及几种候选标称误差下的归一化值 |
 | `scripts/watch_train.py` | 监督训练日志，出现异常、到达里程碑或训练结束时退出 |
+| `scripts/csv_to_tensorboard.py` | 把run的`train_log.csv`与`sampling_log.csv`写成TensorBoard标量，标签与`--tensorboard`相同 |
 
 ## 实现
 
@@ -316,6 +328,7 @@ scripts/
   diag_compare_bins.py
   diag_wm_error.py
   watch_train.py
+  csv_to_tensorboard.py
   smrun.sh
 tests/
   test_layout.py
@@ -327,6 +340,7 @@ tests/
   test_bin_returns.py
   test_learning_math.py
   test_compile_check.py
+  test_tensorboard_log.py
 ```
 
 | 路径 | 内容 |
