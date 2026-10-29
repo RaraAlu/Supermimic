@@ -45,7 +45,7 @@
 ```
 
 跨行括号用固定尺寸的`\Bigl`、`\Bigr`，避免把一对`\left`、`\right`拆到不同行。
-公式中的文字用`\text{...}`，运算符用`\operatorname{...}`或`\mathrm{...}`；
+公式中的文字用`\text{...}`，运算符名用`\mathrm{...}`（GitHub不允许`\operatorname`，会报“macros are not allowed”）；
 绝对值和范数用`\lvert...\rvert`、`\lVert...\rVert`，避免与Markdown表格的分隔符冲突。
 论文的公式编号使用`\tag{1}`等显式标签，并与正文引用保持一致。
 

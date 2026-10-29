@@ -126,7 +126,7 @@ $`d=0`$ 时跟踪目标就是当前参考帧，执行器滞后全靠预测补偿
 
 ```math
 \begin{aligned}
-a_t&=D\bigl(\operatorname{clip}(z_t+\sigma\epsilon,\,-1,\,1),\;o_{t-9:t}\bigr),\\
+a_t&=D\bigl(\mathrm{clip}(z_t+\sigma\epsilon,\,-1,\,1),\;o_{t-9:t}\bigr),\\
 \epsilon&\sim\mathcal N(0,I),\quad \sigma\in[0.05,0.1].
 \end{aligned}
 ```
@@ -147,7 +147,7 @@ a_t&=D\bigl(\operatorname{clip}(z_t+\sigma\epsilon,\,-1,\,1),\;o_{t-9:t}\bigr),\
 \begin{aligned}
 \mathcal L_1
 &=\bigl\lVert D(\hat z,o)-D(z_T,o)\bigr\rVert_2^2\\
-&\quad+\lambda_z\bigl\lVert\operatorname{atanh}(\hat z)-\operatorname{atanh}(z_T)\bigr\rVert_2^2.
+&\quad+\lambda_z\bigl\lVert\mathrm{atanh}(\hat z)-\mathrm{atanh}(z_T)\bigr\rVert_2^2.
 \end{aligned}
 ```
 

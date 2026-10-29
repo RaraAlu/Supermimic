@@ -1007,7 +1007,7 @@ u &= G'/G_{\max},\qquad G_{\max}=0.1/(1-\gamma).
 代码`BinSampler.scores`已经存归一化评分，对同一步结束于同一分箱的有效回合先取均值，再更新一次EMA：
 
 ```math
-\mathrm{bin\_G}_b\leftarrow0.8\,\mathrm{bin\_G}_b+0.2\,\operatorname{mean}(u)
+\mathrm{bin\_G}_b\leftarrow0.8\,\mathrm{bin\_G}_b+0.2\,\mathrm{mean}(u)
 ```
 
 没有有效结束回合的分箱不更新。这避免了重复CUDA索引覆盖的未定义结果。
