@@ -3,6 +3,8 @@
 Plays every clip of a motion source once from its first frame, exactly like
 supermimic/scripts/evaluate.py, and additionally records per clip the reward terms of the
 first control step (where a_prev = 0) and the normalized return without that step.
+Failures are counted as in evaluate.py, with the step that triggered termination and whether the goal was
+already truncated at the clip end.
 
 Run from the repository root; --src selects the source tree (default: this repository):
     python scripts/diag_first_step.py --src <src> --ckpt <ckpt.pt> --motion_source <subset.h5> --out <dir>
@@ -63,13 +65,16 @@ with torch.no_grad():
     env.reset(ids, motion.clip_start[ids].clone())
     hist = None
     step = 0
+    fail_f = torch.zeros(C, dtype=torch.long, device=dev)  # reference frame before the step that triggered termination
     while not bool(env.done_eval.all()):
         S = env.state()
         o = mdp.obs(S, env.a_prev, env.xi, env.f)
         hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
         a = pi(hist, motion.goal(env.f, K))
         alive = ~env.done_eval.clone()
+        f_prev, failed_prev = env.f.clone(), env.failed_eval.clone()
         out = env.step(a)
+        fail_f = torch.where(env.failed_eval & ~failed_prev, f_prev, fail_f)
         r, terms = out["r"], out["terms"]
         af = alive.float()
         rec["ret"] += r * af
@@ -96,6 +101,9 @@ elapsed = time.time() - t0
 
 denom = (motion.clip_len - 1).float() * MAX_STEP_REWARD
 failed = env.failed_eval.clone()
+# The goal uses frames f+1..f+K clamped at the clip end; when f + K exceeds it, the future reference is frozen.
+truncated = failed & (fail_f + K > clip_end)
+fail_step = torch.where(failed, fail_f - motion.clip_start[ids] + 1, 0)
 norm = rec["ret"] / denom
 norm_wo_first = (rec["ret"] - rec["r0"]) / ((motion.clip_len - 2).float() * MAX_STEP_REWARD)
 # counterfactual: same rollout, first step's action-smoothness penalty removed
@@ -113,6 +121,7 @@ def q(x, ps=(0.0, 0.1, 0.5, 0.9, 1.0)):
 summary = {
     "ckpt": args.ckpt, "iteration": ck.get("iteration"), "subject": subject.provenance(), "clips": C, "frames": int(motion.clip_len.sum()),
     "elapsed_s": round(elapsed, 1), "steps": step, "n_failed": int(failed.sum()),
+    "n_failed_guided": int((failed & ~truncated).sum()), "goal_frames": K,
     "norm_return": round(float(norm.mean()), 4),
     "norm_return_wo_first_step": round(float(norm_wo_first.mean()), 4),
     "norm_return_without_first_step_action_rate": round(float(norm_no_rate0.mean()), 4),
@@ -144,10 +153,10 @@ summary = {
 with open(out_dir / "per_clip.csv", "w", newline="", encoding="utf-8") as fh:
     w = csv.writer(fh)
     w.writerow(["name", "clip_len", "failed", "norm", "norm_wo_first", "norm_no_rate0", "r0_norm", "rate0_raw", "lim0_raw",
-                "a0_l2", "rate_rest_mean", "a_l2_rest_mean"])
+                "a0_l2", "rate_rest_mean", "a_l2_rest_mean", "fail_step", "goal_truncated"])
     for i in range(C):
         w.writerow([motion.names[i], int(motion.clip_len[i]), int(failed[i]), f"{norm[i]:.4f}", f"{norm_wo_first[i]:.4f}",
                     f"{norm_no_rate0[i]:.4f}", f"{rec['r0'][i] / MAX_STEP_REWARD:.4f}", f"{rec['rate0'][i]:.3f}",
                     f"{rec['lim0'][i]:.4f}", f"{rec['a0_norm'][i]:.3f}", f"{rec['rate_rest_sum'][i] / rest[i]:.4f}",
-                    f"{rec['a_norm_rest_sum'][i] / rest[i]:.3f}"])
+                    f"{rec['a_norm_rest_sum'][i] / rest[i]:.3f}", int(fail_step[i]), int(truncated[i])])
 print(json.dumps(summary, indent=2, ensure_ascii=False))

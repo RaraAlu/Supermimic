@@ -4,6 +4,8 @@
 Each motion plays once from its first frame with friction 1.0, no domain randomization, no
 observation or action noise. A motion fails if the rollout triggers the training termination.
 Normalized return is the undiscounted reward sum divided by its maximum attainable value.
+Failures are also counted without a truncated goal: if the action that triggered termination was computed
+from future reference frames clamped at the clip end (f + K beyond the clip end), it counts only toward n_failed.
 
 Run as a watcher: ``python -m supermimic.scripts.evaluate --run_dir logs/<run> --watch``.
 """
@@ -77,6 +79,8 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     ids = torch.arange(env.N, device=dev)
     ret = torch.zeros(C, device=dev)
     failed = torch.zeros(C, dtype=torch.bool, device=dev)
+    truncated = torch.zeros(C, dtype=torch.bool, device=dev)
+    fail_step = torch.zeros(C, dtype=torch.long, device=dev)
     traj = {"root_p": [], "root_quat": [], "q": [], "f": [], "alive": []}
     # A batch runs until its longest clip ends, so batches take clips longest-first to keep lengths
     # similar. A single batch keeps library order (trajectory recording relies on it).
@@ -95,6 +99,7 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
         env.done_eval[count:] = True
         clip_end = motion.clip_end[clips]
         batch_ret = torch.zeros(env.N, device=dev)
+        fail_f = torch.zeros(env.N, dtype=torch.long, device=dev)  # reference frame before the step that triggered termination
         hist = None
         while not bool(env.done_eval.all()):
             S = env.state()
@@ -107,17 +112,26 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
 
                 traj["root_p"].append(S[0].cpu()), traj["root_quat"].append(mat_to_quat(S[1]).cpu())
                 traj["q"].append(S[4].cpu()), traj["f"].append(env.f.cpu()), traj["alive"].append(alive.cpu())
+            f_prev, failed_prev = env.f.clone(), env.failed_eval.clone()
             out = env.step(a)
             batch_ret += torch.where(alive, out["r"], 0.0)
+            fail_f = torch.where(env.failed_eval & ~failed_prev, f_prev, fail_f)
             env.f = torch.minimum(env.f, clip_end - 1)
         ret[selected] = batch_ret[:count]
         failed[selected] = env.failed_eval[:count]
+        # The goal uses frames f+1..f+K clamped at the clip end; when f + K exceeds it, the future reference is frozen.
+        truncated[selected] = (env.failed_eval & (fail_f + K > clip_end))[:count]
+        fail_step[selected] = (fail_f - motion.clip_start[clips] + 1)[:count]
     norm = ret / ((motion.clip_len - 1).float() * MAX_STEP_REWARD)
     res = {
         "norm_return": norm.mean().item(),
         "norm_return_framew": (ret.sum() / ((motion.clip_len - 1).sum() * MAX_STEP_REWARD)).item(),
         "n_failed": int(failed.sum().item()),
         "failed": [motion.names[i] for i in failed.nonzero().flatten().tolist()],
+        "n_failed_guided": int((failed & ~truncated).sum().item()),
+        "failed_goal_truncated": [motion.names[i] for i in truncated.nonzero().flatten().tolist()],
+        # transition (from 1) that triggered termination, and the clip's total transitions
+        "fail_step": {motion.names[i]: [int(fail_step[i]), int(motion.clip_len[i]) - 1] for i in failed.nonzero().flatten().tolist()},
         "reference": motion.description,
         "per_clip": {motion.names[i]: round(norm[i].item(), 4) for i in range(C)},
     }
@@ -169,7 +183,8 @@ while True:
         line = f"{it},{ck['wall_time'] / 3600:.4f},{ck['saved_at']},{time.strftime('%Y-%m-%d %H:%M:%S')},{res['norm_return']:.4f},{res['norm_return_framew']:.4f},{res['n_failed']},{'|'.join(res['failed'])}\n"
         open(out_csv, "a", encoding="utf-8").write(line)
         json.dump(res, open(c.replace(".pt", "_eval.json"), "w", encoding="utf-8"), indent=1)
-        print(f"[eval] it {it} ({ck['wall_time'] / 3600:.2f} h): norm return {res['norm_return']:.4f}, failed {res['n_failed']}/{C} ({time.time() - t0:.0f}s)", flush=True)
+        print(f"[eval] it {it} ({ck['wall_time'] / 3600:.2f} h): norm return {res['norm_return']:.4f}, failed {res['n_failed']}/{C}, "
+              f"excluding truncated goal {res['n_failed_guided']} ({time.time() - t0:.0f}s)", flush=True)
         done.add(it)
     if not args.watch:
         break

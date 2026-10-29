@@ -408,7 +408,7 @@ tests/
 | `supermimic/utils/distributed.py` | 进程/设备绑定、协调错误、梯度平均与全局统计同步 |
 | `supermimic/utils/run_log.py` | 训练日志：每组一份CSV，可选同时写TensorBoard标量 |
 | `supermimic/tasks/tracking/constants.py` | 动作数据关节顺序与跟踪目标，不定义机器人配置 |
-| `supermimic/scripts/evaluate.py` | 附录F.1评估：逐原始段首帧播放、失败计数、两种归一化回报 |
+| `supermimic/scripts/evaluate.py` | 附录F.1评估：逐原始段首帧播放、失败计数（另计不含目标截断的失败）、两种归一化回报 |
 | `scripts/` | 数据下载、离线数据验证、仿真自检、compile/CUDA graph一致性检查、训练剖析与基准、重置采样诊断与训练监督 |
 | `tests/` | 无GPU的结构、HDF5/FK数值、数据选择与分批评估回归；数值测试使用项目依赖 |
 
