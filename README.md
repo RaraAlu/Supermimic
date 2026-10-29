@@ -436,6 +436,7 @@ uv run --frozen python -B -m unittest discover -s tests -v
 | [docs/analysis/paper_two_gpu.md](docs/analysis/paper_two_gpu.md) | 双卡短测：表A.5批量口径的两种解读与实测耗时 |
 | [docs/analysis/doc_code_audit.md](docs/analysis/doc_code_audit.md) | 2026-10-28文档与代码逐项核对：差异、实现依据、修正与验证边界 |
 | [docs/troubleshooting/README.md](docs/troubleshooting/README.md) | 问题与解决记录：重置采样四轮课程跑偏、训练指标判读与监督、性能优化中的正确性问题、平台与远程运维 |
+| [docs/teleop/README.md](docs/teleop/README.md) | 实时遥操作：与Teleopit对接，因果意图编码器（方案D）设计 |
 | [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) | 第三方代码许可与出处 |
 | [CONTRIBUTORS.md](CONTRIBUTORS.md) | 贡献者名单、AI 编码代理署名与提交模板约定 |
 
