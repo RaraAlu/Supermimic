@@ -45,7 +45,7 @@ cks = {Path(p).stem: torch.load(p, map_location="cpu", weights_only=False) for p
 a0 = next(iter(cks.values()))["args"]
 K, Hh, HZ, gamma, lam = a0["goal_frames"], a0["hist"], a0["horizon"], a0["gamma"], a0["lam"]
 subject.set_amp(a0)
-motion, mdp = subject.reference(args.motion_source)
+motion, mdp = subject.reference(args.motion_source, a0)
 models = {name: (subject.world_model(ck), subject.policy(ck), subject.critic(ck)) for name, ck in cks.items()}
 survival_prob = subject.survival_prob(mdp)
 

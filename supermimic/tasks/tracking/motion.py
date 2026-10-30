@@ -22,6 +22,13 @@ GOAL_FRAME_DIM = 3 + 6 + 3 + 3 + NUM_J + NUM_J
 BIN_FRAMES = 50  # 用于基于回报的重置采样，每箱 1 秒
 MIN_TAIL_STARTS = BIN_FRAMES // 2  # 过短的末箱并入前一箱
 FK_CHUNK = 65536
+# 片段末尾之后的目标延拓（--goal_tail，不是论文的设置；见docs/analysis/reference_continuation.md第4–5节与10.1节）。
+# clamp为论文做法：未来帧截断在末帧。其余模式在每段末帧之后预存若干虚拟帧，只有goal()会读到；回合仍在真实末帧结束。
+# hold保持末帧且速度为0；stand用min-jerk在TAIL_BLEND秒内过渡到默认姿态、根高TAIL_STAND_Z，水平位置移到末帧的捕获点；
+# auto每段离线判定一次：捕获点落在末帧着地集合（低于TAIL_CONTACT_Z的跟踪刚体按TAIL_FOOT_R外扩）的凸包内、
+# 根位置也在支撑内的保持末帧，其余原地站立；根高低于TAIL_LOW_Z的低姿态结尾一律保持。
+GOAL_TAILS = ("clamp", "hold", "stand", "auto")
+TAIL_BLEND, TAIL_STAND_Z, TAIL_CONTACT_Z, TAIL_FOOT_R, TAIL_EPS, TAIL_LOW_Z = 0.4, 0.79, 0.10, 0.06, 0.02, 0.6
 
 
 def bin_counts(lengths: torch.Tensor) -> torch.Tensor:
@@ -76,6 +83,33 @@ def resolve_motion_args(args, saved=None):
             setattr(args, key, str(Path(value).expanduser().resolve()))
 
 
+def _hull_outside(x: np.ndarray, pts: np.ndarray) -> float:
+    """点x到二维点集pts凸包的外距：在凸包内为0，凸包外为各边外法向的最大有向距离；不足三点或共线时为到线段的距离。"""
+    if len(pts) == 0:
+        return float("inf")
+    pts = np.unique(pts, axis=0)
+    pts = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+    cross = lambda o, a, b: (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])  # noqa: E731
+    lower, upper = [], []
+    for pt in pts:  # Andrew单调链，逆时针
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], pt) <= 0:
+            lower.pop()
+        lower.append(pt)
+    for pt in pts[::-1]:
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], pt) <= 0:
+            upper.pop()
+        upper.append(pt)
+    hull = np.array(lower[:-1] + upper[:-1]) if len(pts) > 1 else pts  # 只有一个不同点时两条链都为空
+    if len(hull) < 3:
+        a, b = hull[0], hull[-1]
+        ab = b - a
+        t = 0.0 if not ab.any() else float(np.clip(np.dot(x - a, ab) / np.dot(ab, ab), 0, 1))
+        return float(np.linalg.norm(x - (a + t * ab)))
+    edge = np.roll(hull, -1, axis=0) - hull
+    normal = np.stack((edge[:, 1], -edge[:, 0]), -1) / np.linalg.norm(edge, axis=-1, keepdims=True)
+    return float(max(((x - hull) * normal).sum(-1).max(), 0.0))
+
+
 def check_reference(current, saved):
     """检查当前参考数据指纹是否与保存的运行或检查点一致。"""
     if saved and current["fingerprint"] != saved["fingerprint"]:
@@ -85,8 +119,8 @@ def check_reference(current, saved):
 class MotionLib:
     """管理分片后的参考动作、派生运动学量、重置分箱和目标特征。"""
     def __init__(self, files: list[str], kin: G1Kinematics, device: str, src_fps: float = 30.0,
-                 rank=0, world_size=1):
-        """从动作 CSV 读取并重采样片段，构建当前进程的参考动作库。"""
+                 rank=0, world_size=1, goal_tail: str = "clamp", tail_frames: int = 0):
+        """从动作 CSV 读取并重采样片段，构建当前进程的参考动作库。goal_tail与tail_frames见GOAL_TAILS（_build）。"""
         from supermimic.tasks.tracking.motion_hdf5 import file_sha256, validate_pose_arrays
 
         if not files or src_fps <= 0:
@@ -119,7 +153,7 @@ class MotionLib:
                             "selected_clips": len(clips), "fingerprint": digest}
         lens = [len(p) for p, _, _ in clips]
         ids = self._select(lens, rank, world_size)
-        self._build([names[i] for i in ids], [lens[i] for i in ids], (clips[i] for i in ids), kin, device)
+        self._build([names[i] for i in ids], [lens[i] for i in ids], (clips[i] for i in ids), kin, device, goal_tail, tail_frames)
 
     def _select(self, lens, rank, world_size):
         """按片段长度将完整动作分配到各进程，并选择本进程的片段。"""
@@ -143,15 +177,23 @@ class MotionLib:
                                 shorter_than_33_frames=sum(lens[i] < 33 for i in ids), partition=self.partition)
         return ids
 
-    def _build(self, names, lens, clips, kin, device):
-        """从选定片段构建设备上的参考状态、运动学结果和重置分箱。"""
+    def _build(self, names, lens, clips, kin, device, goal_tail="clamp", tail_frames=0):
+        """从选定片段构建设备上的参考状态、运动学结果和重置分箱。
+
+        goal_tail不为clamp时每段末帧之后预存tail_frames个虚拟帧（至少要覆盖目标帧数K）：clip_start按存储长度累加，
+        clip_end仍是真实末帧，clip_id覆盖虚拟帧，future_frames截断在goal_end。clamp时存储与之前完全相同。"""
+        if goal_tail not in GOAL_TAILS or tail_frames < 0 or goal_tail != "clamp" and tail_frames < 1:
+            raise ValueError(f"goal_tail must be one of {GOAL_TAILS}, with tail_frames >= 1 unless clamp")
         self.device, self.names = device, names
-        self.num_frames = int(sum(lens))
+        extra = tail_frames if goal_tail != "clamp" else 0
+        stored_lens = [n + extra for n in lens]
+        self.num_frames = int(sum(stored_lens))
         tracked = len(kin.tracked_idx)
         per_frame = reference_bytes_per_frame(tracked)
         estimate = self.num_frames * per_frame
-        self.global_description["reference_tensor_bytes"] = self.global_description["selected_frames"] * per_frame
-        self.description.update(selected_frames=self.num_frames, reference_tensor_bytes=estimate)
+        global_stored = self.global_description["selected_frames"] + extra * self.global_description["selected_clips"]
+        self.global_description["reference_tensor_bytes"] = global_stored * per_frame
+        self.description.update(selected_frames=int(sum(lens)), reference_tensor_bytes=estimate)
         if torch.device(device).type == "cuda":
             free, _ = torch.cuda.mem_get_info(torch.device(device))
             if estimate * 1.1 + 2 * 1024**3 > free:
@@ -163,10 +205,12 @@ class MotionLib:
         # 将完整片段拼接到一条存储轴；clip_end 是末帧的包含式索引，
         # 与用于数组切片的右开边界不同。
         lengths = torch.tensor(lens, dtype=torch.long, device=device)
+        stored = torch.tensor(stored_lens, dtype=torch.long, device=device)
         self.clip_len = lengths
-        self.clip_start = torch.cumsum(lengths, 0) - lengths
+        self.clip_start = torch.cumsum(stored, 0) - stored
         self.clip_end = self.clip_start + lengths - 1
-        self.clip_id = torch.repeat_interleave(torch.arange(len(lens), device=device), lengths)
+        self.goal_end = self.clip_end + extra  # 未来目标帧的上界；clamp时等于clip_end
+        self.clip_id = torch.repeat_interleave(torch.arange(len(lens), device=device), stored)
         for key, shape in (("root_p", (3,)), ("root_quat", (4,)), ("root_v", (3,)),
                            ("root_w", (3,)), ("q", (NUM_J,)), ("qd", (NUM_J,))):
             setattr(self, key, torch.empty((self.num_frames, *shape), device=device))
@@ -190,9 +234,22 @@ class MotionLib:
             part = slice(offset, offset + expected)
             for key, value in (("root_p", p), ("root_quat", mat_to_quat(R)), ("root_v", v), ("root_w", w), ("q", j), ("qd", qd)):
                 getattr(self, key)[part] = value.to(device)
-            offset += expected
+            if extra:  # 先全部保持末帧（速度为0），stand/auto再改写判为站立的片段
+                tail = slice(offset + expected, offset + expected + extra)
+                zero3 = torch.zeros(extra, 3)
+                for key, value in (("root_p", p[-1].expand(extra, 3)), ("root_quat", mat_to_quat(R[-1]).expand(extra, 4)),
+                                   ("root_v", zero3), ("root_w", zero3), ("q", j[-1].expand(extra, NUM_J)),
+                                   ("qd", torch.zeros(extra, NUM_J))):
+                    getattr(self, key)[tail] = value.to(device)
+            offset += expected + extra
         if offset != self.num_frames:
             raise ValueError("source did not yield every selected clip")
+        self.tail_stand = torch.zeros(len(lens), dtype=torch.bool, device=device)  # 末尾延拓为原地站立的片段
+        if extra and goal_tail != "hold":
+            self._stand_tail(kin, extra, goal_tail == "stand")
+        tail_info = {"mode": goal_tail, "frames": extra, "stand_clips": int(self.tail_stand.sum())}
+        self.description["goal_tail"] = tail_info
+        self.global_description["goal_tail"] = {"mode": goal_tail, "frames": extra}
         for key, shape in (("body_p", (tracked, 3)), ("body_quat", (tracked, 4)),
                            ("body_v", (tracked, 3)), ("body_w", (tracked, 3)),
                            ("root_v_local", (3,)), ("root_w_local", (3,))):
@@ -229,17 +286,61 @@ class MotionLib:
             local = (torch.arange(start, end, device=device) - self.clip_start[ids]) // BIN_FRAMES
             self.frame_bin[start:end] = first_bin[ids] + torch.minimum(local, counts[ids] - 1)
 
+    @torch.no_grad()
+    def _stand_tail(self, kin, extra: int, every_clip: bool):
+        """把判为原地站立的片段（every_clip为真时是全部片段）的虚拟帧改写为站立延拓，见GOAL_TAILS。"""
+        ends, dev = self.clip_end, self.device
+        p, quat, v = self.root_p[ends], self.root_quat[ends], self.root_v[ends]
+        R, q = quat_to_mat(quat), self.q[ends]
+        # 捕获点 ξ = x + v / ω0，ω0 = sqrt(g / z)；质心用根位置近似
+        omega0 = torch.sqrt(9.81 / p[:, 2].clamp(min=0.3))
+        xi = p[:, :2] + v[:, :2] / omega0[:, None]
+        if every_clip:
+            use = torch.ones(len(ends), dtype=torch.bool, device=dev)
+        else:
+            bodies = kin.forward(p, R, v, self.root_w[ends], q, self.qd[ends])[0]  # (片段数, 跟踪刚体, 3)
+            low = (bodies[..., 2] < TAIL_CONTACT_Z).cpu().numpy()
+            pts, xi_np, root_np = bodies[..., :2].cpu().numpy(), xi.cpu().numpy(), p[:, :2].cpu().numpy()
+            hold = np.array([_hull_outside(xi_np[i], pts[i][low[i]]) - TAIL_FOOT_R <= TAIL_EPS
+                             and _hull_outside(root_np[i], pts[i][low[i]]) <= TAIL_FOOT_R for i in range(len(ends))], dtype=bool)
+            use = torch.from_numpy(~hold).to(dev) & (p[:, 2] >= TAIL_LOW_Z)
+        self.tail_stand = use
+        sel = use.nonzero().squeeze(-1)
+        if len(sel) == 0:
+            return
+        p, quat, R, q, xi = p[sel], quat[sel], R[sel], q[sel], xi[sel]
+        m = len(sel)
+        # min-jerk插值 s(x) = 10x³ − 15x⁴ + 6x⁵，x = t / TAIL_BLEND，之后保持终点
+        x = (torch.arange(1, extra + 1, device=dev).float() * CONTROL_DT / TAIL_BLEND).clamp(max=1.0)
+        s = 10 * x**3 - 15 * x**4 + 6 * x**5
+        ds = torch.where(x < 1, (30 * x**2 - 60 * x**3 + 30 * x**4) / TAIL_BLEND, 0.0)
+        dxy, dz = xi - p[:, :2], TAIL_STAND_Z - p[:, 2]
+        P = p[:, None, :].repeat(1, extra, 1)
+        P[..., :2] += dxy[:, None] * s[None, :, None]
+        P[..., 2] += dz[:, None] * s[None, :]
+        V = torch.zeros(m, extra, 3, device=dev)
+        V[..., :2] = dxy[:, None] * ds[None, :, None]
+        V[..., 2] = dz[:, None] * ds[None, :]
+        Qt = quat_slerp(quat[:, None].expand(m, extra, 4), mat_to_quat(yaw_mat(R))[:, None].expand(m, extra, 4), s.expand(m, extra))
+        dq = kin.default_q - q
+        idx = ends[sel][:, None] + torch.arange(1, extra + 1, device=dev)
+        self.root_p[idx], self.root_quat[idx], self.root_v[idx] = P, Qt, V
+        self.root_w[idx] = 0.0
+        self.q[idx] = q[:, None] + dq[:, None] * s[None, :, None]
+        self.qd[idx] = dq[:, None] * ds[None, :, None]
+
     @staticmethod
     def from_dir(path: str, kin: G1Kinematics, device: str, limit: int | None = None,
-                 rank=0, world_size=1) -> MotionLib:
+                 rank=0, world_size=1, goal_tail="clamp", tail_frames=0) -> MotionLib:
         """从目录中的动作文件创建参考动作库。"""
         if limit is not None and limit < 1:
             raise ValueError("motion_limit must be positive")
         files = sorted(glob.glob(os.path.join(path, "*.csv")))
-        return MotionLib(files if limit is None else files[:limit], kin, device, rank=rank, world_size=world_size)
+        return MotionLib(files if limit is None else files[:limit], kin, device, rank=rank, world_size=world_size,
+                         goal_tail=goal_tail, tail_frames=tail_frames)
 
     @classmethod
-    def from_index(cls, path, kin, device, source_root=None, limit=None, rank=0, world_size=1):
+    def from_index(cls, path, kin, device, source_root=None, limit=None, rank=0, world_size=1, goal_tail="clamp", tail_frames=0):
         """从配对数据索引及其源片段创建参考动作库。"""
         from supermimic.tasks.tracking.motion_hdf5 import IndexedG1Dataset
 
@@ -249,11 +350,11 @@ class MotionLib:
         ids = instance._select([c.length for c in dataset.clips], rank, world_size)
         dataset.clips = [dataset.clips[i] for i in ids]
         instance._build([c.name for c in dataset.clips], [c.length for c in dataset.clips],
-                        dataset.iter_clips(), kin, device)
+                        dataset.iter_clips(), kin, device, goal_tail, tail_frames)
         return instance
 
     @classmethod
-    def from_source(cls, path, kin, device, limit=None, rank=0, world_size=1):
+    def from_source(cls, path, kin, device, limit=None, rank=0, world_size=1, goal_tail="clamp", tail_frames=0):
         """从单个合并 HDF5 源文件创建参考动作库。"""
         from supermimic.tasks.tracking.motion_hdf5 import MergedG1Dataset
 
@@ -263,21 +364,22 @@ class MotionLib:
         ids = instance._select([c.length for c in dataset.clips], rank, world_size)
         dataset.clips = [dataset.clips[i] for i in ids]
         instance._build([c.name for c in dataset.clips], [c.length for c in dataset.clips],
-                        dataset.iter_clips(), kin, device)
+                        dataset.iter_clips(), kin, device, goal_tail, tail_frames)
         return instance
 
     @classmethod
-    def from_args(cls, args, kin, device, rank=0, world_size=1):
+    def from_args(cls, args, kin, device, rank=0, world_size=1, goal_tail="clamp", tail_frames=0):
         """根据命令行中的数据源选项创建参考动作库。"""
+        tail = {"goal_tail": goal_tail, "tail_frames": tail_frames}
         if getattr(args, "motion_source", None):
-            return cls.from_source(args.motion_source, kin, device, args.motion_limit, rank, world_size)
+            return cls.from_source(args.motion_source, kin, device, args.motion_limit, rank, world_size, **tail)
         if args.motion_index:
-            return cls.from_index(args.motion_index, kin, device, args.motion_root, args.motion_limit, rank, world_size)
-        return cls.from_dir(args.motion_dir, kin, device, args.motion_limit, rank, world_size)
+            return cls.from_index(args.motion_index, kin, device, args.motion_root, args.motion_limit, rank, world_size, **tail)
+        return cls.from_dir(args.motion_dir, kin, device, args.motion_limit, rank, world_size, **tail)
 
     def future_frames(self, f: torch.Tensor, K: int) -> torch.Tensor:
-        """返回 f+1 到 f+K 的帧索引，超出片段末尾时截断，形状为 (B, K)。"""
-        end = self.clip_end[self.clip_id[f]]
+        """返回 f+1 到 f+K 的帧索引，超出goal_end时截断（clamp时即片段末帧，否则为最后一个虚拟帧），形状为 (B, K)。"""
+        end = self.goal_end[self.clip_id[f]]
         fut = f.unsqueeze(-1) + torch.arange(1, K + 1, device=f.device)
         return torch.minimum(fut, end.unsqueeze(-1))
 

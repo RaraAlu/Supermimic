@@ -28,6 +28,7 @@ class Subject:
             raise ImportError(f"supermimic was imported from {loaded}, not from --src {self.src}")
         self.device = device
         self.env_options = {}
+        self.goal_tail = None  # reference()载入后为实际的--goal_tail设置
         # dirty表示工作区有未提交的修改，此时commit不足以复现被测代码
         try:
             git = lambda *a: subprocess.check_output(["git", *a], cwd=self.src, text=True, stderr=subprocess.DEVNULL)  # noqa: E731
@@ -44,17 +45,29 @@ class Subject:
 
     def provenance(self) -> dict:
         """被测的源码与仿真选项，写入各脚本的summary.json。"""
-        return {"src": str(self.src), "commit": self.commit, "dirty": self.dirty, "env_options": self.env_options}
+        return {"src": str(self.src), "commit": self.commit, "dirty": self.dirty, "env_options": self.env_options,
+                "goal_tail": self.goal_tail}
 
     # ---------------- 参考动作与MDP ----------------
-    def reference(self, motion_source: str):
-        """合并源文件的MotionLib及其上的MDP。"""
+    def reference(self, motion_source: str, run_args: dict | None = None, goal_tail: str | None = None):
+        """合并源文件的MotionLib及其上的MDP。
+
+        片段末尾之后的目标（--goal_tail）取goal_tail，未给时取检查点run_args中的设置，都没有时为clamp（论文做法）。
+        旧源码树的MotionLib没有这个选项：要求clamp以外的模式时报错，否则照旧载入。实际设置记在self.goal_tail，由provenance()写出。"""
         from supermimic.tasks.tracking.mdp import MDP
         from supermimic.tasks.tracking.motion import MotionLib
         from supermimic.utils.kinematics import G1Kinematics
 
+        mode = goal_tail or (run_args or {}).get("goal_tail", "clamp")
         kin = G1Kinematics(self.device)
-        motion = MotionLib.from_source(motion_source, kin, self.device)
+        if "goal_tail" in inspect.signature(MotionLib.from_source).parameters:
+            motion = MotionLib.from_source(motion_source, kin, self.device, goal_tail=mode,
+                                           tail_frames=(run_args or {}).get("goal_frames", 10) if mode != "clamp" else 0)
+        elif mode != "clamp":
+            raise TypeError(f"MotionLib in {self.src} has no goal_tail option (requested {mode})")
+        else:
+            motion = MotionLib.from_source(motion_source, kin, self.device)
+        self.goal_tail = mode
         return motion, MDP(kin, motion, kin.default_q)
 
     @staticmethod

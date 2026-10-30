@@ -43,7 +43,7 @@ ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
 a_ = ck["args"]
 K, Hh, k = a_["goal_frames"], a_["hist"], args.window
 subject.set_amp(a_)
-motion, mdp = subject.reference(args.motion_source)
+motion, mdp = subject.reference(args.motion_source, a_)
 wm = subject.world_model(ck)
 pi = subject.policy(ck)
 

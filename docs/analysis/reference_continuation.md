@@ -1,7 +1,7 @@
 # 参考缺失时的目标延拓：统一框架设计
 
 - 范围：参考在片段末尾结束、实时流中断或延迟时，策略的未来目标、阶段切换、奖励、终止、存活概率、课程评分与评估如何统一定义。
-- 状态：设计稿，代码未进仓库。第1节的数字来自98k检查点的评估与对照；第1阶段已在Rara上做原型与可行性评估（10.1节），其余为待验证的方案。
+- 状态：第1阶段已实现为`--goal_tail`（默认`clamp`即论文口径，见10.2节）；第1节的数字来自98k检查点的评估与对照，10.1节是实现前的原型评估，第2阶段起为待验证的方案。
 - 相关：目标特征见[training_pipeline.md](training_pipeline.md)第9节与`MotionLib.goal`，重置采样见[reset_sampling.md](reset_sampling.md)，
   实时遥操作的参考时间线见[docs/teleop/causal_intent_encoder.md](../teleop/causal_intent_encoder.md)。
 - 与论文的关系：参考全部可用时，本框架逐位退化为现有（论文）的目标、奖励、终止与存活概率。启用延拓属于偏离论文的设置，结果须单独标注；
@@ -346,7 +346,28 @@ supermimic/tasks/tracking/mdp.py
 
 - 低姿态误判：捕获点判据把爬行结尾判成了原地站立，因此加了根高度低于0.6 m即保持末帧的保护。正式实现后须用第2阶段的全量评估再验证。
 - 判为站立的比例偏高（shard_008中38%）。其中多数为站立静止结尾，此时站立与保持末帧等价，但 $`h_c`$ 与脚底尺寸仍需校准。
-- 正式实现时，原型中的环境变量开关改为训练与评估参数（第8节`--goal_tail`），并写入检查点。
+- 正式实现时，原型中的环境变量开关改为训练与评估参数（第8节`--goal_tail`），并写入检查点（已完成，10.2节）。
+
+### 10.2 第1阶段的实现
+
+`--goal_tail {clamp, hold, stand, auto}`，`MotionLib`的`_build`与`_stand_tail`按10.1节的方式预存`--goal_frames`个虚拟帧：
+
+- `clamp`：存储与之前完全相同，`goal_end = clip_end`。
+- `hold`：虚拟帧为末帧，速度与角速度为0。
+- `stand`：所有片段都按4.2节过渡到原地站立，不判定，不加低姿态保护。
+- `auto`：按5.3节逐段离线判定，参数同10.1节原型；判为站立的段数写入参考描述`goal_tail.stand_clips`。
+
+训练把设置写入`args.json`与检查点；`evaluate.py`、`diag_first_step.py`与`eval_f1_shards.py`默认沿用检查点的设置，
+`--goal_tail`可在评估时改写，实际设置写入结果的参考描述与`summary.json`的`subject`。
+单元测试`tests/test_goal_tail.py`覆盖10节第1阶段列出的各项（`reward`、`termination`、`soft_survival`只读真实帧，没有改动）。
+
+验收（Rara，2026-10-30）：
+
+- 用库内实现重跑1.3节的34段（98k检查点，附录F.1条件）：`clamp`段内失败28段，`auto`为12段，与原型相同。
+  判为站立22段（原型23段）：爬行起步的结尾`crawl_ff_start_180_R_003__A128`正式实现判为保持末帧，原型的凸包在着地点共线时用的是近似，
+  判成了站立。另有两段判定相同而成败互换（`mohak_forward_start_003__A034`、`sit_cross_legged_stop_003__A062`），在F.1重复评估的波动范围内。
+- 512段子集，1024个环境×200次迭代，`--goal_tail auto`：3.00 it/s，与不开时相同；156段判为站立；`evaluate.py`与`diag_first_step.py`沿用并记录设置。
+- `check_compile_equiv.py`需要`torch.compile`，Rara没有triton，未运行；延拓只改参考数组的内容，不改编译的函数与张量形状。
 
 ## 11. 风险与未决问题
 

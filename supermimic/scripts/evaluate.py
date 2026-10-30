@@ -3,6 +3,7 @@
 
 每个动作从首帧播放一次，摩擦系数为 1.0，不使用域随机化、观测噪声或动作噪声；触发训练终止条件即视为失败。归一化回报为未折扣奖励之和除以可达到的最大值。
 另报告不计目标截断的失败数：触发终止的动作若由已截断在段末的未来参考算出（f + K 超过段末），这类失败只计入论文口径。
+--goal_tail默认沿用检查点的设置（旧检查点为clamp）；不为clamp时越过段末的目标换成虚拟帧，上面的“目标截断”仍按f + K超过段末计数。
 
 监听运行：python -m supermimic.scripts.evaluate --run_dir logs/<run> --watch。"""
 
@@ -32,6 +33,8 @@ parser.add_argument("--motion_root", type=str, default=None)
 parser.add_argument("--motion_limit", type=int, default=None)
 parser.add_argument("--eval_batch_size", type=int, default=4096, help="parallel environments per batch (paper: 4096 per GPU)")
 parser.add_argument("--every", type=int, default=1, help="evaluate every n-th checkpoint")
+parser.add_argument("--goal_tail", type=str, default=None, choices=["clamp", "hold", "stand", "auto"],
+                    help="goal frames past a clip's end (see train.py); default: the run's setting, clamp for older runs")
 parser.add_argument("--device", type=str, default="cuda:0")
 args = parser.parse_args()
 if int(os.environ.get("WORLD_SIZE", "1")) > 1:
@@ -55,8 +58,9 @@ initial_ck = torch.load(args.ckpt, map_location="cpu") if args.ckpt else None
 run_args = Path(args.run_dir) / "args.json"
 saved_args = initial_ck["args"] if initial_ck else json.loads(run_args.read_text(encoding="utf-8"))
 resolve_motion_args(args, saved_args)
+goal_tail = args.goal_tail or saved_args.get("goal_tail", "clamp")
 kin = G1Kinematics(dev)
-motion = MotionLib.from_args(args, kin, dev)
+motion = MotionLib.from_args(args, kin, dev, goal_tail=goal_tail, tail_frames=saved_args["goal_frames"])
 mdp = MDP(kin, motion, kin.default_q)
 C = len(motion.names)
 if args.record and C > args.eval_batch_size:

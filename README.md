@@ -262,6 +262,13 @@ F为0时训练日志里没有确定性表现，用`evaluate.py --watch`或`scrip
 
 `--bin_clip_cap C`（默认0，与论文相同；不是论文的设置）限制重置分布40%困难度部分中单个片段的份额不超过C（例如0.01），超出部分按比例分给其他片段，做法见[重置采样分析](docs/analysis/reset_sampling.md)第4节。并另写`clipcap_log.csv`（TensorBoard标签`clipcap/<列名>`），与`train_log.csv`同频，记日志那一刻的快照：单个片段最大的重置概率`clip_top1`（含50%均匀部分，长片段本来就较大）、削平前困难度部分中最大的片段份额`hard_clip_top1_raw`、被削到上限的片段数`capped_clips`。
 
+`--goal_tail {clamp, hold, stand, auto}`（默认`clamp`，与论文相同；其余不是论文的设置）决定未来目标越过片段末帧时的取值。
+`clamp`重复末帧；其余在载入时给每段末帧之后预存`--goal_frames`个虚拟帧，只有`goal()`会读到：`hold`保持末帧、速度为0；
+`stand`在0.4 s内以min-jerk过渡到默认关节角、根高0.79 m，水平位置移到末帧的捕获点；`auto`按末帧捕获点是否落在着地刚体的支撑范围内逐段选择，
+根高低于0.6 m的结尾一律保持末帧。回合仍在真实末帧结束，真实帧、段内目标与重置分箱都不变，每步计算量与`clamp`相同，参考库约多3%显存。
+该设置写入检查点：`evaluate.py`与回放检查点的诊断脚本默认沿用它（旧检查点为`clamp`），`--goal_tail`可在评估时改用别的方式。
+设计、判据与原型评估见[参考缺失时的目标延拓](docs/analysis/reference_continuation.md)。
+
 `--keep_states N`（默认3）保留`last.pt`与前N−1次保存`last_prev1.pt`、`last_prev2.pt`……（硬链接，不额外占写入），
 崩溃前的完整状态不会被紧接着的下一次保存覆盖；都是可直接`--resume`的完整状态。
 
@@ -399,6 +406,7 @@ tests/
   test_learning_math.py
   test_compile_check.py
   test_tensorboard_log.py
+  test_goal_tail.py
 ```
 
 | 路径 | 内容 |

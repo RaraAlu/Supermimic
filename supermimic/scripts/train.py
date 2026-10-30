@@ -21,6 +21,10 @@ parser.add_argument("--buffer_steps", type=int, default=1000)
 parser.add_argument("--utd", type=float, default=0.4, help="updates per vectorized simulator step")
 parser.add_argument("--horizon", type=int, default=32)
 parser.add_argument("--goal_frames", type=int, default=10)
+parser.add_argument("--goal_tail", type=str, default="clamp", choices=["clamp", "hold", "stand", "auto"],
+                    help="future goal frames past a clip's last frame: clamped to it (clamp, the paper), the last frame held "
+                         "at rest (hold), standing in place (stand), or hold/stand chosen per clip by a capture-point test "
+                         "(auto); not in the paper except clamp. Episodes still end at the clip's last frame")
 parser.add_argument("--hist", type=int, default=10)
 parser.add_argument("--wm_window", type=int, default=8)
 parser.add_argument("--wm_batches", type=int, default=10)
@@ -146,7 +150,7 @@ def setup(argv: list[str] | None = None):
     # 每卡载入自己的完整片段分片；先确认存在足够长的片段，再进入需要固定时域的训练。
     with parallel.coordinated("reference loading"):
         kin = G1Kinematics(dev)
-        motion = MotionLib.from_args(args, kin, dev, parallel.rank, parallel.world_size)
+        motion = MotionLib.from_args(args, kin, dev, parallel.rank, parallel.world_size, args.goal_tail, args.goal_frames)
         if resume_ck:
             check_reference(motion.global_description, resume_ck.get("reference"))
         if not bool((motion.clip_len > args.horizon).any()):

@@ -19,6 +19,8 @@ parser.add_argument("--motion_source", required=True)
 parser.add_argument("--out", required=True)
 parser.add_argument("--device", default="cuda:0")
 parser.add_argument("--transient_steps", type=int, default=20)
+parser.add_argument("--goal_tail", default=None, choices=["clamp", "hold", "stand", "auto"],
+                    help="goal frames past a clip's end (see train.py); default: the checkpoint's setting, clamp for older ones")
 args = parser.parse_args()
 subject = _subject.Subject(args.src, args.device)
 
@@ -36,7 +38,7 @@ ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
 a_ = ck["args"]
 K, Hh = a_["goal_frames"], a_["hist"]
 subject.set_amp(a_)
-motion, mdp = subject.reference(args.motion_source)
+motion, mdp = subject.reference(args.motion_source, a_, args.goal_tail)
 C = len(motion.names)
 pi = subject.policy(ck)
 w_rate, w_lim = RewardCfg.w_action_rate, RewardCfg.w_joint_limit
