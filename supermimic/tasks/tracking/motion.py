@@ -110,6 +110,27 @@ def _hull_outside(x: np.ndarray, pts: np.ndarray) -> float:
     return float(max(((x - hull) * normal).sum(-1).max(), 0.0))
 
 
+def load_csv(path: str, src_fps: float = 30.0):
+    """读取一段动作CSV（每行根位置xyz、根四元数xyzw、29个关节角）并线性/球面插值重采样到50 Hz，返回(位置, 四元数wxyz, 关节角)。"""
+    from supermimic.tasks.tracking.motion_hdf5 import validate_pose_arrays
+
+    raw = torch.tensor(np.loadtxt(path, delimiter=",", ndmin=2), dtype=torch.float32)
+    if raw.shape[1] < 36:
+        raise ValueError(f"{path}: expected at least 36 CSV columns")
+    p, q_xyzw, j = raw[:, :3], raw[:, 3:7], raw[:, 7:36]
+    quat = torch.cat((q_xyzw[:, 3:4], q_xyzw[:, :3]), -1)
+    validate_pose_arrays(p.numpy(), quat.numpy(), j.numpy(), path)
+    T_src = raw.shape[0]
+    dur = (T_src - 1) / src_fps
+    n = int(np.floor(dur / CONTROL_DT)) + 1
+    t = torch.arange(n, dtype=torch.float32) * CONTROL_DT * src_fps
+    i0 = torch.clamp(t.floor().long(), max=T_src - 2)
+    a = (t - i0.float()).clamp(0, 1)
+    p = p[i0] * (1 - a[:, None]) + p[i0 + 1] * a[:, None]
+    j = j[i0] * (1 - a[:, None]) + j[i0 + 1] * a[:, None]
+    return p, quat_slerp(quat[i0], quat[i0 + 1], a), j
+
+
 def check_reference(current, saved):
     """检查当前参考数据指纹是否与保存的运行或检查点一致。"""
     if saved and current["fingerprint"] != saved["fingerprint"]:
@@ -121,30 +142,12 @@ class MotionLib:
     def __init__(self, files: list[str], kin: G1Kinematics, device: str, src_fps: float = 30.0,
                  rank=0, world_size=1, goal_tail: str = "clamp", tail_frames: int = 0):
         """从动作 CSV 读取并重采样片段，构建当前进程的参考动作库。goal_tail与tail_frames见GOAL_TAILS（_build）。"""
-        from supermimic.tasks.tracking.motion_hdf5 import file_sha256, validate_pose_arrays
+        from supermimic.tasks.tracking.motion_hdf5 import file_sha256
 
         if not files or src_fps <= 0:
             raise ValueError("need at least one CSV motion and a positive source FPS")
         names = [os.path.splitext(os.path.basename(f))[0] for f in files]
-        clips = []
-        for f in files:
-            raw = torch.tensor(np.loadtxt(f, delimiter=",", ndmin=2), dtype=torch.float32)
-            if raw.shape[1] < 36:
-                raise ValueError(f"{f}: expected at least 36 CSV columns")
-            p, q_xyzw, j = raw[:, :3], raw[:, 3:7], raw[:, 7:36]
-            quat = torch.cat((q_xyzw[:, 3:4], q_xyzw[:, :3]), -1)
-            validate_pose_arrays(p.numpy(), quat.numpy(), j.numpy(), f)
-            # 重采样至 50 Hz
-            T_src = raw.shape[0]
-            dur = (T_src - 1) / src_fps
-            n = int(np.floor(dur / CONTROL_DT)) + 1
-            t = torch.arange(n, dtype=torch.float32) * CONTROL_DT * src_fps
-            i0 = torch.clamp(t.floor().long(), max=T_src - 2)
-            a = (t - i0.float()).clamp(0, 1)
-            p = p[i0] * (1 - a[:, None]) + p[i0 + 1] * a[:, None]
-            j = j[i0] * (1 - a[:, None]) + j[i0 + 1] * a[:, None]
-            quat = quat_slerp(quat[i0], quat[i0 + 1], a)
-            clips.append((p, quat, j))
+        clips = [load_csv(f, src_fps) for f in files]
         digest = hashlib.sha256(json.dumps(
             {"csv": [(os.path.basename(f), file_sha256(Path(f))) for f in files], "fps": src_fps},
             sort_keys=True,
