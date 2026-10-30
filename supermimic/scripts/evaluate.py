@@ -1,14 +1,10 @@
-# Ported from zita-ch/supermimic_vibed (MIT, Copyright (c) 2026 ETH Zurich, Chong Zhang); see THIRD_PARTY_NOTICES.md.
-"""Checkpoint evaluation (paper Appendix F.1) on all motions of the library.
+# 移植自 zita-ch/supermimic_vibed（MIT，Copyright (c) 2026 ETH Zurich, Chong Zhang）；详见 THIRD_PARTY_NOTICES.md。
+"""在动作库的全部动作上评估检查点（论文附录 F.1）。
 
-Each motion plays once from its first frame with friction 1.0, no domain randomization, no
-observation or action noise. A motion fails if the rollout triggers the training termination.
-Normalized return is the undiscounted reward sum divided by its maximum attainable value.
-Failures are also counted without a truncated goal: if the action that triggered termination was computed
-from future reference frames clamped at the clip end (f + K beyond the clip end), it counts only toward n_failed.
+每个动作从首帧播放一次，摩擦系数为 1.0，不使用域随机化、观测噪声或动作噪声；触发训练终止条件即视为失败。归一化回报为未折扣奖励之和除以可达到的最大值。
+另报告不计目标截断的失败数：触发终止的动作若由已截断在段末的未来参考算出（f + K 超过段末），这类失败只计入论文口径。
 
-Run as a watcher: ``python -m supermimic.scripts.evaluate --run_dir logs/<run> --watch``.
-"""
+监听运行：python -m supermimic.scripts.evaluate --run_dir logs/<run> --watch。"""
 
 from __future__ import annotations
 
@@ -69,6 +65,7 @@ if args.record and C > args.eval_batch_size:
 
 @torch.no_grad()
 def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
+    """从参考片段首帧评估策略，汇总各片段回报和成功情况，并按需记录轨迹。"""
     check_reference(motion.description, ck.get("reference"))
     a_ = ck["args"]
     K, Hh = a_["goal_frames"], a_["hist"]
@@ -82,8 +79,8 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     truncated = torch.zeros(C, dtype=torch.bool, device=dev)
     fail_step = torch.zeros(C, dtype=torch.long, device=dev)
     traj = {"root_p": [], "root_quat": [], "q": [], "f": [], "alive": []}
-    # A batch runs until its longest clip ends, so batches take clips longest-first to keep lengths
-    # similar. A single batch keeps library order (trajectory recording relies on it).
+    # 一个批次运行到最长片段结束，因此按长度降序分批以减少片段长度差异。
+    # 只有一个批次时保留动作库顺序，轨迹记录依赖该顺序。
     if C <= env.N:
         order = torch.arange(C, device=dev)
     else:
@@ -91,7 +88,7 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     for start in range(0, C, env.N):
         count = min(env.N, C - start)
         selected = order[start:start + count]
-        # Pad the last batch with an inactive duplicate; it never enters the scores.
+        # 用不活跃的重复片段填充最后一个批次；该片段不计入评分。
         clips = torch.cat((selected, selected[-1:].expand(env.N - count)))
         env.done_eval[:] = False
         env.failed_eval[:] = False
@@ -99,13 +96,14 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
         env.done_eval[count:] = True
         clip_end = motion.clip_end[clips]
         batch_ret = torch.zeros(env.N, device=dev)
-        fail_f = torch.zeros(env.N, dtype=torch.long, device=dev)  # reference frame before the step that triggered termination
+        fail_f = torch.zeros(env.N, dtype=torch.long, device=dev)  # 触发终止那一步推进前的参考帧
         hist = None
         while not bool(env.done_eval.all()):
             S = env.state()
             o = mdp.obs(S, env.a_prev, env.xi, env.f)
             hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
             a = pi(hist, motion.goal(env.f, K))
+            # 保存推进前的活跃掩码，使触发终止的当前步奖励仍计入回报，之后各步不再计入。
             alive = ~env.done_eval.clone()
             if record:
                 from supermimic.utils.rotations import mat_to_quat
@@ -116,12 +114,14 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
             out = env.step(a)
             batch_ret += torch.where(alive, out["r"], 0.0)
             fail_f = torch.where(env.failed_eval & ~failed_prev, f_prev, fail_f)
+            # 已结束环境仍随批次推进，钳住参考索引以便下一次 step 的 f+1 不越过片段末尾。
             env.f = torch.minimum(env.f, clip_end - 1)
         ret[selected] = batch_ret[:count]
         failed[selected] = env.failed_eval[:count]
-        # The goal uses frames f+1..f+K clamped at the clip end; when f + K exceeds it, the future reference is frozen.
+        # 目标取f+1..f+K帧并在段末截断；f + K超过段末时策略看到的未来参考已停在末帧。
         truncated[selected] = (env.failed_eval & (fail_f + K > clip_end))[:count]
         fail_step[selected] = (fail_f - motion.clip_start[clips] + 1)[:count]
+    # 每片段最多有长度减一条转移；同时报告片段等权均值与按帧数加权的总体回报。
     norm = ret / ((motion.clip_len - 1).float() * MAX_STEP_REWARD)
     res = {
         "norm_return": norm.mean().item(),
@@ -130,7 +130,7 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
         "failed": [motion.names[i] for i in failed.nonzero().flatten().tolist()],
         "n_failed_guided": int((failed & ~truncated).sum().item()),
         "failed_goal_truncated": [motion.names[i] for i in truncated.nonzero().flatten().tolist()],
-        # transition (from 1) that triggered termination, and the clip's total transitions
+        # 第几步转移触发终止（1起），以及该段的总转移数
         "fail_step": {motion.names[i]: [int(fail_step[i]), int(motion.clip_len[i]) - 1] for i in failed.nonzero().flatten().tolist()},
         "reference": motion.description,
         "per_clip": {motion.names[i]: round(norm[i].item(), 4) for i in range(C)},
@@ -143,6 +143,7 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
 
 
 def make_env() -> TrackingSim:
+    """创建批量大小受配置限制的评估环境。"""
     return TrackingSim(min(C, args.eval_batch_size), motion, mdp, dev, eval_mode=True)
 
 

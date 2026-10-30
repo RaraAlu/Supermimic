@@ -1,4 +1,4 @@
-"""Read full G1 source clips selected by a paired-data index, without editing either."""
+"""依据配对数据索引读取完整 G1 源动作片段，不修改索引或源数据。"""
 
 from __future__ import annotations
 
@@ -20,18 +20,19 @@ ARRAY_SHAPES = {"root_pos": 3, "root_quat_w": 4, "joint_pos": NUM_J}
 
 
 def reference_bytes_per_frame(tracked: int) -> int:
-    """Resident reference bytes per frame: root p/quat/v/w, q, qd, root-frame v/w, per-body p/quat/v/w, two int64 maps."""
+    """估算每帧常驻参考数据的字节数：根部位置、四元数和速度，关节状态，根系速度，各刚体状态及两个 int64 映射。"""
     return 4 * (3 + 4 + 3 + 3 + NUM_J + NUM_J + 3 + 3 + tracked * (3 + 4 + 3 + 3)) + 16
 
 
 def partition_clips(lengths, world_size):
-    """Deterministic longest-first packing, preserving whole source clips."""
+    """按片段长度从长到短确定性地分配，保持每个源片段完整。"""
     if world_size < 1 or len(lengths) < world_size or any(n < 2 for n in lengths):
         raise ValueError("need at least one complete motion (>=2 frames) per rank")
     if world_size == 1:
         return [list(range(len(lengths)))]
     groups = [[] for _ in range(world_size)]
     heap = [(0, rank) for rank in range(world_size)]
+    # 最长片段优先放到当前总帧数最少的进程；以原索引和进程号打破并列，保证可复现。
     for i in sorted(range(len(lengths)), key=lambda i: (-lengths[i], i)):
         frames, rank = heapq.heappop(heap)
         groups[rank].append(i)
@@ -40,6 +41,7 @@ def partition_clips(lengths, world_size):
 
 
 def file_sha256(path: Path) -> str:
+    """分块读取文件并计算 SHA-256 摘要，避免一次将整个文件载入内存。"""
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
@@ -48,6 +50,7 @@ def file_sha256(path: Path) -> str:
 
 
 def validate_pose_arrays(p, quat, joints, name: str) -> None:
+    """验证位置、四元数和关节数组的形状、有限性及四元数单位长度。"""
     n = len(p)
     for key, array, width in (("root_pos", p, 3), ("root_quat_w", quat, 4), ("joint_pos", joints, NUM_J)):
         if array.shape != (n, width) or n < 2:
@@ -60,6 +63,7 @@ def validate_pose_arrays(p, quat, joints, name: str) -> None:
 
 @dataclass(frozen=True)
 class SourceClip:
+    """记录源动作片段的名称、分片、索引、起点和长度。"""
     name: str
     shard: str
     source_clip_index: int
@@ -68,13 +72,12 @@ class SourceClip:
 
 
 class IndexedG1Dataset:
-    """An identity whitelist, not a paired-frame or training-window view.
+    """按身份白名单选择源片段，不使用配对帧或训练窗口视图。
 
-    Neither paired clips/start,length nor source clip_* window arrays are consumed.
-    Length and offsets always come from the source source_clip_* metadata.
-    """
+    不读取配对片段的起点、长度或源文件中的 clip_* 窗口数组；长度和偏移始终取自源文件的 source_clip_* 元数据。"""
 
     def __init__(self, index_path, source_root=None, limit=None, *, verify_hashes=False):
+        """读取并校验索引及源数据元信息，按选项限制片段数量和验证文件摘要。"""
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
             raise ValueError("motion_limit must be positive")
         self.index_path = Path(index_path).expanduser().resolve(strict=True)
@@ -90,6 +93,7 @@ class IndexedG1Dataset:
         if not manifest_sha or file_sha256(self.source_root / "manifest.json") != manifest_sha:
             raise ValueError("G1 source manifest changed; use the source bound to this index")
         snapshot = run["g1_snapshot"]["shards"]
+        # 索引只决定片段身份白名单；实际时间范围稍后从源文件读取，避免把配对窗口误当完整动作。
         with h5py.File(self.index_path, "r") as index:
             if index.attrs.get("format") != INDEX_FORMAT or not index.attrs.get("complete", False):
                 raise ValueError("requires a complete Mjbones paired index")
@@ -114,6 +118,7 @@ class IndexedG1Dataset:
                         raise ValueError(f"invalid index column {key}")
                     expected[key] = group[key][:]
 
+        # 按源分片集中验证文件，但将结果写回索引原顺序，保持片段选择及指纹稳定。
         records = [None] * self.whitelist_clips
         self.source_stats, self.source_hashes = {}, {}
         source_clips = 0
@@ -123,6 +128,7 @@ class IndexedG1Dataset:
             bound = snapshot.get(shard)
             if not bound or "sha256" not in bound:
                 raise ValueError(f"source shard is not bound by run.json: {shard}")
+            # 默认先比较文件大小和修改时间；显式要求或元信息变化时才重算完整摘要，降低大文件启动成本。
             same_stat = (stat.st_size, stat.st_mtime_ns) == (bound["bytes"], bound["mtime_ns"])
             if (verify_hashes or not same_stat) and file_sha256(path) != bound["sha256"]:
                 raise ValueError(f"G1 source checksum changed: {shard}")
@@ -147,6 +153,8 @@ class IndexedG1Dataset:
                     ds = source[key]
                     if ds.shape != (frames, width) or ds.dtype != np.dtype("float32"):
                         raise ValueError(f"{shard}: {key} must be float32 ({frames}, {width})")
+                # 将索引身份映射到源片段的真实边界，并核对可选定位元数据；
+                # 同时要求原生 50 Hz，避免加载阶段隐式重采样改变索引含义。
                 ss, nn = starts[selected_ids], lengths[selected_ids]
                 if np.any(ss < 0) or np.any(nn < 2) or np.any(ss + nn > frames):
                     raise ValueError(f"invalid selected source bounds: {shard}")
@@ -160,11 +168,13 @@ class IndexedG1Dataset:
         self.source_clips = source_clips
         self.clips = records if limit is None else records[:limit]
         self.verify_hashes = verify_hashes
+        # 指纹绑定索引、源摘要和实际选择的片段；修改数量限制也会改变身份，防止恢复训练时混用数据。
         payload = {"index_sha256": self.index_sha256, "source_hashes": self.source_hashes,
                    "length_policy": "full_g1_source", "clips": [asdict(c) for c in self.clips]}
         self.fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
     def _source_path(self, name: str) -> Path:
+        """解析源分片路径并检查它位于允许的源目录内。"""
         relative = PurePosixPath(name)
         if not name or str(relative) != name or relative.is_absolute() or ".." in relative.parts or "\\" in name or ":" in name:
             raise ValueError(f"unsafe source shard path: {name}")
@@ -174,7 +184,9 @@ class IndexedG1Dataset:
         return path
 
     def iter_clips(self):
+        """逐个读取所选源片段，返回根部位置、四元数和关节位置数组。"""
         with ExitStack() as stack:
+            # 按需打开并复用分片句柄，ExitStack 负责异常时关闭；读取前后检查元信息以发现文件变化。
             handles = {}
             for clip in self.clips:
                 if clip.shard not in handles:
@@ -194,6 +206,7 @@ class IndexedG1Dataset:
                     raise ValueError(f"source changed during reference loading: {shard}")
 
     def summary(self):
+        """返回动作来源、选择和指纹等可用于检查点校验的元数据。"""
         frames = sum(c.length for c in self.clips)
         return {"format": "supermimic_indexed_g1_v1", "index": str(self.index_path),
                 "source_root": str(self.source_root), "index_sha256": self.index_sha256,
@@ -207,14 +220,12 @@ class IndexedG1Dataset:
 
 
 class MergedG1Dataset:
-    """A single merged ``teleopit_motion_hdf5`` source, read without an index.
+    """无需索引即可读取单个合并的 teleopit_motion_hdf5 数据源。
 
-    Clip boundaries come from the file's own ``source_clip_*`` arrays, so no
-    pairing index is needed. Identity is a digest over the file's structural
-    metadata, which stays stable when the same file is copied between machines.
-    """
+    片段边界来自文件自身的 source_clip_* 数组；身份标识由结构元数据生成摘要，同一文件复制到其他机器后保持稳定。"""
 
     def __init__(self, path, limit=None):
+        """读取合并源文件的片段边界，验证结构并生成稳定身份信息。"""
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
             raise ValueError("motion_limit must be positive")
         self.path = Path(path).expanduser().resolve(strict=True)
@@ -237,6 +248,7 @@ class MergedG1Dataset:
             names = None
             if "clips" in source and "source_relative_path" in source["clips"]:
                 names = source["clips"]["source_relative_path"].asstr()[:]
+        # 先验证所有片段连续覆盖整个帧轴，再应用数量限制，避免截取前缀掩盖源文件结构错误。
         count = len(lengths)
         if count < 1 or len(starts) != count:
             raise ValueError("source_clip_starts and source_clip_lengths must agree")
@@ -262,6 +274,8 @@ class MergedG1Dataset:
         self.whitelist_clips = int(len(lengths))
         self.frames = int(lengths.sum())
         self.limit = limit
+        # 合并源的身份来自结构元数据及大小，不是动作数组内容的完整哈希；
+        # 复制路径不影响指纹，但不能据此检测所有等大小内容修改。
         digest = hashlib.sha256()
         digest.update(json.dumps({"format": "merged_g1_v1", "fps": 50, "frames": frames,
                                   "clips": int(len(lengths)),
@@ -272,6 +286,7 @@ class MergedG1Dataset:
         self.fingerprint = digest.hexdigest()
 
     def iter_clips(self):
+        """逐个读取合并文件中选定的完整动作片段。"""
         before = self.path.stat()
         with h5py.File(self.path, "r") as source:
             for clip in self.clips:
@@ -284,6 +299,7 @@ class MergedG1Dataset:
             raise ValueError("source changed during reference loading")
 
     def summary(self):
+        """返回合并源文件及所选片段的摘要和指纹。"""
         frames = sum(c.length for c in self.clips)
         return {"format": "supermimic_merged_g1_v1", "source": str(self.path),
                 "fingerprint": self.fingerprint, "length_policy": "full_g1_source", "fps": 50,

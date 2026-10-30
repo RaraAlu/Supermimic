@@ -1,18 +1,10 @@
-"""World-model k-step prediction error on fresh policy rollouts, in physical units (read-only).
+"""在新采集的策略轨迹上测量世界模型 k 步预测误差，按物理单位分量报告，不修改检查点。
 
-Paper Figure 3(c) reports an "8-step prediction error" of 0.007-0.011 that "counts the state only, is
-normalized by a predefined nominal error, and is measured online on policy rollouts"; the nominal
-error and the aggregation are not given. Training's wm_err8 differs on both counts (it divides by the
-running std of one-step increments and is computed on replay windows), so this script measures the
-error where the paper does and reports it per state component in physical units, plus normalized
-values under several candidate nominal errors.
-
-The checkpoint's policy collects fresh transitions under the training setup (domain randomization,
-reset noise, bin starts, observation noise, action noise); the checkpoint's world model then rolls
-k steps from each logged start on the logged actions, exactly like training's world-model fit.
-
-    python scripts/diag_wm_error.py --ckpt CKPT --motion_source SOURCE.h5 --out DIR
-"""
+论文图 3(c) 的 8 步误差为 0.007–0.011，仅统计状态、按预设标称误差归一化并在线测量，
+但未提供标称误差及聚合方式。训练指标 wm_err8 使用单步增量的运行标准差和回放窗口，定义不同。
+本脚本在论文对应的策略轨迹上报告物理误差，并比较多种候选标称尺度。
+策略使用训练时的域随机化、重置噪声、分箱起点、观测和动作噪声采集转移；
+世界模型从记录的起点按记录的动作推演 k 步，与训练拟合方式一致。"""
 
 import argparse
 import json
@@ -55,7 +47,7 @@ motion, mdp = subject.reference(args.motion_source)
 wm = subject.world_model(ck)
 pi = subject.policy(ck)
 
-# ---- fresh transitions from the checkpoint's policy under the training setup ----
+# ---- 在训练配置下用检查点策略采集新转移 ----
 N, T = args.num_envs, args.steps
 env = subject.make_env(N, motion, mdp, run_args=a_, inherit=("gamma", "bin_clip_end", "bin_prior"))
 hist = torch.zeros(N, Hh, OBS_DIM, device=dev)
@@ -75,15 +67,16 @@ with torch.no_grad():
             for key in rec:
                 rec[key][t] = out[key]
 
-# ---- candidate nominal errors over the 70 frame-local error dims (pos, rot, lin vel, ang vel, q, qd) ----
+# ---- 局部坐标系 70 维误差的候选标称尺度：位置、旋转、线速度、角速度、q、qd ----
 def per_dim(pos, rot, lin, ang, q, qd):
+    """按位置、旋转、线速度、角速度、关节位置和速度展开各分量的归一化尺度。"""
     return torch.cat([torch.full((n,), float(x)) for n, x in ((3, pos), (3, rot), (3, lin), (3, ang), (NUM_J, q), (NUM_J, qd))]).to(dev)
 
 
-nan = float("nan")  # dims a candidate does not define are excluded from its mean
+nan = float("nan")  # 候选方案未定义的维度不参与均值计算
 err_floor = per_dim(3e-3, 5e-3, 2e-2, 5e-2, 3e-3, 5e-2)  # supermimic/tasks/tracking/rl/trainer.py的ERR_FLOOR
 c = RewardCfg
-# D: projected-gravity noise 0.05 stands in for orientation; root position and linear velocity are not observed
+# 方案 D：用 0.05 的投影重力噪声代替姿态尺度；根部位置和线速度不属于观测
 candidates = {
     "A_training_wm_err8 (max(sigma_delta, floor))": torch.maximum(wm.out_norm.std(), err_floor),
     "B_fixed_floor_constants (train.py ERR_FLOOR)": err_floor,
@@ -91,22 +84,24 @@ candidates = {
     "D_sensor_noise (Table A.1 half-widths)": per_dim(nan, 0.05, nan, 0.2, 0.01, 0.5),
 }
 
-# ---- k-step world-model rollouts from every logged window start ----
+# ---- 从每个记录窗口的起点执行 k 步世界模型推演 ----
 starts = torch.arange(0, T - k + 1, args.stride, device=dev)
 comp = ("pos_m", "rot_rad", "linvel_mps", "angvel_radps", "q_rms_rad", "qd_rms_radps")
 step_sum = {name: torch.zeros(k, device=dev, dtype=torch.float64) for name in comp}
 cand_sum = {name: torch.zeros(k, device=dev, dtype=torch.float64) for name in candidates}
 count = torch.zeros(k, device=dev, dtype=torch.float64)
-last = {name: [] for name in comp}  # per-window component errors at step k (windows valid through step k)
+last = {name: [] for name in comp}  # 每个窗口第 k 步的分量误差，仅统计截至该步仍有效的窗口
 sq_sum = torch.zeros(k, 70, device=dev, dtype=torch.float64)
 
 
 def components(e):
+    """将逐维误差聚合为根部向量范数及关节位置、速度的均方根误差。"""
     return torch.stack((e[:, 0:3].norm(dim=-1), e[:, 3:6].norm(dim=-1), e[:, 6:9].norm(dim=-1), e[:, 9:12].norm(dim=-1),
                         e[:, 12:12 + NUM_J].pow(2).mean(-1).sqrt(), e[:, 12 + NUM_J:].pow(2).mean(-1).sqrt()), -1)
 
 
 with torch.no_grad():
+    # 将窗口起点与环境编号组成笛卡尔积，再分块推演，避免一次展开所有序列耗尽显存。
     idx_t = starts.repeat_interleave(N)
     idx_e = torch.arange(N, device=dev).repeat(len(starts))
     for c0 in range(0, len(idx_t), args.chunk):
@@ -114,16 +109,18 @@ with torch.no_grad():
         rows = t0.unsqueeze(-1) + torch.arange(k, device=dev)
         envs = e0.unsqueeze(-1).expand_as(rows)
         s, s1, act, xi, done = (rec[key][rows, envs] for key in ("s", "s1", "a", "xi", "done"))
-        # transition j is valid if no episode ended at transitions 0..j-1 (as in ReplayBuffer.sample_windows)
+        # 仅当转移 0 至 j-1 均未结束回合时，第 j 个转移才有效，与 ReplayBuffer.sample_windows 一致
         mask = torch.cumprod(torch.cat((torch.ones_like(done[:, :1]), ~done[:, :-1]), -1).float(), -1)
+        # 窗口内只在首步使用真实状态，后续递归预测但沿用记录的动作，以隔离模型误差。
         S = unflatten_state(s[:, 0])
         for j in range(k):
             S = wm.step(S, act[:, j], normalize_xi(xi[:, j]))
-            e = wm.state_error(S, unflatten_state(s1[:, j]))  # (B, 70), frame-local, physical units
+            e = wm.state_error(S, unflatten_state(s1[:, j]))  # 形状为（B, 70），使用局部坐标系下的物理单位
             m = mask[:, j]
             cm = components(e)
             for i, name in enumerate(comp):
                 step_sum[name][j] += (cm[:, i] * m).sum()
+            # 各候选尺度只在其定义的维度上平均平方误差；物理分量范数与归一化均方误差分开汇报。
             for name, nom in candidates.items():
                 use = ~torch.isnan(nom)
                 cand_sum[name][j] += (((e[:, use] / nom[use]) ** 2).mean(-1) * m).sum()
@@ -136,6 +133,7 @@ with torch.no_grad():
 
 
 def q(x, ps=(0.5, 0.9, 0.99)):
+    """计算指定分位数及均值，并将结果舍入为便于 JSON 输出的数值。"""
     return {f"p{int(p * 100)}": round(float(torch.quantile(x, p)), 5) for p in ps} | {"mean": round(float(x.mean()), 5)}
 
 
@@ -143,6 +141,7 @@ last = {name: torch.cat(v) for name, v in last.items()}
 sigma_delta = wm.out_norm.std()
 blocks = {"pos": slice(0, 3), "rot": slice(3, 6), "linvel": slice(6, 9), "angvel": slice(9, 12),
           "q": slice(12, 12 + NUM_J), "qd": slice(12 + NUM_J, 70)}
+# 先累计逐轴平方误差再开方，得到总体 RMS；这与先对每个窗口取范数再平均的指标不同。
 rms_k = (sq_sum[k - 1] / count[k - 1]).sqrt()
 summary = {
     "ckpt": args.ckpt, "iteration": ck.get("iteration"), "subject": subject.provenance(), "num_envs": N, "recorded_steps": T, "window": k,

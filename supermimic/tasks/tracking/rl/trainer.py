@@ -1,4 +1,4 @@
-# Ported from zita-ch/supermimic_vibed (MIT, Copyright (c) 2026 ETH Zurich, Chong Zhang); see THIRD_PARTY_NOTICES.md.
+# 移植自 zita-ch/supermimic_vibed（MIT，Copyright (c) 2026 ETH Zurich, Chong Zhang）；详见 THIRD_PARTY_NOTICES.md。
 """SuperMimic训练器（算法A.1）：采样 → 拟合世界模型 → 经冻结的世界模型想象推演、BPTT更新策略 → critic更新。
 
 supermimic/scripts/train.py只负责命令行、进程与运行目录；本模块持有模型、优化器、回放缓冲与仿真环境，
@@ -26,14 +26,14 @@ from supermimic.utils.checkpoints import rotate_states
 from supermimic.utils.cuda_graph import GraphedCall
 from supermimic.utils.distributed import average_gradients
 
-# per-component floors on the error normalization (pos, rot, lin vel, ang vel, q, qd increments)
+# 误差归一化各分量的下限：位置、旋转、线速度、角速度、关节位置和速度增量
 ERR_FLOOR = torch.cat((torch.full((3,), 3e-3), torch.full((3,), 5e-3), torch.full((3,), 2e-2), torch.full((3,), 5e-2),
                        torch.full((NUM_J,), 3e-3), torch.full((NUM_J,), 5e-2)))  # fmt: skip
 
-# critic diagnostics of one update (diag_log.csv): means, maxima, and bin-score statistics added when logging
+# 单次价值网络更新的诊断指标（diag_log.csv）；分箱得分统计在记录时补充
 DIAG_MEAN = ("v_mean", "v_end_mean", "v_capped_frac", "critic_bias", "z_gt5_frac", "v_input_gradnorm", "critic_gradnorm")
 DIAG_MAX = ("v_max", "z_max")
-DIAG_BINS = ("bin_score_mean", "bin_score_min", "nonfinite_scores")  # visited, scorable bins; scores skipped since the last row
+DIAG_BINS = ("bin_score_mean", "bin_score_min", "nonfinite_scores")  # 已访问且可评分的分箱；上次记录以来跳过的得分数
 TRAIN_COLUMNS = ("iteration", "wall_h", "sim_steps", "wm_loss", "wm_err8", "pi_loss", "v_loss", "imag_rew", "pi_gradnorm",
                  "imag_survival", "sim_rew", "ep_len", "ep_ret_norm", "term_frac", "it_per_s", "lr")
 SAMPLING_COLUMNS = ("iteration", "samp_entropy", "samp_top1", "bins_visited", "reset_tail_frac")
@@ -65,6 +65,7 @@ class Layout:
 
 
 def make_layout(args, parallel) -> Layout:
+    """根据全局或每卡批量配置和进程数量，计算当前进程的训练布局。"""
     scope = parallel.world_size if args.batch_scope == "per_gpu" else 1
     local_wm_batch = parallel.local_size(args.wm_batch * scope, "wm_batch")
     local_pi_batch = parallel.local_size(args.pi_batch * scope, "pi_batch")
@@ -86,7 +87,7 @@ def make_layout(args, parallel) -> Layout:
 
 
 def split_sizes(n: int, parts: int) -> list[int]:
-    """Chunk sizes of torch.tensor_split(range(n), parts)."""
+    """返回 torch.tensor_split(range(n), parts) 各分块的大小。"""
     return [n // parts + int(i < n % parts) for i in range(parts)]
 
 
@@ -98,13 +99,9 @@ def lr_at(it: int, base_lr: float, decay_iters: int) -> float:
 
 
 def survival(keep: torch.Tensor, unrolled: bool) -> torch.Tensor:
-    """Soft survival weights c_{t+1} = prod_{i<=t} (1 - d_i) along the imagined horizon (dim 0).
+    """计算想象时间轴（第 0 维）上的软存活权重 c_{t+1} = prod_{i<=t}(1 - d_i)。
 
-    Takes the per-step survival probabilities 1 - d_i themselves (MDP.soft_survival), not d_i, so a
-    near-certain termination is not rounded to exactly 0 by 1 - (1 - p).
-    cumprod's backward branches on zeros in its input on the host, which a captured graph cannot do,
-    so graphs (unrolled) use the same running product written out step by step.
-    """
+    直接接收每步存活概率 MDP.soft_survival，避免近乎必然终止时因相减舍入为零。cumprod 的反向传播会在主机上根据输入中的零分支，捕获图无法执行这一操作，因此图模式逐步展开相同的累乘。"""
     if not unrolled:
         return torch.cumprod(keep, 0)
     out, c = [], torch.ones_like(keep[0])
@@ -125,6 +122,7 @@ def gae_targets(V: torch.Tensor, rews: torch.Tensor, keeps: torch.Tensor, gamma:
 
 
 def set_requires_grad(m: nn.Module, flag: bool):
+    """统一启用或禁用模块参数的梯度计算。"""
     for p in m.parameters():
         p.requires_grad_(flag)
 
@@ -133,6 +131,7 @@ class Trainer:
     """一个rank上的训练状态与各更新步骤。构造后调用collect(warmup_steps)预热，再逐次调用iteration(it)。"""
 
     def __init__(self, args, parallel, layout: Layout, kin, motion, resume: dict | None = None):
+        """建立环境、回放缓冲区、模型、优化器与训练状态，并按需恢复检查点。"""
         self.args, self.parallel, self.layout, self.motion = args, parallel, layout, motion
         dev = self.device = parallel.device
         self.mdp = MDP(kin, motion, kin.default_q)
@@ -148,12 +147,12 @@ class Trainer:
         self.use_graph = args.cuda_graph == "on" or (args.cuda_graph == "auto" and cuda and not parallel.enabled and not self.profile)
         if self.use_graph and not cuda:
             raise ValueError("--cuda_graph on needs CUDA")
-        # Inside graphs the gradient all-reduce uses the fixed global batch sizes (no host round trip).
+        # 图内梯度全归约使用固定的全局批量大小，无需与主机往返。
         scope = layout.scope
         self.graph_wm_total = args.wm_batch * scope * (args.wm_batches if args.wm_update == "single" else 1) if self.use_graph else None
         self.graph_pi_total = args.pi_batch * scope if self.use_graph else None
         self.graph_critic = self.use_graph and args.cuda_graph_critic == "on" and not args.no_critic
-        # global sample count of each critic minibatch: every rank splits its HZ * local_pi_batch rows the same way
+        # 每个价值网络小批次的全局样本数：各进程以相同方式切分 HZ * local_pi_batch 行
         world = parallel.world_size
         self.graph_critic_totals = [sum(col) for col in zip(*(
             split_sizes(args.horizon * rank_batch, args.critic_minibatches)
@@ -166,14 +165,16 @@ class Trainer:
         self.start_it, self.wall_offset, self.sim_steps = 0, 0.0, 0
         if resume:
             self._resume(resume)
+        # 先同步模型与归一化缓冲区，再按进程切换随机种子。
+        # 这样各卡从同一组参数出发，但后续环境随机化和采样不会重复。
         for model in (self.wm, self.pi, self.critic):
             parallel.broadcast_module(model)
         if parallel.enabled:
             torch.manual_seed(args.seed + parallel.rank)
 
         self.err_floor = ERR_FLOOR.to(dev)
-        # every per-step reward is at most MAX_STEP_REWARD (the tracking kernels are <= 1, the penalties <= 0), so no
-        # discounted return, and no correct critic value, exceeds MAX_STEP_REWARD / (1 - gamma) (10 at gamma 0.99)
+        # 每步奖励至多为 MAX_STEP_REWARD（跟踪核不超过 1，惩罚不大于 0），因此折扣回报和正确的
+        # 价值估计均不超过 MAX_STEP_REWARD / (1 - gamma)（gamma 为 0.99 时为 10）。
         self.value_cap = MAX_STEP_REWARD / (1 - args.gamma) if args.critic_cap == "on" else math.inf
         # 可编译的内核是实例属性：检查脚本可在同一Trainer上切换eager与编译版本
         self.use_compile = args.compile == "on" or (args.compile == "auto" and importlib.util.find_spec("triton") is not None)
@@ -185,9 +186,9 @@ class Trainer:
         self.critic_input_c = maybe_compile(self._critic_input)
         print(f"torch.compile: {'on' if self.use_compile else 'off'}", flush=True)
 
-        # Non-finite world-model/critic/policy gradients are flagged on the GPU and checked once per iteration:
-        # a host sync after each of the 10 world-model and 20 critic updates stalls the GPU queue.
-        # The check runs before logging and checkpointing, so a corrupted step aborts without being saved.
+        # 在 GPU 上标记世界模型、价值网络和策略的非有限梯度，每次迭代检查一次：
+        # 若在 10 次世界模型更新和 20 次价值网络更新后分别同步主机，会阻塞 GPU 队列。
+        # 检查先于日志与检查点保存，异常更新会中止且不会被保存。
         self.nonfinite = torch.zeros(3, dtype=torch.bool, device=dev)
         self.wm_step = self.graphed(self._wm_step)
         self.policy_step = self.graphed(self._policy_step)
@@ -199,6 +200,7 @@ class Trainer:
                                reset_margin=args.reset_margin)
         if resume:
             self._restore_bins(resume)
+        # 回放数据与观测历史属于当前仿真会话，不从检查点恢复；外层 setup 会重新预热。
         self.buffer = ReplayBuffer(args.buffer_steps, layout.local_envs, dev)
         self.obs_hist = torch.zeros(layout.local_envs, self.Hh, OBS_DIM, device=dev)
         self.collect_action = self.graphed(self._collect_action, enabled=self.use_graph and args.cuda_graph_collect == "on")
@@ -211,17 +213,18 @@ class Trainer:
 
     # ---------------- 构造与恢复 ----------------
     def _adam(self, params, captured: bool, **kw):
-        """Graph-captured optimizers keep their step count and learning rate on the device."""
+        """创建适合当前模式的 Adam 优化器；捕获图使用的步数和学习率保存在设备上。"""
         lr = self.layout.base_lr
         if captured:
             return torch.optim.Adam(params, lr=torch.tensor(lr, device=self.device), fused=self.fused_adam, capturable=True, **kw)
         return torch.optim.Adam(params, lr=lr, fused=self.fused_adam, **kw)
 
     def _resume(self, ck: dict):
+        """恢复模型和优化器状态，并将优化器配置调整为当前运行模式。"""
         self.wm.load_state_dict(ck["wm"]), self.pi.load_state_dict(ck["pi"]), self.critic.load_state_dict(ck["critic"])
         self.opt_wm.load_state_dict(ck["opt_wm"]), self.opt_pi.load_state_dict(ck["opt_pi"]), self.opt_v.load_state_dict(ck["opt_v"])
-        # load_state_dict restores the checkpoint's own flags, lr type and step placement; match this run's mode.
-        # Fused and capturable kernels read the step count from device memory, the others from the host.
+        # load_state_dict 会恢复检查点中的标志、学习率类型和步数位置；这里调整为当前运行模式。
+        # fused 与 capturable 内核从设备内存读取步数，其他内核从主机读取。
         for opt, captured in ((self.opt_wm, self.use_graph), (self.opt_pi, self.use_graph), (self.opt_v, self.graph_critic)):
             on_device = self.fused_adam or captured
             for group in opt.param_groups:
@@ -245,6 +248,8 @@ class Trainer:
         shards, rank = state["shards"], parallel.rank
         ok = (len(shards) == parallel.world_size and state["partition_algorithm"] == self.motion.partition["algorithm"]
               and all(shards[rank][k].shape == getattr(sampler, k).shape for k in ("scores", "visits", "ema")))
+        # 用全局最小值统一恢复决定：任一卡分片不匹配时，所有卡都放弃恢复课程，
+        # 避免只有部分进程继续进入概率更新的集合通信。
         if not bool(parallel.reduce(int(ok), torch.distributed.ReduceOp.MIN)):
             print(f"checkpoint's reset-curriculum state was saved for {len(shards)} rank(s) with "
                   f"'{state['partition_algorithm']}' and does not fit this shard: bin scores start from zero", flush=True)
@@ -255,11 +260,14 @@ class Trainer:
         print(f"rank {rank}: restored reset-curriculum state ({100 * visited:.1f}% of this shard's bins visited)", flush=True)
 
     def graphed(self, fn, eager_calls: int = 3, enabled: bool | None = None):
-        """CUDA-graph replay of a training step (supermimic.utils.cuda_graph); enabled defaults to --cuda_graph."""
+        """包装训练步骤以支持 CUDA 图重放；enabled 默认取自 --cuda_graph。"""
         return GraphedCall(fn, eager_calls, self.use_graph if enabled is None else enabled, thread_local=self.parallel.enabled)
 
     # ---------------- 可编译内核 ----------------
     def _wm_rollout(self, s, a, xi):
+        """从窗口首状态开始，根据动作序列和模拟上下文逐步预测世界模型状态。"""
+        # 只使用窗口首个真实状态，随后递归使用模型自身的预测。
+        # 这让损失包含多步误差积累，而非若干互不相关的单步拟合。
         S = unflatten_state(s[:, 0])
         preds = []
         for j in range(self.args.wm_window):
@@ -268,12 +276,16 @@ class Trainer:
         return tuple(torch.stack([P[i] for P in preds], 1) for i in range(6))  # (B, k, ...)
 
     def _wm_err(self, S_hat, s1, mask):
+        """按输出尺度归一化状态误差，使用有效掩码计算窗口损失及末步误差。"""
+        # 按状态增量标准差平衡各物理量；下限避免静止维度的微小方差放大误差。
         std = torch.maximum(self.wm.out_norm.std(), self.err_floor)
         e = (self.wm.state_error(S_hat, unflatten_state(s1)) / std) ** 2  # (B, k, D)
         e = e.mean(-1)
+        # 终止后的转移不计损失；分母固定为窗口数，保留有效时域长度对损失的贡献。
         return (e * mask).sum() / s1.shape[0], e[:, -1]
 
     def _imag_step(self, S, o_hist, a_prev, f, xi, xi_n, g):
+        """执行一步策略动作、世界模型预测和带噪观测更新，并生成下一帧目标。"""
         a = self.pi(o_hist, g)
         S1 = self.wm.step(S, a, xi_n)
         f1 = f + 1
@@ -282,16 +294,20 @@ class Trainer:
         return S1, a, o_hist, f1, self.motion.goal(f1, self.K)
 
     def _reward_term(self, S, f, a, a_prev):
+        """计算想象状态的解析奖励与软存活概率。"""
         return self.mdp.reward(S, f, a, a_prev), self.mdp.soft_survival(S, f)
 
     def _critic_input(self, S, f, xi_n, g):
+        """拼接价值网络状态特征与目标特征。"""
         return torch.cat((self.mdp.critic_features(S, f, xi_n), g), -1)
 
     def cap_value(self, v):
+        """将价值估计限制在理论回报上限以内。"""
         return v.clamp(max=self.value_cap)
 
     # ---------------- 世界模型 ----------------
     def _wm_step(self, s, a, xi, s1, mask):
+        """拟合一个世界模型窗口，归约并裁剪梯度，返回损失和末步误差。"""
         S_hat = self.wm_rollout(s, a, xi)
         loss, e_last = self.wm_err(S_hat, s1, mask)
         self.opt_wm.zero_grad(set_to_none=True)
@@ -300,16 +316,19 @@ class Trainer:
         grad_norm = nn.utils.clip_grad_norm_(self.wm.parameters(), 1.0)
         self.nonfinite[0].logical_or_(~torch.isfinite(grad_norm))
         self.opt_wm.step()
+        # 末步诊断只统计仍有效的窗口，并跨卡汇总分子与样本数，避免等权平均不同样本量的均值。
         m = mask[:, -1]
         error = self.parallel.reduce(torch.stack(((e_last.detach() * m).sum(), m.sum())))
         return loss.detach() / self.args.wm_window, error[0] / error[1].clamp(min=1)
 
     def wm_update(self):
+        """从回放缓冲区采样窗口并执行一次世界模型更新。"""
         w = self.buffer.sample_windows(self.layout.wm_step_batch, self.args.wm_window)
         return self.wm_step(w["s"], w["a"], w["xi"], w["s1"], w["mask"])
 
     # ---------------- 策略与critic ----------------
     def sample_valid_starts(self, B: int):
+        """采样足以容纳完整想象时域的起点及历史；多次失败时报告数据不足。"""
         starts, hists, n = [], [], 0
         attempts = 0
         while n < B:
@@ -318,6 +337,8 @@ class Trainer:
                 raise RuntimeError("replay has too few starts with a complete imagination horizon; collect more transitions or inspect short clips")
             s, h = self.buffer.sample_starts(2 * B, self.Hh)
             f = s["f"]
+            # 保留能走完整个想象时域的起点，防止参考索引跨入相邻片段；
+            # 每轮多抽候选，只截取尚缺的数量。
             ok = f + self.HZ <= self.motion.clip_end[self.motion.clip_id[f]]
             idx = ok.nonzero(as_tuple=False).squeeze(-1)[: B - n]
             starts.append({k: v[idx] for k, v in s.items()}), hists.append({k: v[idx] for k, v in h.items()})
@@ -326,7 +347,7 @@ class Trainer:
         return cat(starts), cat(hists)
 
     def _policy_step(self, s_flat, xi, f, a_prev, o_hist):
-        """Imagine HZ steps through the frozen world model, backpropagate the return and step the policy."""
+        """通过冻结的世界模型想象 HZ 步，反向传播回报并更新策略。"""
         args, HZ, dev = self.args, self.HZ, self.device
         if self.profile:
             torch.cuda.synchronize(); tq0 = time.time()
@@ -336,23 +357,28 @@ class Trainer:
         g0 = self.motion.goal(f, self.K)
         g = g0
         S0, f0 = S, f
+        # 保存每步预测状态、动作与参考目标，随后批量计算奖励并复用于价值网络更新。
         Ss, As, Aps, Fs, Gs = [], [], [], [], []
         for t in range(HZ):
             Aps.append(a_prev)
             S, a_prev, o_hist, f, g = self.imag_step(S, o_hist, a_prev, f, xi, xi_n, g)
             Ss.append(S), As.append(a_prev), Fs.append(f), Gs.append(g)
+        # 将时间与批次合并为 HZ * B，一次执行运动学和奖励计算；随后恢复时间轴计算存活权重。
         flat = lambda xs: torch.stack(xs).flatten(0, 1)  # noqa: E731  (H*B, ...)
         S_all = tuple(flat([St[i] for St in Ss]) for i in range(6))
         f_all = flat(Fs)
         r, keep = self.reward_term(S_all, f_all, flat(As), flat(Aps))
         r, keep = r.view(HZ, B), keep.view(HZ, B)
         alive = survival(keep, self.use_graph)  # c_{t+1}
+        # 第 t 步奖励使用此前各步的存活概率；本步的终止影响后续奖励和末端自举。
         c_t = torch.cat((torch.ones(1, B, device=dev), alive[:-1]), 0)
         disc = args.gamma ** torch.arange(HZ, device=dev, dtype=torch.float32).unsqueeze(-1)
         J = (disc * c_t * r).sum(0)
         c = alive[-1]
         r_sum = (c_t * r).detach().sum(0)
         rews, keeps = r.detach(), keep.detach()
+        # 时域之外的回报由末端价值补充，并同时乘折扣与整个时域的存活概率。
+        # 价值上限约束避免策略追逐不可能达到的高估回报。
         if not args.no_critic:
             J = J + (args.gamma**HZ) * c * self.cap_value(self.critic(self._critic_input(S, f, xi_n, g)))
         loss = -J.mean()
@@ -367,11 +393,13 @@ class Trainer:
         nn.utils.clip_grad_value_(self.pi.parameters(), 0.1)
         finite_pi_grad = torch.isfinite(gn)
         self.nonfinite[2].logical_or_(~finite_pi_grad)
-        # A captured graph cannot branch on the host, so it always steps; a non-finite gradient still aborts
-        # the run at the end of this iteration, before anything is logged or saved.
+        # 捕获的图无法在主机上分支，因此总会执行优化步骤；非有限梯度仍会在本次迭代末尾、
+        # 写日志或保存之前中止运行。
         if self.use_graph or bool(finite_pi_grad):
             self.opt_pi.step()
         with torch.no_grad():
+            # 价值拟合需要起点加 HZ 个后继状态，共 HZ + 1 帧；切断策略计算图，
+            # 使后续价值更新不会再次反向传播到本次策略推演。
             S_c = tuple(torch.cat((S0[i].unsqueeze(0), torch.stack([St[i].detach() for St in Ss])), 0).flatten(0, 1) for i in range(6))
             f_c = torch.cat((f0.unsqueeze(0), torch.stack(Fs)), 0).flatten()
             g_c = torch.cat((g0.unsqueeze(0), torch.stack(Gs)), 0).flatten(0, 1)
@@ -380,18 +408,15 @@ class Trainer:
                 S_c, f_c, g_c) + tq
 
     def _critic_step(self, rews, keeps, xi_n, S_c, f_c, g_c):
-        """Fit the critic to GAE(lambda) targets over the imagined transitions (Eq. 3).
+        """以想象转移的 GAE(lambda) 目标拟合价值网络（式 3）。
 
-        Besides the loss it returns the diagnostics DIAG_MEAN and DIAG_MAX measured on this update's imagined states:
-        the raw critic values (mean, at the horizon end, maximum, share above the cap), their mean offset from the
-        GAE targets, how far the critic's normalized inputs stray (|z| > 5 share, maximum), the critic's input
-        gradient at the end states (what the policy objective differentiates through) and its parameter gradient norm.
-        """
+        除损失外，还返回本次想象状态上的 DIAG_MEAN 和 DIAG_MAX：原始价值的均值、末步值、最大值及超过上限的比例，相对 GAE 目标的平均偏差，归一化输入的偏离程度，以及末状态输入梯度和参数梯度范数。"""
         args, HZ, critic = self.args, self.HZ, self.critic
         B = self.layout.local_pi_batch
         with torch.no_grad():
             xi_c = xi_n.unsqueeze(0).expand(HZ + 1, -1, -1).flatten(0, 1)
             X = self.critic_input_c(S_c, f_c, xi_c, g_c).view(HZ + 1, B, -1)
+        # 先更新输入统计再固定本轮目标；所有小批次与训练轮次使用同一份 GAE 目标。
         critic.norm.update(X)
         with torch.no_grad():
             raw = critic(X)
@@ -401,12 +426,14 @@ class Trainer:
             diag_mean = torch.stack((raw.mean(), raw[-1].mean(), (raw > self.value_cap).float().mean(), (raw[:-1] - targets).mean(),
                                      (z > 5).float().mean()))
             diag_max = torch.stack((raw.max(), z.max()))
+        # 单独测量末端价值对输入的敏感度，供判断自举梯度是否异常；该指标不参与拟合损失。
         x_end = X[-1].detach().clone().requires_grad_(True)
-        value_grad = torch.autograd.grad(critic(x_end).sum(), x_end)[0].norm(dim=-1).mean()  # before this update's steps
+        value_grad = torch.autograd.grad(critic(x_end).sum(), x_end)[0].norm(dim=-1).mean()  # 本次更新的优化步骤之前
         Xf, Yf = X[:-1].reshape(-1, X.shape[-1]), targets.reshape(-1)
         n = Xf.shape[0]
         v_loss = torch.zeros(())
         grad_sum = torch.zeros((), device=self.device)
+        # 每轮重新打乱 HZ * B 个训练状态；末端状态只用于自举，不作为本轮回归样本。
         for _ in range(args.critic_epochs):
             perm = torch.randperm(n, device=self.device)
             for i, idx in enumerate(torch.tensor_split(perm, args.critic_minibatches)):
@@ -422,17 +449,20 @@ class Trainer:
         return v_loss.detach(), diag_mean, diag_max
 
     def policy_update(self):
+        """从回放中采样起点，更新策略，再使用想象转移更新价值网络。"""
         with self.parallel.coordinated("policy replay sampling"):
             s, h = self.sample_valid_starts(self.layout.local_pi_batch)
         with torch.no_grad():
             o_hist = self.mdp.obs(unflatten_state(h["s"]), h["a_prev"], h["xi"], h["f"])
         o_hist = self.mdp.add_noise(o_hist)
+        # 冻结世界模型与价值网络的参数，但保留它们对输入的导数，
+        # 让回报梯度仍能穿过动力学和末端价值传到策略。
         set_requires_grad(self.wm, False)
         set_requires_grad(self.critic, False)
         loss, gn, imag_r, surv, rews, keeps, xi_n, S_c, f_c, g_c, *tq = self.policy_step(s["s"], s["xi"], s["f"], s["a_prev"], o_hist)
         set_requires_grad(self.wm, True)
         set_requires_grad(self.critic, True)
-        # ---------------- critic: GAE(lambda) targets over the imagined transitions ----------------
+        # ---------------- 价值网络：想象转移的 GAE(lambda) 目标 ----------------
         if self.args.no_critic:
             v_loss, diag_mean, diag_max = torch.zeros(()), torch.zeros(len(DIAG_MEAN)), torch.zeros(len(DIAG_MAX))
         else:
@@ -446,8 +476,9 @@ class Trainer:
     # ---------------- 采样 ----------------
     @torch.no_grad()
     def _collect_action(self, S, a_prev, xi, f, ep_step, history):
-        """Fixed-shape collection work; all changing environment tensors are explicit graph inputs."""
+        """执行固定形状的采样工作，所有变化的环境张量均显式作为图输入。"""
         o = self.mdp.add_noise(self.mdp.obs(S, a_prev, xi, f))
+        # 新回合用首帧观测填满历史，避免混入上一回合；其余环境移除最旧观测并追加当前帧。
         fresh = ep_step == 0
         history = torch.where(fresh[:, None, None], o.unsqueeze(1).expand_as(history),
                               torch.cat((history[:, 1:], o.unsqueeze(1)), 1))
@@ -460,6 +491,7 @@ class Trainer:
 
     @torch.no_grad()
     def store_transition(self, out):
+        """保存模拟转移，并更新世界模型输入和目标的归一化统计。"""
         self.buffer.add(out)
         S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
         self.wm.in_norm.update(self.wm.inputs(S0, out["a"], normalize_xi(out["xi"])))
@@ -467,10 +499,13 @@ class Trainer:
 
     @torch.no_grad()
     def collect(self, n_steps: int):
+        """执行指定步数的模拟采样，写入转移并累计训练统计。"""
         env, stats = self.env, self.stats
         for _ in range(n_steps):
             S = env.state()
             a, self.obs_hist = self.collect_action(S, env.a_prev, env.xi, env.f, env.ep_step, self.obs_hist)
+            # 可将转移入库安排在环境等待重置索引之前，以重叠 GPU 工作与主机等待；
+            # 两条路径都只存储一次转移，使用重置前的后继状态。
             overlap = self.args.collect_overlap == "on"
             out = env.step(a, after_step=self.store_transition if overlap else None)
             if not overlap:
@@ -485,6 +520,7 @@ class Trainer:
 
     # ---------------- 一次迭代 ----------------
     def set_lr(self, lr: float):
+        """更新各优化器的学习率，兼容设备张量与普通数值。"""
         for o in (self.opt_wm, self.opt_pi, self.opt_v):
             for gparam in o.param_groups:
                 if torch.is_tensor(gparam["lr"]):
@@ -497,6 +533,7 @@ class Trainer:
         args = self.args
         lr = lr_at(it, self.layout.base_lr, args.lr_decay_iters)
         self.set_lr(lr)
+        # 用小数累加器落实更新/数据比，保留不足一个采集步的余数，避免每轮取整产生长期偏差。
         self.step_acc += 1.0 / args.utd
         n = int(self.step_acc)
         self.step_acc -= n
@@ -534,6 +571,8 @@ class Trainer:
         """自上次记日志以来的全局统计，按LOG_TABLES分组返回各行；所有rank都必须调用（含集合通信），并清空累计。"""
         args, parallel, env, motion, layout = self.args, self.parallel, self.env, self.motion, self.layout
         stats, agg, diag_agg = self.stats, self.agg, self.diag_agg
+        # 不同指标按实际环境数或批量大小加权，再归约总和与权重；
+        # 各卡分配不均时也能得到正确的全局平均值。
         keys = list(agg) + ["r"]
         values = [agg[k] if k in agg else stats[k] for k in keys]
         weights = [layout.local_wm_batch if k in ("wm", "wm8") else layout.local_envs if k == "r" else layout.local_pi_batch
@@ -541,6 +580,7 @@ class Trainer:
         totals = parallel.reduce([[sum(float(v) for v in vs) * weight, len(vs) * weight]
                                   for vs, weight in zip(values, weights)]).cpu()
         means = {key: float(pair[0] / pair[1].clamp(min=1)) for key, pair in zip(keys, totals)}
+        # 回合指标按已结束回合数归一化；计时取最慢进程，反映同步训练实际吞吐。
         episodes = parallel.reduce([sum(float(v) for v in stats[key]) for key in ("ep_len", "ep_ret", "term", "done")]).cpu()
         timing = parallel.reduce([time.time() - self.t_log, time.time() - self.t_start], torch.distributed.ReduceOp.MAX).cpu()
         ips = args.log_every / float(timing[0])
@@ -608,6 +648,7 @@ class Trainer:
         rotate_states(last, keep_states)
         torch.save(ck, last + ".tmp")
         os.replace(last + ".tmp", last)
+        # 评估检查点只保留推理模型与溯源信息；last.pt 另包含优化器和课程状态，用于继续训练。
         small = {k: ck[k] for k in ("pi", "wm", "iteration", "wall_time", "sim_steps", "args", "saved_at", "reference", "distributed")}
         path = os.path.join(log_dir, f"ckpt_{it + 1:06d}.pt")
         torch.save(small, path + ".tmp")

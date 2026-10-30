@@ -1,14 +1,9 @@
-"""Training-condition episode diagnostic for a SuperMimic checkpoint (read-only).
+"""在训练采集条件下诊断检查点的回合回报，不修改检查点。
 
-Replays the policy under the training collection setup of supermimic/scripts/train.py:
-domain randomization, reset noise, return-based bin starts, observation noise, action noise
-N(0, 0.1^2) clamped to +-20, and the 500-step episode cap. Each finished episode is logged
-with its ep_ret_norm (exactly as the training log computes it) and the split of its return
-into tracking reward, action-smoothness penalty and joint-limit penalty.
-
-Run from the repository root; --src selects the source tree (default: this repository):
-    python scripts/diag_train_episodes.py --src <src> --ckpt <ckpt.pt> --motion_source <subset.h5> --out <dir>
-"""
+沿用 train.py 的域随机化、重置噪声、基于回报的分箱起点、观测噪声，
+以及截断至 ±20 的 N(0, 0.1^2) 动作噪声和 500 步回合上限。
+逐回合记录与训练日志定义一致的 ep_ret_norm，并拆分跟踪奖励、动作平滑惩罚和关节限位惩罚。
+在仓库根目录运行，--src 指定被测源码树，默认使用本仓库。"""
 
 import argparse
 import csv
@@ -62,12 +57,13 @@ hist = torch.zeros(N, Hh, OBS_DIM, device=dev)
 acc_names = ("track", "rate_pen", "lim_pen", "r", "rate0", "lim0", "r0", "rate_max", "a_absmax", "sat_steps", "rate_max_step")
 acc = {k: torch.zeros(N, device=dev) for k in acc_names}
 f_start = env.f.clone()
-episodes = []  # list of dicts of CPU tensors per step with finished episodes
+episodes = []  # 逐步保存已结束回合的 CPU 张量字典
 
 t0 = time.time()
 with torch.no_grad():
     for step in range(args.steps):
         S = env.state()
+        # 环境 step 会自动重置结束的回合，因此先保存推进前的步数和起点，供结束时归因。
         ep_step = env.ep_step.clone()
         fresh = ep_step == 0
         f_start = torch.where(fresh, env.f, f_start)
@@ -76,6 +72,7 @@ with torch.no_grad():
         a = torch.clamp(pi(hist, motion.goal(env.f, K)) + args.action_noise * torch.randn(N, NUM_J, device=dev), -20, 20)
         out = env.step(a)
         r, terms, done = out["r"], out["terms"], out["done"]
+        # terms 中惩罚项仍是原始误差，需要乘权重和控制步长；track 已包含控制步长。
         rate_pen = w_rate * terms["action_rate"] * CONTROL_DT
         lim_pen = w_lim * terms["joint_limit"] * CONTROL_DT
         acc["track"] += terms["track"]
@@ -84,6 +81,7 @@ with torch.no_grad():
         acc["r"] += r
         for k, v in (("rate0", rate_pen), ("lim0", lim_pen), ("r0", r)):
             acc[k] = torch.where(fresh, v, acc[k])
+        # 惩罚是非正数，因此更小代表更严重；同步记录出现位置，区分首步瞬态与后续不稳定。
         worse = rate_pen < acc["rate_max"]
         acc["rate_max"] = torch.where(worse, rate_pen, acc["rate_max"])
         acc["rate_max_step"] = torch.where(worse, ep_step.float(), acc["rate_max_step"])
@@ -98,6 +96,7 @@ with torch.no_grad():
             rec |= {"T": T, "term": out["term"][ids].float(), "ep_ret_norm": out["ep_ret_norm"],
                     "start_offset": (fs - motion.clip_start[clip]).float(), "clip_len": motion.clip_len[clip].float(),
                     "clip": clip.float(), "friction": out["xi"][ids, 0]}
+            # 只将已完成回合移到 CPU；存档后清空对应环境累计量，其余仍在进行的回合继续累加。
             episodes.append({k: v.cpu() for k, v in rec.items()})
             for k in acc_names:
                 acc[k][ids] = 0.0
@@ -106,7 +105,7 @@ elapsed = time.time() - t0
 E = {k: torch.cat([e[k] for e in episodes]) for k in episodes[0]}
 n = len(E["T"])
 den = E["T"] * MAX_STEP_REWARD
-# my own split must reproduce the logged metric
+# 奖励拆分之和必须复现日志指标
 check = (E["r"] / den - E["ep_ret_norm"]).abs().max().item()
 parts = {"track": E["track"] / den, "rate_pen": E["rate_pen"] / den, "lim_pen": E["lim_pen"] / den}
 first_rate = E["rate0"] / den
@@ -114,15 +113,18 @@ first_lim = E["lim0"] / den
 
 
 def q(x, ps=(0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0)):
+    """计算指定分位数及均值，并将结果舍入为便于 JSON 输出的数值。"""
     x = x.float()
     return {f"p{p * 100:g}": round(float(torch.quantile(x, p)), 4) for p in ps} | {"mean": round(float(x.mean()), 4)}
 
 
 def bucket_rows(mask_fn, labels):
+    """按掩码分组汇总回报和惩罚贡献，跳过没有回合的分组。"""
     rows = []
     for label, m in zip(labels, mask_fn):
         if m.sum() == 0:
             continue
+        # 组内均值描述该类回合的表现；对总体均值的贡献则除以全部回合数，不能用组内均值代替。
         rows.append({"bucket": label, "episodes": int(m.sum()), "share": round(float(m.float().mean()), 4),
                      "mean_ep_ret_norm": round(float(E["ep_ret_norm"][m].mean()), 4),
                      "contrib_to_overall_mean": round(float(E["ep_ret_norm"][m].sum() / n), 4),
@@ -137,6 +139,7 @@ def bucket_rows(mask_fn, labels):
 T = E["T"]
 by_T = bucket_rows([T == 1, (T >= 2) & (T <= 5), (T >= 6) & (T <= 20), (T >= 21) & (T <= 100), (T >= 101) & (T <= 499), T >= 500],
                    ["T=1", "T=2-5", "T=6-20", "T=21-100", "T=101-499", "T=500"])
+# 额外单列最低回报的 1% 回合，检查少量短回合或大惩罚是否主导整体均值。
 order = torch.argsort(E["ep_ret_norm"])
 worst_k = max(1, n // 100)
 worst = order[:worst_k]

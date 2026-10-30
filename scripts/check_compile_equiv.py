@@ -1,14 +1,8 @@
-"""Compare eager and compiled updates from the same model, optimizer and RNG state.
+"""从相同模型、优化器和随机数状态比较普通执行与编译后的更新。
 
-Extra arguments are forwarded to supermimic.scripts.train.setup. The compiler uses fallback_random=True so that
-both paths receive identical noise; this checks arithmetic, not equivalence of the two RNG
-implementations. The normal training path keeps its default compiler RNG implementation.
-
-    python scripts/check_compile_equiv.py --motion_source SOURCE --motion_limit 8 --amp none
-
-Numerical tolerances are explicit (--atol/--rtol); a mismatch exits nonzero. The test also
-reports errors in parameter *updates*, so the size of unchanged weights cannot hide drift.
-"""
+额外参数转交 train.setup。编译器设置 fallback_random=True 以提供相同噪声，仅检查算术结果，
+不检查两种随机数实现的等价性；正常训练仍使用默认编译器随机数实现。
+--atol 和 --rtol 指定数值容差，任一不匹配使程序非零退出。另比较参数更新量，避免未变化权重掩盖偏移。"""
 
 import argparse
 from contextlib import contextmanager
@@ -36,10 +30,12 @@ def kernel_scope(namespace, kernels):
 
 
 def compare_trees(label, eager, compiled, atol, rtol):
+    """逐叶比较嵌套输出，按给定容差检查张量并报告最大绝对与相对误差。"""
     left, spec_left = tree_flatten(eager)
     right, spec_right = tree_flatten(compiled)
     if spec_left != spec_right:
         raise AssertionError(f"{label}: output structures differ")
+    # 既检查嵌套结构与非张量值，也检查张量误差；整数和布尔张量必须完全一致。
     failures, maximum, max_relative = [], 0.0, 0.0
     for index, (a, b) in enumerate(zip(left, right)):
         if not torch.is_tensor(a):
@@ -63,13 +59,15 @@ def compare_trees(label, eager, compiled, atol, rtol):
 
 
 def restore_training_state(module, optimizer, saved_model, saved_optimizer):
+    """恢复模型及独立的优化器状态副本，避免预热污染比较基准。"""
     module.load_state_dict(saved_model)
-    # load_state_dict can retain optimizer-state tensor references on the same device. Each replay
-    # needs its own copy, or the warmup mutates the baseline's Adam step and moments.
+    # load_state_dict 可能保留同一设备上的优化器状态张量引用；每次重放
+    # 都需独立副本，避免预热修改基准 Adam 步数及动量。
     optimizer.load_state_dict(copy.deepcopy(saved_optimizer))
 
 
 def main():
+    """建立单卡训练状态，对普通与编译内核逐项比较并以退出码报告结果。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--atol", type=float, default=1e-5)
     parser.add_argument("--rtol", type=float, default=1e-3)
@@ -90,17 +88,21 @@ def main():
     print("compiler RNG: fallback_random=True (identical noise for arithmetic comparison)", flush=True)
 
     def compare(name, module, optimizer, inputs, pre=lambda: None, post=lambda: None):
+        """从一致的训练与随机数状态执行两种计算路径，比较输出及参数更新。"""
         fn = getattr(trainer, f"_{name}")
         with kernel_scope(kernels_namespace, eager_kernels):
             pre()
-            fn(*inputs)  # initialize Adam state before taking the baseline
+            fn(*inputs)  # 保存比较基准前先初始化 Adam 状态
             post()
         saved_model, saved_opt = copy.deepcopy(module.state_dict()), copy.deepcopy(optimizer.state_dict())
         cpu_rng, cuda_rng = torch.get_rng_state(), torch.cuda.get_rng_state()
+        # 保留更新前参数，用增量单独比较，避免大权重本身让相对容差掩盖微小但重要的更新差异。
         baseline_params = {key: value.detach().clone() for key, value in module.named_parameters()}
 
         def run(kernels):
+            """恢复基准状态和随机数，执行指定内核并返回输出、状态及参数增量。"""
             restore_training_state(module, optimizer, saved_model, saved_opt)
+            # 每次都恢复 CPU 与 CUDA 随机数状态，使编译和普通执行使用相同样本噪声。
             torch.set_rng_state(cpu_rng)
             torch.cuda.set_rng_state(cuda_rng)
             trainer.nonfinite.zero_()
@@ -114,7 +116,7 @@ def main():
             updates = {key: value.detach().clone() - baseline_params[key] for key, value in module.named_parameters()}
             return outputs, copy.deepcopy(module.state_dict()), updates, copy.deepcopy(optimizer.state_dict())
 
-        run(compiled_kernels)  # compilation/warmup may execute updates; run() restores before both comparisons
+        run(compiled_kernels)  # 编译和预热可能执行更新；run() 在两次比较前都会恢复状态
         left = run(eager_kernels)
         right = run(compiled_kernels)
         results = [compare_trees(f"{name}/{label}", a, b, options.atol, options.rtol)

@@ -1,9 +1,7 @@
-# Ported from zita-ch/supermimic_vibed (MIT, Copyright (c) 2026 ETH Zurich, Chong Zhang); see THIRD_PARTY_NOTICES.md.
-"""SuperMimic training (Algorithm A.1): collect -> fit world model -> BPTT policy + critic update.
+# 移植自 zita-ch/supermimic_vibed（MIT，Copyright (c) 2026 ETH Zurich, Chong Zhang）；详见 THIRD_PARTY_NOTICES.md。
+"""SuperMimic 训练（算法 A.1）：采样、拟合世界模型，再通过 BPTT 更新策略和价值网络。
 
-本文件只负责命令行、分布式进程、数据加载与运行目录；训练状态与各更新步骤在
-supermimic/tasks/tracking/rl/trainer.py。检查脚本用setup()得到预热后的Trainer，不必运行训练循环。
-"""
+本模块负责命令行、分布式进程、数据加载和运行目录；训练状态与更新步骤位于 supermimic.tasks.tracking.rl.trainer。检查脚本可通过 setup() 获取预热后的 Trainer，无需运行训练循环。"""
 
 from __future__ import annotations
 
@@ -104,6 +102,7 @@ parser.add_argument("--local-rank", "--local_rank", type=int, default=None, help
 
 
 def tensorboard_enabled(args) -> bool:
+    """根据命令行设置及 TensorBoard 是否可用决定是否启用日志。"""
     import importlib.util
 
     return args.tensorboard == "on" or (args.tensorboard == "auto" and importlib.util.find_spec("tensorboard") is not None)
@@ -136,6 +135,7 @@ def setup(argv: list[str] | None = None):
         layout = make_layout(args, parallel)
     parallel.require_equal({k: v for k, v in vars(args).items() if k != "local_rank"}, "training arguments")
 
+    # 每卡载入自己的完整片段分片；先确认存在足够长的片段，再进入需要固定时域的训练。
     with parallel.coordinated("reference loading"):
         kin = G1Kinematics(dev)
         motion = MotionLib.from_args(args, kin, dev, parallel.rank, parallel.world_size)
@@ -144,6 +144,7 @@ def setup(argv: list[str] | None = None):
         if not bool((motion.clip_len > args.horizon).any()):
             raise ValueError("this reference shard has no complete imagination horizon; use fewer ranks or a larger selection")
     parallel.require_equal(motion.global_description["fingerprint"], "global reference fingerprint")
+    # 主进程写全局运行信息，各卡随后单独记录本地分片和实际批量，便于复现实验资源配置。
     with parallel.coordinated("run metadata"):
         if parallel.primary:
             os.makedirs(args.log_dir, exist_ok=True)
@@ -164,15 +165,16 @@ def setup(argv: list[str] | None = None):
     print(f"rank {parallel.rank}/{parallel.world_size} on {dev}: {len(motion.names)} full clips, "
           f"{motion.num_frames} local frames, reference {motion.description['reference_tensor_bytes'] / 1024**3:.3f} GiB", flush=True)
     if tensorboard_enabled(args):
-        from torch.utils.tensorboard import SummaryWriter  # noqa: F401  (fails here, before warmup, when "on" lacks the package)
+        from torch.utils.tensorboard import SummaryWriter  # noqa: F401  （启用时若缺少依赖，在预热前就报错）
 
     trainer = Trainer(args, parallel, layout, kin, motion, resume_ck)
-    # The replay buffer is not checkpointed, so resumed runs also need fresh transitions.
+    # 经验回放缓冲区不写入检查点，因此恢复训练后也需要采集新的转移。
     trainer.collect(args.warmup_steps)
     return args, parallel, trainer
 
 
 def main(argv: list[str] | None = None):
+    """初始化训练状态，循环执行训练、记录日志并保存检查点。"""
     args, parallel, trainer = setup(argv)
     from supermimic.tasks.tracking.rl.trainer import LOG_TABLES
     from supermimic.utils.run_log import RunLog
@@ -204,6 +206,7 @@ def main(argv: list[str] | None = None):
                     trainer.save(it, args.log_dir, args.keep_states, bins)
     if log:
         log.close()
+    # 先释放可能包含 NCCL 操作的捕获图，再销毁进程组，保持资源依赖的释放顺序。
     trainer.close()
     parallel.close()
 

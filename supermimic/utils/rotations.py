@@ -1,5 +1,5 @@
-# Ported from zita-ch/supermimic_vibed (MIT, Copyright (c) 2026 ETH Zurich, Chong Zhang); see THIRD_PARTY_NOTICES.md.
-"""Batched rotation utilities (quaternions are wxyz, rotation matrices act on column vectors)."""
+# 移植自 zita-ch/supermimic_vibed（MIT，Copyright (c) 2026 ETH Zurich, Chong Zhang）；详见 THIRD_PARTY_NOTICES.md。
+"""批量旋转工具：四元数按 wxyz 排列，旋转矩阵作用于列向量。"""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 
 def quat_to_mat(q: torch.Tensor) -> torch.Tensor:
+    """将批量四元数归一化后转换为旋转矩阵，保留前面的批量维度。"""
     q = F.normalize(q, dim=-1)
     w, x, y, z = q.unbind(-1)
     return torch.stack(
@@ -21,7 +22,7 @@ def quat_to_mat(q: torch.Tensor) -> torch.Tensor:
 
 
 def mat_to_quat(m: torch.Tensor) -> torch.Tensor:
-    """Robust matrix -> quaternion (wxyz, w >= 0)."""
+    """稳定地将旋转矩阵转换为四元数，结果按 wxyz 排列且 w 非负。"""
     m00, m01, m02 = m[..., 0, 0], m[..., 0, 1], m[..., 0, 2]
     m10, m11, m12 = m[..., 1, 0], m[..., 1, 1], m[..., 1, 2]
     m20, m21, m22 = m[..., 2, 0], m[..., 2, 1], m[..., 2, 2]
@@ -29,6 +30,8 @@ def mat_to_quat(m: torch.Tensor) -> torch.Tensor:
     qx = torch.sqrt(torch.clamp(1 + m00 - m11 - m22, min=1e-10)) / 2
     qy = torch.sqrt(torch.clamp(1 - m00 + m11 - m22, min=1e-10)) / 2
     qz = torch.sqrt(torch.clamp(1 - m00 - m11 + m22, min=1e-10)) / 2
+    # 分别假设四元数的某一分量为主分量构造候选；随后选绝对值最大的分量作分母，
+    # 避免接近 180 度时仅用实部分量计算所造成的数值不稳定。
     cands = torch.stack(
         (
             torch.stack((qw, (m21 - m12) / (4 * qw), (m02 - m20) / (4 * qw), (m10 - m01) / (4 * qw)), -1),
@@ -45,7 +48,7 @@ def mat_to_quat(m: torch.Tensor) -> torch.Tensor:
 
 
 def axis_angle_to_mat(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
-    """Rodrigues for a fixed unit axis (..., 3) and angle (...)."""
+    """用 Rodrigues 公式将单位旋转轴（..., 3）和角度（...）转换为矩阵。"""
     x, y, z = axis.unbind(-1)
     c, s = torch.cos(angle), torch.sin(angle)
     C = 1 - c
@@ -60,10 +63,11 @@ def axis_angle_to_mat(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
 
 
 def so3_exp(v: torch.Tensor) -> torch.Tensor:
-    """Rotation vector (..., 3) -> matrix, smooth at zero."""
+    """将旋转向量（..., 3）映射为矩阵，并在零角度附近使用平滑近似。"""
     theta2 = (v * v).sum(-1, keepdim=True)
     theta = torch.sqrt(theta2 + 1e-12)
     small = theta2 < 1e-8
+    # 小角度处用泰勒展开消除 sin(theta)/theta 和 (1-cos(theta))/theta² 的相消误差。
     a = torch.where(small, 1 - theta2 / 6, torch.sin(theta) / theta)
     b = torch.where(small, 0.5 - theta2 / 24, (1 - torch.cos(theta)) / (theta2 + 1e-12))
     K = skew(v)
@@ -72,12 +76,13 @@ def so3_exp(v: torch.Tensor) -> torch.Tensor:
 
 
 def so3_log(R: torch.Tensor) -> torch.Tensor:
-    """Matrix -> rotation vector via the quaternion (stable near 0 and pi)."""
+    """通过四元数将矩阵转换为旋转向量，在零和 π 附近保持稳定。"""
     q = mat_to_quat(R)
     return quat_to_rotvec(q)
 
 
 def quat_to_rotvec(q: torch.Tensor) -> torch.Tensor:
+    """将单位四元数转换为旋转向量，并选择非负实部对应的表示。"""
     q = q * torch.where(q[..., :1] < 0, -1.0, 1.0)
     v = q[..., 1:]
     sin_half = torch.linalg.norm(v, dim=-1, keepdim=True)
@@ -87,20 +92,21 @@ def quat_to_rotvec(q: torch.Tensor) -> torch.Tensor:
 
 
 def skew(v: torch.Tensor) -> torch.Tensor:
+    """构造向量的反对称矩阵，使矩阵乘法等价于叉积。"""
     x, y, z = v.unbind(-1)
     o = torch.zeros_like(x)
     return torch.stack((o, -z, y, z, o, -x, -y, x, o), -1).reshape(v.shape[:-1] + (3, 3))
 
 
 def rot_angle_sq(Ra: torch.Tensor, Rb: torch.Tensor) -> torch.Tensor:
-    """Squared geodesic angle between rotations, differentiable (via acos of trace, clamped)."""
-    tr = (Ra * Rb).sum((-1, -2))  # trace(Ra^T Rb)
+    """计算两个旋转之间的测地角平方；截断余弦值以保持梯度稳定。"""
+    tr = (Ra * Rb).sum((-1, -2))  # 相对旋转矩阵 Ra^T Rb 的迹
     cos = torch.clamp((tr - 1) / 2, -1 + 1e-6, 1 - 1e-6)
     return torch.acos(cos) ** 2
 
 
 def yaw_mat(R: torch.Tensor) -> torch.Tensor:
-    """Heading (yaw-only) rotation of R, from the projected x axis."""
+    """将 x 轴投影到水平面，从旋转矩阵提取仅含偏航角的朝向。"""
     fx, fy = R[..., 0, 0], R[..., 1, 0]
     n = torch.sqrt(fx * fx + fy * fy + 1e-9)
     c, s = fx / n, fy / n
@@ -109,12 +115,14 @@ def yaw_mat(R: torch.Tensor) -> torch.Tensor:
 
 
 def mat_to_6d(R: torch.Tensor) -> torch.Tensor:
-    """First two columns, flattened (6D continuous rotation representation)."""
+    """展平旋转矩阵的前两列，得到六维连续旋转表示。"""
     return R[..., :, :2].reshape(R.shape[:-2] + (6,))
 
 
 def quat_slerp(q0: torch.Tensor, q1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """沿最短弧球面插值四元数；夹角很小时退化为线性插值。"""
     dot = (q0 * q1).sum(-1, keepdim=True)
+    # q 与 -q 表示同一旋转；先统一到同一半球，确保插值沿较短弧进行。
     q1 = torch.where(dot < 0, -q1, q1)
     dot = dot.abs().clamp(max=1.0)
     theta = torch.acos(dot)

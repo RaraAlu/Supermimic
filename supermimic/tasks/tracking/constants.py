@@ -1,7 +1,7 @@
-# Ported from zita-ch/supermimic_vibed (MIT, Copyright (c) 2026 ETH Zurich, Chong Zhang); see THIRD_PARTY_NOTICES.md.
-"""Motion-data joint ordering and tracking targets; no robot configuration."""
+# 移植自 zita-ch/supermimic_vibed（MIT，Copyright (c) 2026 ETH Zurich, Chong Zhang）；详见 THIRD_PARTY_NOTICES.md。
+"""动作数据的关节顺序和跟踪目标；不包含机器人配置。"""
 
-# Joint order of the LAFAN1 retarget CSVs (Unitree SDK order), which is also mjlab's G1 order.
+# LAFAN1 重定向 CSV 的关节顺序（Unitree SDK 顺序），也与 mjlab 的 G1 顺序一致。
 G1_JOINT_NAMES = [
     "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint", "left_knee_joint",
     "left_ankle_pitch_joint", "left_ankle_roll_joint",
@@ -14,7 +14,7 @@ G1_JOINT_NAMES = [
     "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
 ]  # fmt: skip
 
-# BeyondMimic's tracked bodies; the anchor/root is the pelvis.
+# BeyondMimic 跟踪的刚体；锚点和根部均为骨盆。
 TRACKED_BODIES = [
     "pelvis", "left_hip_roll_link", "left_knee_link", "left_ankle_roll_link",
     "right_hip_roll_link", "right_knee_link", "right_ankle_roll_link", "torso_link",

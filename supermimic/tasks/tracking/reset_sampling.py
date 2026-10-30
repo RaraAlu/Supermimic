@@ -9,23 +9,19 @@ import torch.distributed as dist
 
 from supermimic.utils.distributed import LocalContext
 
-TAIL_STEPS = 100  # resets this close to the clip end (2 s) are reported as tail resets
+TAIL_STEPS = 100  # 距片段末尾不超过此步数（2 秒）的重置计为末尾重置
 CLIP_END_MODES = ("bootstrap", "terminal")
 PRIORS = ("zero", "mean")
 
 
 @torch.no_grad()
 def update_bin_returns(estimates, bins, returns, alpha=0.2, visits=None, replace_first=False):
-    """Apply one EMA update per bin using its mean episode return in this simulator step.
+    """对本模拟步中结束的回合按分箱求平均回报，每箱执行一次 EMA 更新。
 
-    Several environments can finish in the same bin. Sort them in a stable order and reduce each
-    segment before writing: index_put_ with duplicate destinations silently loses observations and
-    has undefined results on CUDA. Unique bins retain the original single-episode update exactly.
-    ``visits`` counts finished episodes per bin; with ``replace_first`` a bin's first update takes
-    the observed mean instead of blending it into the initial value.
-    """
+    多个环境可能在同一箱结束：先稳定排序并分段归约，再写入，避免 index_put_ 在重复目标下丢失观测或产生未定义 CUDA 结果。唯一分箱与原来的单回合更新一致。visits 记录每箱结束的回合数；replace_first 为真时首次更新直接采用观测均值。"""
     if bins.numel() == 0:
         return
+    # 先把重复分箱的回合聚合为一条观测，再更新 EMA；同一步结束回合的排列不会改变更新次数。
     order = torch.argsort(bins, stable=True)
     unique, counts = torch.unique_consecutive(bins[order], return_counts=True)
     means = torch.segment_reduce(returns[order], "mean", lengths=counts)
@@ -40,27 +36,18 @@ def update_bin_returns(estimates, bins, returns, alpha=0.2, visits=None, replace
 @torch.no_grad()
 def episode_bin_scores(disc_ret, ret, head_disc, head_ret, steps, terminated, at_clip_end, left, gamma, step_max,
                        clip_end="bootstrap", max_steps=500, skip_steps=0):
-    """Normalized reset-bin scores of finished episodes, and which episodes may update their bin.
+    """计算已结束回合的归一化分箱得分及其是否可以更新分箱。
 
-    disc_ret and ret are the discounted and plain reward sums from the start frame, head_disc and
-    head_ret the same sums over the first skip_steps steps, steps the episode length, left the steps
-    from the start frame to the clip end. Truncated episodes extend their return with their mean
-    reward ("bootstrap"); with "terminal", an episode that reaches the clip end stops there and is
-    scored against the maximum attainable from its start, and only the max_steps cap is extended.
+    disc_ret、ret 为起始帧起的折扣及未折扣回报，head_disc、head_ret 为前 skip_steps 步的对应回报；steps 是回合长度，left 是起点到片段末尾的步数。bootstrap 模式以平均奖励外推截断回合；terminal 模式在片段末尾结束回报，按起点可达的最大值评分，仅对 max_steps 截断进行外推。
 
-    With skip_steps > 0 the score is the return after the reset transient: right after a reset the
-    policy recovers from reset noise, a zero previous action and a repeated observation history,
-    which costs reward for about a second regardless of the bin, and in a short episode that cost
-    dominates the mean reward the bootstrap extends. An episode that falls within the transient
-    still scores 0; one truncated within it carries no other evidence and does not update its bin.
-    A non-finite score (a diverged simulation) never updates its bin: one NaN estimate would stay in
-    the bin for good and make every later weight computation fall back to the uniform distribution.
-    """
+    skip_steps 大于零时跳过重置瞬态，以免重置噪声、零前一动作和重复观测历史的恢复成本主导短回合得分。瞬态内跌倒仍记零分，瞬态内截断则不更新分箱。非有限得分也不更新，避免 NaN 永久污染采样权重。"""
+    # 移除重置瞬态后，将折扣起点重新移到有效区间首步；步数及可达时域同步平移。
     if skip_steps:
         disc_ret, ret = (disc_ret - head_disc) / gamma**skip_steps, ret - head_ret
         steps, left, max_steps = steps - skip_steps, left - skip_steps, max_steps - skip_steps
     valid = terminated | (steps > 0)
     ended = terminated | at_clip_end if clip_end == "terminal" else terminated
+    # 真正终止不补未来奖励；允许自举的截断回合按已观测平均奖励估算剩余无限时域。
     G = disc_ret + torch.where(ended, 0.0, gamma**steps * (ret / steps.clamp(min=1)) / (1 - gamma))
     G_max = torch.full_like(G, step_max / (1 - gamma))
     if clip_end == "terminal":
@@ -71,21 +58,11 @@ def episode_bin_scores(disc_ret, ret, head_disc, head_ret, steps, terminated, at
 
 @torch.no_grad()
 def global_bin_probabilities(returns, ema, maximum_return, num_bins, parallel, visits=None, allowed=None, scored=None):
-    """Global 50/40/10 reset weights; sampling remains conditional on the local shard.
+    """计算全局 50/40/10 重置权重，实际采样限定在本地分片。
 
-    With ``visits``, bins without a finished episode score the global mean of visited bins.
-    ``allowed`` marks bins that may be reset to (the others get probability 0, and the uniform share
-    is spread over allowed bins only); ``scored`` marks allowed bins whose score enters the softmax
-    and the EMA. Bins that can never produce a score take only the uniform share, so an unscorable
-    bin stuck at its initial score cannot attract the adaptive share. With no scored bin on any rank
-    (every clip too short to score), the adaptive half joins the uniform share.
+    提供 visits 时，未完成回合的分箱使用已访问分箱的全局平均分。allowed 指定允许重置的分箱；scored 指定参与 softmax 和 EMA 的分箱。无法评分的分箱只获得均匀权重；若所有进程都没有可评分的分箱，则自适应权重也并入均匀分布。
 
-    Scores are clamped to [0, maximum_return], the range a working policy produces. Below 0 the
-    penalties outweigh the tracking reward; after a policy collapse many bins score far below 0,
-    and exp(-25 * score) then turns the softmax into a single bin that takes the whole 40% share
-    (0.48 of the weight in the 2026-10-28 run) and fills the replay buffer with one failure.
-    Clamped, all failing bins tie and share it. Scores in range are unchanged.
-    """
+    得分截断到 [0, maximum_return]，避免策略崩溃后大量负分使 softmax 几乎只选择一个失败分箱；正常范围内的得分不变。"""
     returns = torch.nan_to_num(returns, nan=0.0).clamp(0.0, maximum_return)
     if allowed is None:
         allowed = torch.ones_like(returns, dtype=torch.bool)
@@ -96,10 +73,11 @@ def global_bin_probabilities(returns, ema, maximum_return, num_bins, parallel, v
         seen = (visits > 0) & scored
         total, count = parallel.reduce(torch.stack(((returns * seen).double().sum(), seen.sum().double())))
         returns = torch.where(seen, returns, (total / count.clamp(min=1)).to(returns.dtype))
+    # 低分箱获得更高权重；先求跨卡最大 logit 再计算指数，保证所有分片共享同一数值基准。
     logits = torch.where(scored, -25.0 * returns / maximum_return, -torch.inf)
     maximum = parallel.reduce(logits.max(), dist.ReduceOp.MAX)
     exp = torch.where(scored, torch.exp(logits.double() - maximum), 0.0)
-    norm = parallel.reduce(exp.sum())  # >= 1 (the global maximum contributes exp(0)) unless nothing is scored
+    norm = parallel.reduce(exp.sum())  # 除无可评分分箱外，结果至少为 1（全局最大值贡献 exp(0)）
     soft = (exp / norm.clamp(min=1e-300)).to(returns.dtype)
     ema.mul_(0.999).add_(0.001 * soft)
     kept = torch.where(scored, ema, 0.0)
@@ -118,28 +96,20 @@ class BinSampler:
 
     def __init__(self, motion, device, gamma: float, parallel=None, clip_end: str = "bootstrap", prior: str = "zero",
                  skip_steps: int = 50, reset_margin: int = 100, max_steps: int = 500):
-        """clip_end: "bootstrap" extends episodes that reach the clip end with their mean reward and
-        scores bins against the global maximum return; "terminal" ends the return at the clip end and
-        scores each episode against the maximum attainable from its start frame (only the 500-step
-        cap is bootstrapped). prior: unvisited bins score 0 ("zero") or the mean of visited bins
-        ("mean", whose first episode then replaces the prior instead of being blended into it).
-        skip_steps: bins are scored from this step of each episode on, past the reset transient
-        (see episode_bin_scores). reset_margin: no reset starts within this many steps of a clip's
-        end (a clip shorter than that starts only at its first frame); such first frames and bins
-        that cannot outlast the transient take only the uniform share. Both 0 reproduce the earlier
-        scores. parallel为None时按单进程处理（LocalContext）。"""
+        """配置分箱采样：clip_end 为 bootstrap 时以平均奖励外推片段末尾并按全局最大回报评分；terminal 时在末尾结束并按起点可达的最大回报评分，仅外推步数上限截断。
+
+        prior 控制未访问分箱采用零分或已访问分箱的均值；mean 模式首次观测直接替换先验。skip_steps 跳过重置瞬态；reset_margin 排除片段末尾附近的起点，短片段仅允许首帧。无法越过瞬态的分箱及这些首帧只获得均匀权重。两者均为零时恢复旧评分方式。parallel 为 None 时使用单进程 LocalContext。"""
         if clip_end not in CLIP_END_MODES or prior not in PRIORS or skip_steps < 0 or reset_margin < 0:
             raise ValueError(f"bin_clip_end must be one of {CLIP_END_MODES}, bin_prior one of {PRIORS}, "
                              "and bin_skip_steps and reset_margin non-negative")
         self.motion, self.device, self.gamma, self.parallel = motion, device, gamma, parallel
         self.clip_end, self.prior, self.skip_steps, self.max_steps = clip_end, prior, skip_steps, max_steps
-        # per-bin score: discounted return divided by its maximum (the global maximum, or the start frame's attainable maximum)
+        # 分箱得分为折扣回报除以最大回报（全局最大值或起始帧可达到的最大值）
         self.scores = torch.full((motion.num_bins,), 0.0, device=device)
         self.visits = torch.zeros(motion.num_bins, dtype=torch.long, device=device)
-        # reset starts of a bin are [bin_start, reset_end); none within reset_margin of the clip end, except
-        # a clip's first frame. Those first frames are not scored: their score rests on the few steps between
-        # the transient and the clip end, and one low draw takes the whole softmax share. Neither is a bin whose
-        # starts cannot outlast the transient.
+        # 分箱起点为 [bin_start, reset_end)；除片段首帧外，排除距末尾不足 reset_margin 的起点。
+        # 这些首帧不参与评分：瞬态结束到片段末尾的步数太少，一次低分就可能占据全部 softmax 权重。
+        # 起点无法越过瞬态的分箱也不参与评分。
         clip_start, clip_end_frame = motion.clip_start[motion.bin_clip], motion.clip_end[motion.bin_clip]
         limit = clip_end_frame - reset_margin
         self.allowed = (motion.bin_start < limit) | (motion.bin_start == clip_start)
@@ -148,21 +118,22 @@ class BinSampler:
         num_bins = motion.global_num_bins if parallel else motion.num_bins
         self.ema = torch.full((motion.num_bins,), 1.0 / num_bins, device=device)
         self.probs = self.allowed.float() / self.allowed.sum().clamp(min=1)
-        self.reset_counts = torch.zeros(2, device=device)  # sampled resets, of which tail resets
-        self.nonfinite = torch.zeros((), device=device)  # bin scores skipped for being non-finite
+        self.reset_counts = torch.zeros(2, device=device)  # 采样重置数及其中的末尾重置数
+        self.nonfinite = torch.zeros((), device=device)  # 因非有限值而跳过的分箱得分数
         # 自上次window_report以来每个分箱被抽中的次数、从它起步的回合结束数与其中因终止而结束的数（日志用，不进入检查点）
         self.window_starts = torch.zeros(motion.num_bins, dtype=torch.long, device=device)
         self.window_ends = torch.zeros(motion.num_bins, dtype=torch.long, device=device)
         self.window_terms = torch.zeros(motion.num_bins, dtype=torch.long, device=device)
 
     def _probabilities(self, context):
+        """根据当前分箱得分、访问数和概率 EMA 计算全局重置概率。"""
         visits = self.visits if self.prior == "mean" else None
         return global_bin_probabilities(self.scores, self.ema, 1.0, self.motion.global_num_bins, context,
                                         visits, self.allowed, self.scored)
 
     def prepare(self, active):
         """多卡时每个仿真步都调用：有任一rank结束了回合就在所有rank上更新全局概率；单进程时不做事。"""
-        # Every rank participates, even when only another rank has completed episodes.
+        # 即使只有其他进程完成回合，所有进程也必须参与。
         if self.parallel and bool(self.parallel.reduce(int(active))):
             self.probs = self._probabilities(self.parallel)
 
@@ -173,7 +144,7 @@ class BinSampler:
             self.probs = self._probabilities(LocalContext)
         bins = torch.multinomial(self.probs, n, replacement=True)
         start = m.bin_start[bins]
-        end = self.reset_end[bins]  # stays >= 1 step before the clip end
+        end = self.reset_end[bins]  # 至少比片段末尾早一步
         f = start + (torch.rand(n, device=self.device) * (end - start).float()).long()
         self.reset_counts[0] += n
         self.reset_counts[1] += (m.clip_end[m.bin_clip[bins]] - f < TAIL_STEPS).sum()
@@ -182,9 +153,10 @@ class BinSampler:
 
     def record(self, start_f, start_bin, disc_ret, ret, head_disc, head_ret, steps, terminated, at_clip_end, step_max):
         """记录结束回合的得分（参数含义见episode_bin_scores），截断的回合以平均奖励外推。"""
-        left = (self.motion.clip_end[self.motion.clip_id[start_f]] - start_f).float()  # start frame to clip end
+        left = (self.motion.clip_end[self.motion.clip_id[start_f]] - start_f).float()  # 从起始帧到片段末尾
         score, valid = episode_bin_scores(disc_ret, ret, head_disc, head_ret, steps, terminated, at_clip_end, left,
                                           self.gamma, step_max, self.clip_end, self.max_steps, self.skip_steps)
+        # 窗口结束/失败计数记录所有回合；只有有效且有限的得分进入课程更新，两类统计用途不同。
         self.nonfinite += (~torch.isfinite(score)).sum()
         self.window_ends.index_add_(0, start_bin, torch.ones_like(start_bin))
         died = start_bin[terminated]
@@ -216,6 +188,7 @@ class BinSampler:
         clip_terms = torch.zeros(n_clips, dtype=torch.long, device=self.device).index_add_(0, m.bin_clip, self.window_terms)
         clip_ends = torch.zeros(n_clips, dtype=torch.long, device=self.device).index_add_(0, m.bin_clip, self.window_ends)
         clip_starts = torch.zeros(n_clips, dtype=torch.long, device=self.device).index_add_(0, m.bin_clip, self.window_starts)
+        # 先按片段汇总终止数再排名，每个入选片段再定位最常失败的分箱，便于追踪具体动作时段。
         counts, order = clip_terms.topk(min(top, n_clips))
         rows = []
         for count, clip in zip(counts.tolist(), order.tolist()):
@@ -233,11 +206,9 @@ class BinSampler:
 
     @torch.no_grad()
     def stats(self) -> torch.Tensor:
-        """Local sums since the last call: [entropy terms, max prob, visited bins, resets, tail resets, skipped scores].
+        """返回上次调用以来的本地统计：[熵项、最大概率、已访问分箱数、重置数、末尾重置数、跳过的得分数]。
 
-        The probabilities are global (they sum to 1 across ranks), so summing the entropy terms and
-        visited bins and taking the max of the max over ranks gives the global values.
-        """
+        概率是全局分布，跨进程求和熵项与访问数、取最大概率的最大值即可得到全局统计。"""
         p = self.probs.double()
         stats = torch.stack((-(p * (p + 1e-30).log()).sum(), p.max(), (self.visits > 0).sum().double(),
                              *self.reset_counts.double(), self.nonfinite.double()))

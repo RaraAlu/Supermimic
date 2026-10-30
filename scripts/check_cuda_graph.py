@@ -1,15 +1,7 @@
-"""Check that CUDA-graph replay of the world-model, policy and critic steps and of the simulator's reward and
-termination matches eager execution bitwise.
+"""逐位比较世界模型、策略、价值网络更新以及模拟器奖励和终止处理的 CUDA 图重放与普通执行。
 
-Builds the training state with ``supermimic.scripts.train.setup(... --cuda_graph on)`` (a short warmup
-collection only), then on each rank runs one eager step and one graph replay from identical model, optimizer
-and RNG state and compares outputs and updated parameters. Extra arguments go to the training script.
-
-    python scripts/check_cuda_graph.py --motion_limit 8
-    torchrun --standalone --nproc-per-node=2 scripts/check_cuda_graph.py --motion_limit 8 --batch_scope per_gpu
-
-Exits non-zero if any comparison differs.
-"""
+通过 train.setup(... --cuda_graph on) 建立状态并短暂预热；各进程从相同模型、优化器和随机数状态
+执行普通步骤及图重放，比较输出和更新后的参数。额外参数转交训练脚本，任一差异使程序非零退出。"""
 
 import os
 import sys
@@ -33,40 +25,46 @@ rank = parallel.rank
 
 
 def snapshot(module, opt):
-    tensors_ = [t.detach().clone() for t in module.state_dict(keep_vars=True).values()]  # parameters and buffers
+    """复制模型参数、缓冲区和已有优化器状态，供两条执行路径恢复同一起点。"""
+    tensors_ = [t.detach().clone() for t in module.state_dict(keep_vars=True).values()]  # 模型参数与缓冲区
     state = {id(p): {k: v.clone() for k, v in opt.state[p].items()} for p in module.parameters() if p in opt.state}
     return tensors_, state
 
 
 def restore(module, opt, snap):
+    """原位恢复模型及优化器张量，保持 CUDA 图捕获的内存地址不变。"""
     tensors_, state = snap
     with torch.no_grad():
         for t, v in zip(module.state_dict(keep_vars=True).values(), tensors_):
             t.copy_(v)
-        for p in module.parameters():  # in place: the captured graph holds these exact tensors
+        for p in module.parameters():  # 原位恢复：捕获的图仍引用这些张量
             for k, v in state.get(id(p), {}).items():
                 opt.state[p][k].copy_(v)
 
 
 def tensors(x):
+    """按树遍历顺序提取嵌套结构中的全部张量。"""
     out = []
     tree_map(lambda t: out.append(t) if torch.is_tensor(t) else None, x)
     return out
 
 
 def compare(name, module, opt, inputs, pre=lambda: None, post=lambda: None):
+    """从一致的训练与随机数状态执行两种计算路径，比较输出及参数更新。"""
     fn = getattr(trainer, f"_{name}")
-    pre(); fn(*inputs); post()  # one real step first, so the optimizer state exists
+    pre(); fn(*inputs); post()  # 先实际更新一步，以初始化优化器状态
+    # 优化器状态初始化后才保存基准；每次捕获或重放前恢复同一参数和随机数状态。
     snap, rng = snapshot(module, opt), torch.cuda.get_rng_state()
     pre(); eager_out = fn(*inputs); post()
     eager_params = [t.detach().clone() for t in module.state_dict(keep_vars=True).values()]
     graphed = trainer.graphed(fn, eager_calls=0)
     restore(module, opt, snap); torch.cuda.set_rng_state(rng)
-    pre(); first_out = graphed(*inputs); post()  # capture, then replay
+    pre(); first_out = graphed(*inputs); post()  # 先捕获计算图，再重放执行
+    # 首次捕获后的重放与后续重放分别比较，防止仅验证稳定重放而漏掉首次执行的差异。
     first_ok = all(torch.equal(a, b) for a, b in zip(tensors(eager_out), tensors(first_out)))
     first_ok &= all(torch.equal(a, b.detach()) for a, b in zip(eager_params, module.state_dict(keep_vars=True).values()))
     restore(module, opt, snap); torch.cuda.set_rng_state(rng)
-    pre(); graph_out = graphed(*inputs); post()  # replay from the eager call's starting state
+    pre(); graph_out = graphed(*inputs); post()  # 从普通执行的同一起始状态重放
     outs = all(torch.equal(a, b) for a, b in zip(tensors(eager_out), tensors(graph_out)))
     params = all(torch.equal(a, b.detach()) for a, b in zip(eager_params, module.state_dict(keep_vars=True).values()))
     print(f"rank {rank} {name}: first capture+replay bitwise equal {first_ok}, outputs bitwise equal {outs}, updated parameters and buffers bitwise equal {params}", flush=True)
@@ -91,8 +89,8 @@ env = trainer.env
 if trainer.collect_action.enabled:
     ok &= compare("collect_action", pi, opt_pi,
                   (env.state(), env.a_prev, env.xi, env.f, env.ep_step, trainer.obs_hist))
-# Compare the actual post-processing on both sides of reset, using the same transition and the same
-# starting normalizer/buffer state. Replaying physics would introduce simulator nondeterminism.
+# 使用相同转移以及相同的归一化器和缓冲区初始状态，比较重置前后的实际后处理。
+# 不重放物理过程，以免引入模拟器的非确定性。
 buffer, store = trainer.buffer, trainer.store_transition
 norms = (wm.in_norm, wm.out_norm)
 overlap_same = True
@@ -118,7 +116,7 @@ if env._reward_termination.enabled:
     a, a_prev = torch.randn(env.N, NUM_J, device=env.device), env.a_prev.clone()
     eager_out = env._reward_termination_eager(S1, f1, a, a_prev)
     graphed = GraphedCall(env._reward_termination_eager, eager_calls=0, thread_local=parallel.enabled)
-    graphed(S1, f1, a, a_prev)  # capture, then replay
+    graphed(S1, f1, a, a_prev)  # 先捕获计算图，再重放执行
     graph_out = graphed(S1, f1, a, a_prev)
     same = all(torch.equal(x, y) for x, y in zip(tensors(eager_out), tensors(graph_out)))
     print(f"rank {rank} env reward/termination: outputs bitwise equal {same} ({len(tensors(eager_out))} tensors)", flush=True)

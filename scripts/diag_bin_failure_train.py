@@ -52,6 +52,7 @@ for c in range(len(motion.names)):
     starts += [s0 + o for o in range(0, n - 1, args.stride)]
 starts = torch.tensor(starts, device=dev)
 P, R = len(starts), args.repeats
+# 每个起点连续占用 R 个环境，方便结束后还原为（起点数, 重复次数）并统计失败频次。
 per_batch = max(args.num_envs // R, 1)
 N = per_batch * R
 fails = torch.zeros(P, dtype=torch.long, device=dev)
@@ -74,10 +75,12 @@ with torch.no_grad():
                                torch.cat((hist[:, 1:], o.unsqueeze(1)), 1))
             a = torch.clamp(pi(hist, motion.goal(env.f, K)) + args.action_noise * torch.randn(N, NUM_J, device=dev), -20, 20)
             out = env.step(a)
+            # 训练环境会自动重置，但诊断只关心指定起点的第一回合；用 ended 屏蔽后续回合的失败。
             failed |= out["term"] & ~ended
             ended |= out["done"]
             if bool(ended.all()):
                 break
+        # 沿重复次数求和，并丢弃为填满最后批次而复制的起点，保证每个真实起点权重相同。
         fails[b0:b0 + cnt] = failed.view(per_batch, R)[:cnt].sum(-1)
 elapsed = time.time() - t0
 

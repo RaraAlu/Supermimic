@@ -1,5 +1,5 @@
-# Ported from zita-ch/supermimic_vibed (MIT, Copyright (c) 2026 ETH Zurich, Chong Zhang); see THIRD_PARTY_NOTICES.md.
-"""Full-clip 50 Hz references, derivatives and FK for the built-in mjlab G1."""
+# 移植自 zita-ch/supermimic_vibed（MIT，Copyright (c) 2026 ETH Zurich, Chong Zhang）；详见 THIRD_PARTY_NOTICES.md。
+"""为 mjlab 内置 G1 提供完整片段的 50 Hz 参考数据、导数和正向运动学。"""
 
 from __future__ import annotations
 
@@ -19,42 +19,43 @@ from supermimic.utils.rotations import mat_to_6d, mat_to_quat, quat_slerp, quat_
 CONTROL_DT = 0.02
 # 每个未来帧的目标特征：当前偏航系下的根位置与6D朝向、根系速度、q、qd
 GOAL_FRAME_DIM = 3 + 6 + 3 + 3 + NUM_J + NUM_J
-BIN_FRAMES = 50  # 1 s bins for return-based reset sampling
-MIN_TAIL_STARTS = BIN_FRAMES // 2  # a shorter final bin joins the previous one
+BIN_FRAMES = 50  # 用于基于回报的重置采样，每箱 1 秒
+MIN_TAIL_STARTS = BIN_FRAMES // 2  # 过短的末箱并入前一箱
 FK_CHUNK = 65536
 
 
 def bin_counts(lengths: torch.Tensor) -> torch.Tensor:
-    """Reset bins per clip over its n - 1 start frames (the final frame is never a start).
+    """计算各片段 n - 1 个可用起始帧的重置分箱数，末帧不能作为起点。
 
-    A final bin with fewer than MIN_TAIL_STARTS start frames is merged into the previous bin:
-    its episodes would last only a few steps, and their bootstrapped bin returns would pull
-    the return-based reset sampling onto clip ends.
-    """
+    末箱起始帧少于 MIN_TAIL_STARTS 时并入前一箱，避免极短回合的外推回报使基于回报的采样集中到片段末尾。"""
     starts = lengths - 1
     full, tail = starts // BIN_FRAMES, starts % BIN_FRAMES
     return full + ((tail >= MIN_TAIL_STARTS) | (full == 0)).long()
 
 
 class RotationView:
-    """Rotations stored as wxyz quaternions and indexed as matrices, so callers keep ``lib.root_R[f]``."""
+    """以 wxyz 四元数存储旋转，索引时转换为矩阵，保留 lib.root_R[f] 的调用方式。"""
 
     def __init__(self, quat: torch.Tensor):
+        """保存按 wxyz 排列的四元数张量。"""
         self.quat = quat
 
     def __getitem__(self, idx) -> torch.Tensor:
+        """将所选四元数即时转换为旋转矩阵。"""
         return quat_to_mat(self.quat[idx])
 
     def __len__(self) -> int:
+        """返回存储的旋转数量。"""
         return len(self.quat)
 
     @property
     def shape(self) -> torch.Size:
+        """返回按矩阵表示时的张量形状。"""
         return self.quat.shape[:-1] + (3, 3)
 
 
 def resolve_motion_args(args, saved=None):
-    """Restore a run's selection unless the caller explicitly selects another source."""
+    """除非调用者明确选择其他数据源，否则恢复运行时保存的动作选择。"""
     saved = saved or {}
     source = getattr(args, "motion_source", None)
     if args.motion_dir is None and args.motion_index is None and source is None:
@@ -76,13 +77,16 @@ def resolve_motion_args(args, saved=None):
 
 
 def check_reference(current, saved):
+    """检查当前参考数据指纹是否与保存的运行或检查点一致。"""
     if saved and current["fingerprint"] != saved["fingerprint"]:
         raise ValueError("reference fingerprint mismatch: index, source or selection differs from the checkpoint/run")
 
 
 class MotionLib:
+    """管理分片后的参考动作、派生运动学量、重置分箱和目标特征。"""
     def __init__(self, files: list[str], kin: G1Kinematics, device: str, src_fps: float = 30.0,
                  rank=0, world_size=1):
+        """从动作 CSV 读取并重采样片段，构建当前进程的参考动作库。"""
         from supermimic.tasks.tracking.motion_hdf5 import file_sha256, validate_pose_arrays
 
         if not files or src_fps <= 0:
@@ -96,7 +100,7 @@ class MotionLib:
             p, q_xyzw, j = raw[:, :3], raw[:, 3:7], raw[:, 7:36]
             quat = torch.cat((q_xyzw[:, 3:4], q_xyzw[:, :3]), -1)
             validate_pose_arrays(p.numpy(), quat.numpy(), j.numpy(), f)
-            # resample to 50 Hz
+            # 重采样至 50 Hz
             T_src = raw.shape[0]
             dur = (T_src - 1) / src_fps
             n = int(np.floor(dur / CONTROL_DT)) + 1
@@ -118,6 +122,7 @@ class MotionLib:
         self._build([names[i] for i in ids], [lens[i] for i in ids], (clips[i] for i in ids), kin, device)
 
     def _select(self, lens, rank, world_size):
+        """按片段长度将完整动作分配到各进程，并选择本进程的片段。"""
         from supermimic.tasks.tracking.motion_hdf5 import partition_clips
 
         if not 0 <= rank < world_size:
@@ -139,6 +144,7 @@ class MotionLib:
         return ids
 
     def _build(self, names, lens, clips, kin, device):
+        """从选定片段构建设备上的参考状态、运动学结果和重置分箱。"""
         self.device, self.names = device, names
         self.num_frames = int(sum(lens))
         tracked = len(kin.tracked_idx)
@@ -154,6 +160,8 @@ class MotionLib:
                     f"only {free / 1024**3:.2f} GiB is free. Use an explicit --motion_limit for a smoke "
                     "test, or a larger-memory device. No clips were silently discarded."
                 )
+        # 将完整片段拼接到一条存储轴；clip_end 是末帧的包含式索引，
+        # 与用于数组切片的右开边界不同。
         lengths = torch.tensor(lens, dtype=torch.long, device=device)
         self.clip_len = lengths
         self.clip_start = torch.cumsum(lengths, 0) - lengths
@@ -162,6 +170,7 @@ class MotionLib:
         for key, shape in (("root_p", (3,)), ("root_quat", (4,)), ("root_v", (3,)),
                            ("root_w", (3,)), ("q", (NUM_J,)), ("qd", (NUM_J,))):
             setattr(self, key, torch.empty((self.num_frames, *shape), device=device))
+        # 逐片段计算导数再写入连续存储，避免差分跨越两个无关动作的拼接边界。
         offset = 0
         for i, (p, quat, j) in enumerate(clips):
             if i >= len(lens):
@@ -173,7 +182,7 @@ class MotionLib:
             R = quat_to_mat(quat)
             v = _gradient(p, CONTROL_DT)
             qd = _gradient(j, CONTROL_DT)
-            # angular velocity (world) by central differences of rotations
+            # 对旋转做中心差分，得到世界系角速度
             w = torch.zeros_like(p)
             w[1:-1] = so3_log(R[2:] @ R[:-2].transpose(-1, -2)) / (2 * CONTROL_DT)
             w[0] = so3_log(R[1] @ R[0].T) / CONTROL_DT
@@ -188,7 +197,7 @@ class MotionLib:
                            ("body_v", (tracked, 3)), ("body_w", (tracked, 3)),
                            ("root_v_local", (3,)), ("root_w_local", (3,))):
             setattr(self, key, torch.empty((self.num_frames, *shape), device=device))
-        # Matrices exist only per chunk; the resident library keeps quaternions.
+        # 矩阵仅在分块计算时存在，常驻动作库保存四元数。
         self.root_R = RotationView(self.root_quat)
         self.body_R = RotationView(self.body_quat)
         with torch.no_grad():
@@ -198,19 +207,19 @@ class MotionLib:
                 out = kin.forward(self.root_p[s:e], R, self.root_v[s:e], self.root_w[s:e], self.q[s:e], self.qd[s:e])
                 for key, value in zip(("body_p", "body_quat", "body_v", "body_w"), out):
                     getattr(self, key)[s:e] = mat_to_quat(value) if key == "body_quat" else value
-                # per-frame static goal parts: root velocities in the root frame
+                # 逐帧预计算目标中不变的部分：根坐标系下的根速度
                 Rt = R.transpose(-1, -2)
                 self.root_v_local[s:e] = (Rt @ self.root_v[s:e].unsqueeze(-1)).squeeze(-1)
                 self.root_w_local[s:e] = (Rt @ self.root_w[s:e].unsqueeze(-1)).squeeze(-1)
-        # Storage windows never participate in these source-clip time-axis bins.
-        # The final frame is a target, never a reset start (there must be a next frame).
+        # 源片段时间轴上的分箱不使用存储窗口。
+        # 最后一帧只能作为目标，不能作为重置起点，因为起点必须有下一帧。
         counts = bin_counts(lengths)
         first_bin = torch.cumsum(counts, 0) - counts
         self.bin_clip = torch.repeat_interleave(torch.arange(len(lens), device=device), counts)
         self.num_bins = int(counts.sum())
         local_bin = torch.arange(self.num_bins, device=device) - first_bin[self.bin_clip]
         self.bin_start = self.clip_start[self.bin_clip] + local_bin * BIN_FRAMES
-        # Reset starts of a bin are [bin_start, bin_end); the last bin runs to the clip's final frame.
+        # 每箱重置起点为 [bin_start, bin_end)，最后一箱延伸到片段末帧。
         last = local_bin == counts[self.bin_clip] - 1
         self.bin_end = torch.where(last, self.clip_end[self.bin_clip], self.bin_start + BIN_FRAMES)
         self.frame_bin = torch.empty(self.num_frames, dtype=torch.long, device=device)
@@ -223,6 +232,7 @@ class MotionLib:
     @staticmethod
     def from_dir(path: str, kin: G1Kinematics, device: str, limit: int | None = None,
                  rank=0, world_size=1) -> MotionLib:
+        """从目录中的动作文件创建参考动作库。"""
         if limit is not None and limit < 1:
             raise ValueError("motion_limit must be positive")
         files = sorted(glob.glob(os.path.join(path, "*.csv")))
@@ -230,6 +240,7 @@ class MotionLib:
 
     @classmethod
     def from_index(cls, path, kin, device, source_root=None, limit=None, rank=0, world_size=1):
+        """从配对数据索引及其源片段创建参考动作库。"""
         from supermimic.tasks.tracking.motion_hdf5 import IndexedG1Dataset
 
         dataset = IndexedG1Dataset(path, source_root, limit)
@@ -243,6 +254,7 @@ class MotionLib:
 
     @classmethod
     def from_source(cls, path, kin, device, limit=None, rank=0, world_size=1):
+        """从单个合并 HDF5 源文件创建参考动作库。"""
         from supermimic.tasks.tracking.motion_hdf5 import MergedG1Dataset
 
         dataset = MergedG1Dataset(path, limit)
@@ -256,6 +268,7 @@ class MotionLib:
 
     @classmethod
     def from_args(cls, args, kin, device, rank=0, world_size=1):
+        """根据命令行中的数据源选项创建参考动作库。"""
         if getattr(args, "motion_source", None):
             return cls.from_source(args.motion_source, kin, device, args.motion_limit, rank, world_size)
         if args.motion_index:
@@ -263,14 +276,16 @@ class MotionLib:
         return cls.from_dir(args.motion_dir, kin, device, args.motion_limit, rank, world_size)
 
     def future_frames(self, f: torch.Tensor, K: int) -> torch.Tensor:
-        """Frames f+1..f+K clamped to the clip's last frame, shape (B, K)."""
+        """返回 f+1 到 f+K 的帧索引，超出片段末尾时截断，形状为 (B, K)。"""
         end = self.clip_end[self.clip_id[f]]
         fut = f.unsqueeze(-1) + torch.arange(1, K + 1, device=f.device)
         return torch.minimum(fut, end.unsqueeze(-1))
 
     def goal(self, f: torch.Tensor, K: int) -> torch.Tensor:
-        """Goal features from the reference only: K future frames relative to the current reference frame."""
+        """仅从参考动作生成目标特征：以当前参考帧为基准的 K 个未来帧。"""
         fut = self.future_frames(f, K)  # (B,K)
+        # 目标以当前参考帧的偏航和位置为基准，不随机器人的跟踪误差漂移；
+        # 未来索引在各自片段末尾截断，不会读到下一个动作。
         H = yaw_mat(self.root_R[f])  # (B,3,3)
         Ht = H.transpose(-1, -2).unsqueeze(1)
         dp = (Ht @ (self.root_p[fut] - self.root_p[f].unsqueeze(1)).unsqueeze(-1)).squeeze(-1)
@@ -281,10 +296,12 @@ class MotionLib:
         return feats.reshape(f.shape[0], -1)
 
     def ref_state(self, f: torch.Tensor):
+        """按帧索引返回根部位置、旋转、速度和关节状态。"""
         return self.root_p[f], self.root_R[f], self.root_v[f], self.root_w[f], self.q[f], self.qd[f]
 
 
 def _gradient(x: torch.Tensor, dt: float) -> torch.Tensor:
+    """沿时间维计算有限差分：内部使用中心差分，两端使用单边差分。"""
     g = torch.zeros_like(x)
     g[1:-1] = (x[2:] - x[:-2]) / (2 * dt)
     g[0] = (x[1] - x[0]) / dt

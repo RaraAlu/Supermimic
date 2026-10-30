@@ -1,10 +1,7 @@
-"""Difficulty label per 1 s start position (read-only): does the checkpoint fall within 2 s from there?
+"""为每个间隔 1 秒的起点标记难度：检查点是否在随后 2 秒内跌倒。
 
-For every clip and every start offset 0, 50, 100, ... (< n - 1), the policy plays from the reference
-state at that frame under the evaluation setup of Appendix F.1 (friction 1.0, no randomization or
-noise) for up to --steps control steps or until the clip ends. A position is labeled hard if the
-rollout triggers the training termination. The labels are independent of any reset-bin layout.
-"""
+各片段从 0、50、100 等小于 n - 1 的帧开始，采用附录 F.1 的评估条件：摩擦系数 1.0，无随机化或噪声。
+运行至 --steps 控制步或片段结束；触发训练终止条件即标记为困难。标签独立于重置分箱布局。"""
 
 import argparse
 import json
@@ -33,6 +30,7 @@ subject.set_amp(a_)
 motion, mdp = subject.reference(args.motion_source)
 pi = subject.policy(ck)
 
+# 按源片段的固定帧网格枚举起点，避免标签随课程分箱合并策略变化；末帧没有后继状态，不作起点。
 starts = []
 for c in range(len(motion.names)):
     s0, n = int(motion.clip_start[c]), int(motion.clip_len[c])
@@ -44,6 +42,7 @@ env = subject.make_env(min(args.batch, P), motion, mdp, eval_mode=True)
 with torch.no_grad():
     for b0 in range(0, P, env.N):
         cnt = min(env.N, P - b0)
+        # 最后不足一批时复制末个起点填充，随后将补位环境标为结束，结果仅回写前 cnt 项。
         frames = torch.cat((starts[b0:b0 + cnt], starts[b0 + cnt - 1:b0 + cnt].expand(env.N - cnt)))
         ids = torch.arange(env.N, device=dev)
         env.done_eval[:] = False

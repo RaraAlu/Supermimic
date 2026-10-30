@@ -1,1 +1,1 @@
-"""Training and evaluation command modules."""
+"""训练和评估命令模块。"""
