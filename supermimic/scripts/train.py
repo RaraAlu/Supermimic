@@ -34,6 +34,10 @@ parser.add_argument("--lr", type=float, default=2e-4)
 parser.add_argument("--gamma", type=float, default=0.99)
 parser.add_argument("--lam", type=float, default=0.95)
 parser.add_argument("--action_noise", type=float, default=0.1)
+parser.add_argument("--clean_action_frac", type=float, default=0.0,
+                    help="fraction of each rank's environments collected without action noise (not in the paper; 0 keeps "
+                         "the paper's behavior). The policy imagines with its deterministic actions, while a buffer of only "
+                         "noisy actions leaves the world model without data along them; also writes clean_log.csv")
 parser.add_argument("--critic_epochs", type=int, default=5)
 parser.add_argument("--critic_minibatches", type=int, default=4)
 parser.add_argument("--no_critic", action="store_true")
@@ -176,13 +180,14 @@ def setup(argv: list[str] | None = None):
 def main(argv: list[str] | None = None):
     """初始化训练状态，循环执行训练、记录日志并保存检查点。"""
     args, parallel, trainer = setup(argv)
-    from supermimic.tasks.tracking.rl.trainer import LOG_TABLES
+    from supermimic.tasks.tracking.rl.trainer import CLEAN_TABLE, LOG_TABLES
     from supermimic.utils.run_log import RunLog
 
     # train/sampling/diag各一份CSV，后两者单独成文件，恢复旧run时train_log.csv的列不变；TensorBoard用purge_step
     # 隐藏上次运行在恢复点之后写下的事件（恢复点及之前的行仍有效）
     start_it = trainer.start_it
-    log = RunLog(args.log_dir, LOG_TABLES, tensorboard=tensorboard_enabled(args),
+    tables = LOG_TABLES | (CLEAN_TABLE if args.clean_action_frac > 0 else {})
+    log = RunLog(args.log_dir, tables, tensorboard=tensorboard_enabled(args),
                  purge_step=start_it + 1 if start_it else None) if parallel.primary else None
     trainer.start_clock()
     for it in range(start_it, args.iterations):
@@ -194,6 +199,10 @@ def main(argv: list[str] | None = None):
                 r = rows["train"]
                 print(f"it {it + 1} | {r[1]:.3f} h | wm {r[3]:.4f} e8 {r[4]:.4f} | pi {r[5]:.3f} v {r[6]:.4f} imag_r {r[7]:.3f} surv {r[9]:.3f} "
                       f"| sim_r {r[10]:.3f} ep_len {r[11]:.1f} ep_ret {r[12]:.3f} term {r[13]:.2f} | {r[14]:.2f} it/s", flush=True)  # fmt: skip
+                if "clean" in rows:
+                    c = rows["clean"]
+                    print(f"   clean sim_r {c[1]:.3f} ep_ret {c[4]:.3f} term {c[5]:.2f} | noisy sim_r {c[2]:.3f} ep_ret {c[7]:.3f} "
+                          f"term {c[8]:.2f}", flush=True)
         if args.term_log_every and (it + 1) % args.term_log_every == 0:
             summary, lines = trainer.term_rows(it)  # 集合通信，所有rank都调用
             if log:

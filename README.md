@@ -254,6 +254,12 @@ uv run --frozen tensorboard --logdir logs
 | `top_bin_s`、`top_bin_terms` | 该片段内终止最多的1 s分箱的起点（秒）及其终止数 |
 | `share` | 占窗口全部终止的比例 |
 
+`--clean_action_frac F`（默认0，与论文相同；不是论文的设置）让每个rank前round(F×本rank环境数)个环境采样时不加动作噪声，
+并另写`clean_log.csv`（TensorBoard标签`clean/<列名>`），与`train_log.csv`同频：两组环境各自的每步奖励`sim_rew_clean`/`sim_rew_noisy`，
+以及回合长度、归一化回报、终止比例`ep_len_*`、`ep_ret_*`、`term_frac_*`（回合按起步时所在的组归类）。clean组低于noisy组，
+说明确定性策略在真实仿真里已不如加噪声时，原因与判读见[训练指标第12节](docs/troubleshooting/training_metrics.md)。
+F为0时训练日志里没有确定性表现，用`evaluate.py --watch`或`scripts/diag_first_step.py`在固定子集上评估检查点。
+
 `--keep_states N`（默认3）保留`last.pt`与前N−1次保存`last_prev1.pt`、`last_prev2.pt`……（硬链接，不额外占写入），
 崩溃前的完整状态不会被紧接着的下一次保存覆盖；都是可直接`--resume`的完整状态。
 

@@ -48,6 +48,11 @@ BIN_SECONDS = 50  # 一个重置分箱的帧数（1 s，50 Hz）
 LOG_TABLES = {"train": ("train_log.csv", TRAIN_COLUMNS), "sampling": ("sampling_log.csv", SAMPLING_COLUMNS),
               "diag": ("diag_log.csv", DIAG_COLUMNS), "termwin": ("termwin_log.csv", TERMWIN_COLUMNS),
               "term_bins": ("term_bins.csv", TERM_BINS_COLUMNS)}
+# --clean_action_frac > 0 时另写：不加动作噪声的环境组（clean）与加噪声组（noisy）的仿真指标，含义同train_log.csv的同名列。
+# clean组的sim_rew低于noisy组，说明确定性策略在真实仿真中已不如加噪声时（世界模型只在加噪声动作上拟合的后果）。
+CLEAN_COLUMNS = ("iteration", "sim_rew_clean", "sim_rew_noisy", "ep_len_clean", "ep_ret_clean", "term_frac_clean",
+                 "ep_len_noisy", "ep_ret_noisy", "term_frac_noisy")
+CLEAN_TABLE = {"clean": ("clean_log.csv", CLEAN_COLUMNS)}
 
 
 @dataclass(frozen=True)
@@ -96,6 +101,17 @@ def lr_at(it: int, base_lr: float, decay_iters: int) -> float:
     if it >= decay_iters:
         return base_lr * 0.03
     return base_lr * (0.03 + 0.97 * 0.5 * (1 + math.cos(math.pi * it / decay_iters)))
+
+
+def clean_action_split(frac: float, local_envs: int, action_noise: float, device) -> tuple:
+    """前round(frac * local_envs)个环境不加动作噪声：返回(clean掩码, 逐环境噪声尺度(N, 1))；frac为0时两者都是None（论文路径）。
+    frac>0时即使本rank取整后没有clean环境也返回掩码，保证各rank都参与clean_log的集合通信。"""
+    if not 0 <= frac < 1:
+        raise ValueError("clean_action_frac must be in [0, 1)")
+    if frac == 0:
+        return None, None
+    clean = torch.arange(local_envs, device=device) < round(frac * local_envs)
+    return clean, (action_noise * (~clean).float()).unsqueeze(-1)
 
 
 def survival(keep: torch.Tensor, unrolled: bool) -> torch.Tensor:
@@ -203,10 +219,15 @@ class Trainer:
         # 回放数据与观测历史属于当前仿真会话，不从检查点恢复；外层 setup 会重新预热。
         self.buffer = ReplayBuffer(args.buffer_steps, layout.local_envs, dev)
         self.obs_hist = torch.zeros(layout.local_envs, self.Hh, OBS_DIM, device=dev)
+        # 可选（偏离论文）：本rank前clean_action_frac比例的环境采样时不加动作噪声。回放中只有加噪声的动作时，
+        # 世界模型在确定性策略的平滑动作上缺少数据，想象推演用的正是确定性策略。为0时与论文完全相同。
+        self.clean_envs, self.noise_scale = clean_action_split(args.clean_action_frac, layout.local_envs, args.action_noise, dev)
         self.collect_action = self.graphed(self._collect_action, enabled=self.use_graph and args.cuda_graph_collect == "on")
 
         self.step_acc = 0.0
         self.stats = {"r": [], "ep_len": [], "ep_ret": [], "term": [], "done": []}
+        if self.clean_envs is not None:
+            self.stats |= {"r_clean": [], "r_noisy": [], "ep_clean": []}
         self.agg = {"wm": [], "wm8": [], "pi": [], "v": [], "ir": [], "gn": [], "surv": []}
         self.diag_agg = {"mean": [], "max": []}
         self.t_start = self.t_log = None
@@ -486,7 +507,8 @@ class Trainer:
         self.pi.obs_norm.update(o)
         self.pi.goal_norm.update(g)
         a = self.pi(history, g)
-        a = torch.clamp(a + self.args.action_noise * torch.randn_like(a), -20, 20)
+        noise = torch.randn_like(a)
+        a = torch.clamp(a + (self.args.action_noise * noise if self.noise_scale is None else self.noise_scale * noise), -20, 20)
         return a, history
 
     @torch.no_grad()
@@ -512,11 +534,20 @@ class Trainer:
                 self.store_transition(out)
             self.sim_steps += self.layout.global_envs
             stats["r"].append(out["r"].mean() / 0.1)
+            if self.clean_envs is not None:
+                c = self.clean_envs.float()
+                stats["r_clean"].append((out["r"] * c).sum() / 0.1)
+                stats["r_noisy"].append((out["r"] * (1 - c)).sum() / 0.1)
             if "ep_len" in out:
                 stats["ep_len"].append(out["ep_len"].sum())
                 stats["ep_ret"].append(out["ep_ret_norm"].sum())
                 stats["term"].append(out["term"].float().sum())
                 stats["done"].append(out["done"].float().sum())
+                if self.clean_envs is not None:
+                    # ep_len与ep_ret_norm按done.nonzero()的顺序排列；环境已在主机上取得重置索引，这里的布尔索引不增加同步
+                    ended = self.clean_envs[out["done"]].float()
+                    stats["ep_clean"].append(torch.stack(((out["ep_len"] * ended).sum(), (out["ep_ret_norm"] * ended).sum(),
+                                                          (out["term"] & self.clean_envs).float().sum(), ended.sum())))
 
     # ---------------- 一次迭代 ----------------
     def set_lr(self, lr: float):
@@ -606,10 +637,26 @@ class Trainer:
         bin_min = float(parallel.reduce(torch.where(scored, sampler.scores, torch.inf).min(), torch.distributed.ReduceOp.MIN))
         diag_row = [it + 1, *(float(x) for x in d_mean[:-1] / d_mean[-1]), *(float(x) for x in d_max),
                     float(bin_sum[0] / bin_sum[1].clamp(min=1)), bin_min if math.isfinite(bin_min) else 0.0, float(samp[5])]
+        rows = {"train": row, "sampling": samp_row, "diag": diag_row}
+        if self.clean_envs is not None:
+            rows["clean"] = self._clean_row(it, stats, episodes)
+        # 本次日志已消费累计量，清空窗口，避免下次重复统计；模型与课程长期状态不在此处清除。
         self.stats = {k: [] for k in stats}
         self.agg = {k: [] for k in agg}
         self.diag_agg = {k: [] for k in diag_agg}
-        return {"train": row, "sampling": samp_row, "diag": diag_row}
+        return rows
+
+    def _clean_row(self, it: int, stats: dict, episodes: torch.Tensor) -> list:
+        """clean_log.csv一行：两组环境分别的每步奖励与回合指标；noisy组的回合量由全部回合减去clean组得到。"""
+        n_clean = float(self.clean_envs.sum())
+        steps = len(stats["r_clean"])
+        ep = torch.stack(stats["ep_clean"]).sum(0).tolist() if stats["ep_clean"] else [0.0] * 4
+        tot = self.parallel.reduce([sum(float(v) for v in stats["r_clean"]), steps * n_clean,
+                                    sum(float(v) for v in stats["r_noisy"]), steps * (self.layout.local_envs - n_clean), *ep]).cpu()
+        c = tot[4:8]
+        n = episodes - c  # 顺序相同：回合长度和、归一化回报和、终止数、结束回合数
+        per = lambda x: [float(x[0] / x[3].clamp(min=1)), float(x[1] / x[3].clamp(min=1)), float(x[2] / x[3].clamp(min=1))]  # noqa: E731
+        return [it + 1, float(tot[0] / tot[1].clamp(min=1)), float(tot[2] / tot[3].clamp(min=1)), *per(c), *per(n)]
 
     def gather_bins(self) -> dict:
         """各rank的重置课程状态汇总（集合通信，所有rank都要调用；只有主进程拿去存检查点）。"""

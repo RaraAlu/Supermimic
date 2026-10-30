@@ -7,7 +7,7 @@
 | 分册 | 内容 |
 | --- | --- |
 | [reset_curriculum.md](reset_curriculum.md) | 按回报重置采样的四轮课程跑偏：尾部极短分箱、首步惩罚假设、重置过渡期、短片段首帧 |
-| [training_metrics.md](training_metrics.md) | 指标判读与监督：`ep_ret_norm`、学习率口径、`wm_err8`、短暂崩溃、覆盖率、监督阈值、critic归一化、评估显存、检查点的子集评估（按迭代数对齐论文）、critic高估引发的崩溃 |
+| [training_metrics.md](training_metrics.md) | 指标判读与监督：`ep_ret_norm`、学习率口径、`wm_err8`、短暂崩溃、覆盖率、监督阈值、critic归一化、评估显存、检查点的子集评估（按迭代数对齐论文）、critic高估引发的崩溃、后期确定性表现退步 |
 | [performance_correctness.md](performance_correctness.md) | compile、CUDA graph、fused Adam与多卡带来的正确性问题 |
 | [platform_ops.md](platform_ops.md) | Windows/Linux共用仓库、远程服务器连接与传输、代码同步、运行管理 |
 
@@ -26,6 +26,7 @@
 | global批量实验的学习率口径 | 该次实验选`--lr_scaling none`；论文训练批量口径仍未确认 | 未解决 | [training_metrics.md](training_metrics.md)第2节 |
 | `wm_err8`与论文图3(c)不可比 | `diag_wm_error.py`按物理单位与候选标称误差测量；论文标称值未知 | 未解决 | 第3节 |
 | 6.4万、9.91万次迭代：critic估值超过理论上限，策略随之崩溃；9.91万次的那次没有恢复，随后抽样权重无效而中止 | 诊断确认critic先坏；加critic估值上限、分箱分数限制到[0, 1]、非有限分数不更新分箱；最初原因未查明 | 验证中 | [training_metrics.md](training_metrics.md)第11节 |
+| 13万次迭代之后确定性F.1退步（21.8万次全量失败287段），加噪声的表现仍在升 | 世界模型只拟合加噪声的动作，确定性策略在想象中利用其误差；按确定性评估选检查点，新增`--clean_action_frac`与`clean_log.csv`（默认关） | 验证中 | [training_metrics.md](training_metrics.md)第12节 |
 | 课程转向后`wm_err8`升到0.45 | 固定分布诊断确认是数据分布变化；监督阈值放宽 | 已解决 | 第4、7节 |
 | 2.23万次迭代短暂崩溃 | 自行恢复；原因未查明 | 未解决 | 第5节 |
 | 覆盖率停在78.4% | 等于可重置分箱占比，不是卡住 | 已解决 | 第6节 |
