@@ -433,6 +433,7 @@ uv run --frozen python -B -m unittest discover -s tests -v
 | [docs/analysis/markdown_math.md](docs/analysis/markdown_math.md) | GitHub公式排版约定：行内公式、独立公式、多行对齐与界面验收 |
 | [docs/analysis/optimization.md](docs/analysis/optimization.md) | 性能优化分析：剖析方法与实测、瓶颈（kernel发射）、按优先级的优化项与验证顺序 |
 | [docs/analysis/reset_sampling.md](docs/analysis/reset_sampling.md) | 按回报重置采样：负`ep_ret_norm`的排查、尾部分箱修正、分箱选项、全量对照、开源实现对照与未解决问题 |
+| [docs/analysis/reference_continuation.md](docs/analysis/reference_continuation.md) | 参考缺失时的目标延拓（设计稿）：可用性掩码与延拓算子、捕获点阶段切换、分阶段容差下的奖励/终止/评测、实施阶段与验收 |
 | [docs/analysis/paper_two_gpu.md](docs/analysis/paper_two_gpu.md) | 双卡短测：表A.5批量口径的两种解读与实测耗时 |
 | [docs/analysis/doc_code_audit.md](docs/analysis/doc_code_audit.md) | 2026-10-28文档与代码逐项核对：差异、实现依据、修正与验证边界 |
 | [docs/troubleshooting/README.md](docs/troubleshooting/README.md) | 问题与解决记录：重置采样四轮课程跑偏、训练指标判读与监督、性能优化中的正确性问题、平台与远程运维 |
