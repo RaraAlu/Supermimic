@@ -27,6 +27,7 @@ parser.add_argument("--bin_clip_end", default=None, help="passed to TrackingSim;
 parser.add_argument("--bin_prior", default=None, help="passed to TrackingSim; an error if the source lacks it")
 parser.add_argument("--bin_skip_steps", type=int, default=None, help="passed to TrackingSim; an error if the source lacks it")
 parser.add_argument("--reset_margin", type=int, default=None, help="passed to TrackingSim; an error if the source lacks it")
+parser.add_argument("--bin_clip_cap", type=float, default=None, help="passed to TrackingSim; an error if the source lacks it")
 args = parser.parse_args()
 subject = _subject.Subject(args.src, args.device)
 
@@ -51,7 +52,7 @@ w_rate, w_lim = RewardCfg.w_action_rate, RewardCfg.w_joint_limit
 
 N = args.num_envs
 # 未显式传入的采样选项取源码树的默认值，不从检查点继承
-bin_kw = {k: getattr(args, k) for k in ("bin_clip_end", "bin_prior", "bin_skip_steps", "reset_margin") if getattr(args, k) is not None}
+bin_kw = {k: getattr(args, k) for k in ("bin_clip_end", "bin_prior", "bin_skip_steps", "reset_margin", "bin_clip_cap") if getattr(args, k) is not None}
 env = subject.make_env(N, motion, mdp, run_args=a_, inherit=("gamma",), **bin_kw)
 hist = torch.zeros(N, Hh, OBS_DIM, device=dev)
 acc_names = ("track", "rate_pen", "lim_pen", "r", "rate0", "lim0", "r0", "rate_max", "a_absmax", "sat_steps", "rate_max_step")

@@ -69,7 +69,7 @@ def collect(pi):
     N = args.num_envs
     # 记录长度覆盖最后一个采样起点的完整真实回报窗口，并额外保留尾部自举状态。
     T = (args.starts - 1) * args.start_stride + args.mc_steps + 1
-    env = subject.make_env(N, motion, mdp, run_args=a0, inherit=("gamma", "bin_clip_end", "bin_prior"))
+    env = subject.make_env(N, motion, mdp, run_args=a0, inherit=("gamma", "bin_clip_end", "bin_prior", "bin_clip_cap"))
     hist = torch.zeros(N, Hh, OBS_DIM, device=dev)
     rec = {"s": torch.empty(T, N, subject.STATE_DIM, device=dev), "f": torch.empty(T, N, dtype=torch.long, device=dev),
            "xi": torch.empty(T, N, subject.XI_DIM, device=dev), "r": torch.empty(T, N, device=dev),

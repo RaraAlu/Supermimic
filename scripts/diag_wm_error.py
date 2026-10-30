@@ -49,7 +49,7 @@ pi = subject.policy(ck)
 
 # ---- 在训练配置下用检查点策略采集新转移 ----
 N, T = args.num_envs, args.steps
-env = subject.make_env(N, motion, mdp, run_args=a_, inherit=("gamma", "bin_clip_end", "bin_prior"))
+env = subject.make_env(N, motion, mdp, run_args=a_, inherit=("gamma", "bin_clip_end", "bin_prior", "bin_clip_cap"))
 hist = torch.zeros(N, Hh, OBS_DIM, device=dev)
 rec = {"s": torch.empty(T, N, subject.STATE_DIM, device=dev), "s1": torch.empty(T, N, subject.STATE_DIM, device=dev),
        "a": torch.empty(T, N, NUM_J, device=dev), "xi": torch.empty(T, N, subject.XI_DIM, device=dev),

@@ -330,6 +330,11 @@ RTX 5080 单卡回归、`--nproc-per-node=gpu` 自动启动和多进程检查点
 | `scripts/diag_compare_bins.py` | 汇总多次重放：短回合、片段末尾重置、难位置倾斜、采样集中度 |
 | `scripts/diag_wm_error.py` | 用检查点的策略按训练条件收集新rollout，测世界模型k步预测误差：物理单位逐分量，及几种候选标称误差下的归一化值 |
 | `scripts/diag_critic_bias.py` | 用若干完整训练状态（含critic）交叉评估：各状态的策略收集新rollout，各状态的critic对其估值，报告真实/想象回报偏差、输入标准化超标比例与输入梯度范数 |
+| `scripts/diag_reward_terms.py` | 按附录F.1条件评估一个参考文件，把归一化回报拆成各奖励项与惩罚项，另记各关节误差；`--noise`、`--obs_noise`分别叠加执行与观测中的动作噪声 |
+| `scripts/diag_clip_train_cond.py` | 按训练条件（随机化与噪声）重复重放指定片段及其同族片段，判断反复终止的片段是否本身有问题 |
+| `scripts/eval_f1_shards.py` | 逐个源分片调用`diag_first_step.py`做全库附录F.1评估（可中断续跑），按`clips.csv`汇总成报告，可只统计训练选入的片段 |
+| `scripts/record_clips.py` | 按附录F.1条件重放指定片段（或某次汇总的失败列表），记录策略与参考的根位姿和关节角，存为npz |
+| `scripts/render_clips.py` | 把`record_clips.py`的npz渲染成机器人与参考并排的MP4 |
 | `scripts/watch_train.py` | 监督训练日志，出现异常、到达里程碑或训练结束时退出 |
 | `scripts/csv_to_tensorboard.py` | 把run的`train_log.csv`与`sampling_log.csv`写成TensorBoard标量，标签与`--tensorboard`相同 |
 
@@ -390,6 +395,11 @@ scripts/
   diag_compare_bins.py
   diag_wm_error.py
   diag_critic_bias.py
+  diag_reward_terms.py
+  diag_clip_train_cond.py
+  eval_f1_shards.py
+  record_clips.py
+  render_clips.py
   watch_train.py
   csv_to_tensorboard.py
   smrun.sh
