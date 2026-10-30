@@ -109,8 +109,14 @@ class LayoutTests(unittest.TestCase):
         readme = (REPO / "README.md").read_text(encoding="utf-8")
         links = re.findall(r"\]\(([^)]+)\)", readme)
         code_paths = re.findall(r"`((?:supermimic|scripts|tests)/[^`]+)`", readme)
+        # 页内锚点按GitHub的规则由标题生成：小写，去掉字母、数字、空格、连字符与下划线以外的字符，空格换成连字符
+        anchors = {re.sub(r"[^\w\- ]", "", h.strip().lower()).replace(" ", "-")
+                   for h in re.findall(r"^#{1,6} (.+)$", readme, re.M)}
         for target in links + code_paths:
-            if "://" not in target:
+            if target.startswith("#"):
+                with self.subTest(anchor=target):
+                    self.assertIn(target[1:], anchors)
+            elif "://" not in target:
                 with self.subTest(target=target):
                     self.assertTrue((REPO / target).exists())
         self.assertIn("python -m supermimic.scripts.train", readme)

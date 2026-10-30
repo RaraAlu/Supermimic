@@ -7,16 +7,88 @@
 [zita-ch/supermimic_vibed](https://github.com/zita-ch/supermimic_vibed)（Isaac Lab 3 → mjlab），
 许可与出处见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
+## 亮点
+
+- **全库覆盖**：2×A100训练10.4 h（9.8万次迭代）的检查点，按附录F.1协议在114,403段BONES-SEED动作上逐段从首帧播放，
+  失败35段，成功率99.97%，归一化回报0.949。评估工具可中断续跑、逐段可追溯，见[复现结果](#复现结果)。
+- **重置分箱修正**：论文附录D.1的按回报重置采样在全量数据上会把课程集中到不该练的位置。四轮排查分别定位到极短尾箱、
+  重置过渡期、只能从首帧起步的短片段等压低评分的来源并逐一修正；同一训练区间里最大分箱概率从0.49降到0.02，见[重置分箱](#重置分箱)。
+- **双卡A100吞吐**：`torch.compile`与CUDA graph叠加，世界模型、策略、critic、环境奖励与采样都整段图重放，
+  梯度all-reduce也在图内（NCCL下逐位验证）；单卡比全关快2.8倍。全局8192环境每次迭代约0.38 s，32万次迭代约34 h，
+  见[双卡A100训练与优化](#双卡a100训练与优化)。
+- **与论文逐项对照**：论文没写清的批量口径、分箱细节、精度等都有记录和开关，偏离论文的改动默认关闭，
+  见[与论文的区别](#与论文的区别)。
+- **一个数据入口**：`scripts/make_motion_source.py`把G1 CSV或配对索引转成单文件HDF5，训练、评估与诊断共用，
+  带数据指纹，换卡数续训也能校验数据一致，见[准备训练数据](#准备训练数据)。
+- **问题有证据链**：后期确定性表现退步追到世界模型只拟合加噪声动作的分布，参考段末目标截断导致的失败用目标延拓救回，
+  评估本身的波动也量化过；每个结论都附检查点、脚本与数字，见[docs/troubleshooting](docs/troubleshooting/README.md)。
+
 ## 当前状态
 
 - 阶段：实现v0.1.0（训练闭环、评估、数据/自检脚本）。
-- 目标：在129,514段基准上复现论文主结果。
+- 目标：在129,514段基准上复现论文主结果；当前数据为其中可用的114,403段（220 h）。
 - 算力：8卡H100服务器负责训练与评估；2卡A100 SXM4 80GB（NVLink）服务器用于当前训练与全量诊断；RTX 5080与RTX 4070 Ti SUPER负责开发。
-- 2026-10-27：修正重置分箱后，在2卡A100上重新开始全量训练（全局8192环境、世界模型10×2048、策略4096、学习率2e-4不乘√2）。
-  此前一个run日志中为负的`ep_ret_norm`来自尾部短分箱缺陷，不代表策略变差，见[重置采样分析](docs/analysis/reset_sampling.md)。
+- 2026-10-30：论文口径的基线run训练到26万次迭代后停止（按shard_000上的确定性评估，最好的检查点在13万次前后，见[复现结果](#复现结果)）；
+  同参数、同种子另加`--clean_action_frac 0.2`的对照run从头训练中，用来验证后期退步的应对。
 - 依赖版本：以`pyproject.toml`与`uv.lock`为准（mjlab 1.6.0、mujoco-warp 3.11.0、warp-lang 1.18.0、torch 2.14.1+cu130）。
 - 数据：支持 LAFAN1 CSV、索引白名单 HDF5 与单文件合并源 HDF5；后两者读取原生 50 Hz 完整动作，由 MotionLib 生成参考速度和 FK。
 - 数据/检查点/日志均不入库。
+
+## 复现结果
+
+附录F.1协议：每段动作从首帧播放一次，摩擦1.0，不加域随机化、观测噪声与动作噪声，触发训练的终止条件即失败；
+归一化回报为未折扣奖励之和除以可达最大值。与论文一样，评估集就是训练集，比较的是覆盖程度而不是泛化。
+以下为基线run（2×A100，全局8192环境，FP32/TF32）的检查点在全库114,403段上的结果：
+
+| 检查点 | 训练时间 | 失败段数 | 成功率 | 归一化回报 |
+| --- | --- | --- | --- | --- |
+| 9.8万次迭代 | 10.4 h | 35 | 99.97% | 0.949 |
+| 21.8万次迭代 | 23.1 h | 284 | 99.75% | 0.901 |
+
+- 9.8万次的35段失败中，16段是跑动片段在段末前0–8步失控：未来目标被截断在末帧，策略被要求0.2 s内从跑动定格。
+  `--goal_tail auto`在段末之后给出“保持末帧”或“原地站立”的目标，同一检查点不重训，这34段（去掉倒立）的失败从28段降到12段，
+  且原本成功的片段没有新增失败，见[目标延拓](docs/analysis/reference_continuation.md)。
+- 13万次之后确定性表现逐步下降，而加动作噪声的表现仍在上升，训练日志只看得到后者。原因是世界模型只见过加噪声的执行动作，
+  确定性策略在想象中利用了模型在平滑动作上的误差。shard_000上的归一化回报：13万次0.958，21.8万次0.905。
+  分析与应对见[训练指标第12节](docs/troubleshooting/training_metrics.md)，对照run进行中。
+- 评估本身有波动：同一检查点重复评估，一个分片（约4千段）上失败数差0–3段、回报差约0.001。
+- 数据与论文不同（论文129,514段、264.56 h），这些数字不能与论文的表直接对比。
+  全库评估：`scripts/eval_f1_shards.py`逐分片评估并汇总（Rara单卡约1.1 h），失败片段可用`scripts/record_clips.py`与`scripts/render_clips.py`录成视频。
+
+## 与论文的区别
+
+逐项对照见[训练流程第11节](docs/analysis/training_pipeline.md)。按性质分三类：
+
+**论文没写清、按一种读法实现的**
+
+| 项 | 论文 | 本仓库 |
+| --- | --- | --- |
+| 批量口径 | 表A.5只写“per update”，未说全局还是每卡 | 默认全局（`--batch_scope global`）：全局8192环境、世界模型2048、策略4096；`per_gpu`可切换，两种实测见[双卡短测](docs/analysis/paper_two_gpu.md) |
+| 双卡学习率 | ×√2 | 基线run不乘（`--lr_scaling none`），`sqrt`可开 |
+| 世界模型每次迭代 | “10 batches of 2048 windows” | 10步各2048窗口；`--wm_update single`为1步20480窗口 |
+| 分箱的段末回报、未访问分箱初值 | 未说明 | 本回合平均奖励外推、初值0（`--bin_clip_end`、`--bin_prior`可换） |
+| 观测、世界模型状态与预测头 | 未完整说明 | 99维观测（加参考相对根朝向）、71维物理状态；奖励、观测、终止都由状态解析得到，只拟合动力学 |
+
+**为让训练正常而改的（默认开启，不改奖励与网络）**
+
+| 项 | 问题 | 改法 |
+| --- | --- | --- |
+| 尾箱合并 | 片段末尾的极短分箱只有1–4步回合，被外推成“极难”，课程集中到段末 | 不足25个起点的尾箱并入前一箱 |
+| 重置过渡期 | 重置后1–2 s奖励偏低，短回合的分箱被系统性压低 | 评分跳过前50步，普通起点离段末超过100步（`--bin_skip_steps`、`--reset_margin`） |
+| 只能从首帧起步的短片段 | 跳过过渡期后几乎全靠外推 | 只分均匀份额，不参与softmax |
+| 同一步同箱的多个回合 | 重复索引写入的结果未定义 | 先取均值再更新一次EMA |
+| critic高估 | 估值失控时策略追着高估走 | 估值限制在`MAX_STEP_REWARD / (1 − γ)`（`--critic_cap on`） |
+
+**可选的偏离（默认关闭，与论文相同）**
+
+| 选项 | 作用 |
+| --- | --- |
+| `--clean_action_frac F` | 部分环境采样不加动作噪声，让回放里有确定性策略自己的转移，并分组记录确定性表现 |
+| `--bin_clip_cap C` | 限制单个片段在40%困难度部分中的份额，防止少数片段长期占掉重置 |
+| `--goal_tail {hold, stand, auto}` | 段末之后的未来目标改为保持末帧或原地站立，不再截断在末帧 |
+
+另外：命令行默认`--amp bf16`、前500次迭代只练世界模型（实现时的选择，理由见[训练流程第11节](docs/analysis/training_pipeline.md)）；基线run按论文用`--amp none`
+（FP32，矩阵乘法TF32）与`--wm_only_iters 0`。仿真用mjlab与MuJoCo Warp，部分模块移植自zita-ch/supermimic_vibed；推力扰动与论文一样删除。
 
 ## 平台
 
@@ -77,6 +149,48 @@ uv run --frozen python -m supermimic.scripts.evaluate --run_dir logs/smoke --wat
 ```
 
 无GPU时各命令加`--device cpu`，只用于检查流程能否跑通，速度不具参考意义。
+
+## 准备训练数据
+
+训练、评估和诊断都读同一种文件：单个合并源HDF5（`--motion_source`，格式`teleopit_motion_hdf5` v1，50 Hz）。
+`scripts/make_motion_source.py`把三种输入转成它，只用CPU、逐段读写，不修改输入：
+
+```bash
+# 1) 每个文件一段动作的G1 CSV（36列：根位置xyz、根四元数xyzw、29个关节角），按--csv_fps重采样到50 Hz
+uv run --frozen python scripts/make_motion_source.py --csv_dir data/lafan1_g1 --out data/lafan1.h5
+
+# 2) 配对索引选中的源片段（BONES-SEED），去掉首帧离地超过1.5 m的片段（平地上无法复现的高台起步）
+uv run --frozen python scripts/make_motion_source.py --motion_index paired_50hz/index.h5 \
+  --motion_root G1_SOURCE_ROOT --out data/boneseed.h5 --max_start_height 1.5
+
+# 3) 对已有文件再过滤：按片段名或文件名去掉若干段
+uv run --frozen python scripts/make_motion_source.py --motion_source data/boneseed.h5 --out data/boneseed_v2.h5 \
+  --exclude jump_to_shoulder_roll_R_003__A304_M
+```
+
+文件内容：
+
+| 位置 | 内容 |
+| --- | --- |
+| 属性`format`、`version`、`fps` | `teleopit_motion_hdf5`、`1`、`50` |
+| `root_pos` | float32 `(帧数, 3)`，世界系根位置，m |
+| `root_quat_w` | float32 `(帧数, 4)`，世界系根朝向，**wxyz**（CSV里是xyzw，转换时已调整） |
+| `joint_pos` | float32 `(帧数, 29)`，G1关节角，rad，顺序同`G1_JOINT_NAMES` |
+| `source_clip_starts`、`source_clip_lengths`、`source_clip_fps` | 每段在帧轴上的起点、帧数、帧率（50）；各段首尾相接覆盖整个帧轴 |
+| `clips/source_relative_path`、`clips/input_index` | 片段名，及它在输入中的序号 |
+| 属性`made_by` | 输入、过滤条件与被去掉的片段（JSON） |
+
+- 每段动作保持完整，不按窗口裁短；速度、角速度与正向运动学在载入时逐段计算，差分不跨段。
+- 训练把数据指纹（文件大小、帧数、各段边界）写入`reference.json`与检查点，续训与评估时校验；换了片段选择要新开run。
+- 开发用小子集：`python scripts/make_motion_subset.py SOURCE.h5 subset_512.h5 512 0`随机抽512段。
+- 全量参考张量常驻显存，每帧约1 KB：114,403段约3,965万帧共约39 GiB，双卡时每卡约19 GiB（另加仿真、回放与模型）；载入前会检查显存。
+- 2026-10-30在Rara上用第2条命令转换全库：输入114,406段，高度过滤正好去掉三段从2 m高台起步的片段，得到114,403段、39,652,331帧（220.3 h）。
+  基线run用的文件由Teleopit的配对流程生成，片段相同，但为与人体数据对齐把其中21,956段各去掉了最后1帧（共少21,956帧）；
+  本脚本保留完整源段，与`--motion_index`一致。两者数据指纹不同，基线run的检查点要用原文件评估。
+- 自己的动作需要先重定向到G1（29自由度），根高度以地面为0；首帧离地太高或穿地的片段会在重置时摔倒或爆炸，
+  用`--max_start_height`或`--exclude`去掉。
+
+下面两节分别是直接读配对索引的入口与合并源文件的读取规则；新数据建议统一转成合并源文件。
 
 ## 索引 HDF5 参考数据
 
@@ -144,6 +258,35 @@ uv run --frozen python -m supermimic.scripts.train --motion_source SOURCE.h5 --l
 `--motion_dir`、`--motion_index`、`--motion_source`互斥；`--motion_root`只适用于索引入口。
 合并源的指纹绑定文件大小、总帧数和所选段的起点/长度，不计算姿态内容SHA256；
 相同大小且边界不变的姿态替换可能无法被识别。上面的`scripts/check_data.py`只支持索引入口，不能传`--motion_source`。
+
+## 双卡A100训练与优化
+
+基线run的完整命令（2×A100 SXM4 80GB，NVLink），也是目前推荐的正式训练配置：
+
+```bash
+uv run --frozen torchrun --standalone --nproc-per-node=2 -m supermimic.scripts.train --motion_source data/boneseed.h5 \
+  --batch_scope global --num_envs 8192 --wm_batch 2048 --pi_batch 4096 --wm_batches 10 --wm_update steps \
+  --horizon 32 --goal_frames 10 --hist 10 --buffer_steps 1000 --utd 0.4 --lr 0.0002 --lr_scaling none \
+  --lr_decay_iters 250000 --gamma 0.99 --lam 0.95 --action_noise 0.1 --critic_epochs 5 --critic_minibatches 4 \
+  --amp none --warmup_steps 64 --wm_only_iters 0 --compile on --cuda_graph on --fused_adam on --seed 0 \
+  --iterations 320000 --ckpt_every 2000 --log_every 50 --keep_states 3 --critic_cap on --tensorboard on --log_dir logs/a100
+```
+
+实测约2.6 it/s（每次迭代0.38 s），9.8万次迭代10.4 h，32万次约34 h。各项优化都只改执行方式、不改算法，均有开关并做过逐位或数值核对：
+
+| 优化 | 做法 | 效果 |
+| --- | --- | --- |
+| CUDA graph | 世界模型10次更新、策略想象推演加BPTT、critic的5×4小批、环境奖励与终止、采样前向与动作噪声各自整段捕获重放 | 单卡0.716 s/iter（全关1.457 s） |
+| `torch.compile` | 与CUDA graph叠加，融合逐元素kernel | 单卡0.512 s/iter，比全关快2.8倍 |
+| 图内梯度all-reduce | 按启动时算好的全局样本数做固定计数的all-reduce，捕获时用`thread_local`模式避开NCCL watchdog | 双卡NCCL下图重放与直接执行逐位一致 |
+| 采样重叠 | 回放写入与世界模型统计提前到重置等待之前提交 | 与采样图合计快2.65% |
+| 减少主机往返 | 输入归一化去掉主机同步；图化后奖励与终止不再逐个发射kernel | 每次迭代的同步从86次降到75次；采样每步的kernel发射从2,763次降到1,164次 |
+| 参考张量 | 朝向存四元数、用时再转矩阵 | 每帧1,052字节（存矩阵为1,356），全库省22% |
+| 分片 | 完整片段按长度从长到短装进最小分片，每卡只读、只算自己的片段 | 两卡帧数相差不到0.01%，不拆段、不复制 |
+
+换机器时先跑`torchrun --standalone --nproc-per-node=2 scripts/check_cuda_graph.py --motion_limit 8 --batch_scope per_gpu`，
+各rank都输出“bitwise equal True”后再正式训练。测量方法与各项数字见[性能优化分析](docs/analysis/optimization.md)第6–9节。
+`scripts/smrun.sh`在tmux里启动并记录退出码，配合`scripts/watch_train.py`监督。
 
 ## 多卡自动分片
 
@@ -279,9 +422,29 @@ RTX 5080 单卡回归、`--nproc-per-node=gpu` 自动启动和多进程检查点
 检查点评估仅为流程验收，短跑策略仍有失败；未运行全量长训、H100/NCCL 或新多卡编译路径。
 本次证据位于忽略目录 `logs/auto_shard_validation_20261022/`，没有改写源数据或提交 Git。
 
-## 重置采样与诊断
+## 重置分箱
 
-附录D.1的按回报重置采样按1 s分箱。多分箱片段的最后一箱若不足25个起点，并入前一箱：
+论文附录D.1：每段动作按1 s（50帧）切成分箱，回合从某个分箱的随机帧起步。重置分布是三部分的混合：
+50%在可重置分箱上均匀，40%按 $`\mathrm{softmax}_b(-25\,G_b/G_{\max})`$ 偏向回报低（难）的分箱，10%按历史分布；
+$`G_b`$ 是从该分箱起步的回合回报的EMA。温度25非常尖锐：评分差0.1，权重差约12倍；差0.2，约150倍。
+所以任何系统性压低某类分箱评分的因素，都会让这类分箱拿走40%的份额，“难的多练”就变成了“偏的多练”。
+
+全量数据上实际遇到四次，都是这一机制，区别只在压低评分的来源：
+
+| 轮次 | 被压低的分箱 | 原因 | 修正 | 效果 |
+| --- | --- | --- | --- | --- |
+| 1 | 片段最后的极短分箱 | 回合只有1–4步，首步平滑惩罚摊不开，再被外推 | 不足25个起点的尾箱并入前一箱 | 不超过5步的回合从52%降到2.7% |
+| 2 | 段末附近的分箱 | 以为是首步惩罚，实测不是主因 | （已取代） | — |
+| 3 | 片段最后一个分箱 | 重置过渡期持续1–2 s，短回合的平均奖励偏低 | 评分跳过前50步，起点离段末超过100步 | 段末2 s内的重置从64%降到0.3% |
+| 4 | 短于2 s的片段首帧 | 跳过过渡期后只剩一二十步，评分几乎全靠外推 | 这类首帧只分均匀份额 | 最大分箱概率从0.49降到0.019 |
+
+另有两处保证数值正确：同一步结束在同一分箱的多个回合先取均值再更新一次EMA（原来的重复索引写入结果未定义），
+分数在softmax前限制到[0, 1]、非有限值不更新。多卡时分箱的softmax与EMA按全局归一化，每卡在自己的分片内按条件分布抽样。
+训练中用`sampling_log.csv`的`samp_top1`（最大分箱概率）与`reset_tail_frac`（段末2 s内的重置比例）监控这一机制。
+
+### 选项与诊断
+
+多分箱片段的最后一箱若不足25个起点，并入前一箱：
 否则从片段末尾起步的回合只有1–4步，首步（上一动作为0）的平滑惩罚摊不开，外推后这些分箱显得极难，
 课程重置被集中到片段末尾，训练日志按回合平均的`ep_ret_norm`也随之为负。
 全量BONES-SEED上，修正把不超过5步的回合从52%降到2.7%。排查、对照与未解决问题见[重置采样分析](docs/analysis/reset_sampling.md)。
@@ -321,6 +484,7 @@ RTX 5080 单卡回归、`--nproc-per-node=gpu` 自动启动和多进程检查点
 
 | 脚本 | 用途 |
 | --- | --- |
+| `scripts/make_motion_source.py` | 把G1 CSV、配对索引或另一个合并源转成合并源HDF5，可按片段名与首帧高度过滤（CPU） |
 | `scripts/make_motion_subset.py` | 从HDF5源随机抽取完整片段，生成小规模子集（CPU） |
 | `scripts/_subject.py` | 诊断脚本的被测源码树（`--src`）：载入校验、策略/世界模型/critic加载、按源码树支持的选项建环境 |
 | `scripts/diag_first_step.py` | 附录F.1评估，并记录每段首步的平滑与限位惩罚、去掉首步后的归一化回报 |
@@ -386,6 +550,7 @@ scripts/
   profile_train.py
   benchmark_collect.py
   benchmark_paper_two_gpu.py
+  make_motion_source.py
   make_motion_subset.py
   _subject.py
   diag_first_step.py
@@ -417,6 +582,7 @@ tests/
   test_compile_check.py
   test_tensorboard_log.py
   test_goal_tail.py
+  test_make_motion_source.py
 ```
 
 | 路径 | 内容 |
