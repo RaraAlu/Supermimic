@@ -43,15 +43,16 @@ class TrackingSim:
     def __init__(self, num_envs: int, motion: MotionLib, mdp: MDP, device: str, gamma: float = 0.99,
                  eval_mode: bool = False, max_episode_steps: int = 500, reset_noise: bool = True,
                  parallel=None, graph_reward: bool = False, bin_clip_end: str = "bootstrap",
-                 bin_prior: str = "zero", bin_skip_steps: int = 50, reset_margin: int = 100):  # fmt: skip
-        """bin_clip_end、bin_prior、bin_skip_steps与reset_margin是重置分箱的选项，含义见reset_sampling.BinSampler。"""
+                 bin_prior: str = "zero", bin_skip_steps: int = 50, reset_margin: int = 100, bin_clip_cap: float = 0.0):  # fmt: skip
+        """bin_clip_end、bin_prior、bin_skip_steps、reset_margin与bin_clip_cap是重置分箱的选项，含义见reset_sampling.BinSampler。"""
         self.device = dev = device
         self.parallel = parallel if parallel is not None and parallel.enabled else None
         self.eval_mode = eval_mode
         self.max_episode_steps = max_episode_steps if not eval_mode else 10**9
         # 先建分箱采样器：选项不合法时在建场景之前报错
         self.sampler = BinSampler(motion, dev, gamma, self.parallel, clip_end=bin_clip_end, prior=bin_prior,
-                                  skip_steps=bin_skip_steps, reset_margin=reset_margin, max_steps=self.max_episode_steps)
+                                  skip_steps=bin_skip_steps, reset_margin=reset_margin, max_steps=self.max_episode_steps,
+                                  clip_cap=bin_clip_cap)
         scene_cfg = SceneCfg(
             num_envs=num_envs,
             env_spacing=0.0,

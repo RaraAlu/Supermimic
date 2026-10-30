@@ -4,6 +4,8 @@
 因此每个rank只持有本分片的分箱，却从同一个全局分布中采样。
 """
 
+import math
+
 import torch
 import torch.distributed as dist
 
@@ -57,12 +59,45 @@ def episode_bin_scores(disc_ret, ret, head_disc, head_ret, steps, terminated, at
 
 
 @torch.no_grad()
-def global_bin_probabilities(returns, ema, maximum_return, num_bins, parallel, visits=None, allowed=None, scored=None):
+def cap_clip_share(soft, bin_clip, num_clips, cap, parallel):
+    """把困难度分布soft中单个片段（全部分箱之和）的份额限制在cap以内；不是论文的设置（LaoYang1994复现中的--env.hard-clip-cap）。
+
+    超过上限的片段整段等比缩到上限，其余片段乘同一个系数分走削掉的质量，片段内各分箱的相对比例不变，总和不变。
+    有质量的片段少于1/cap个时上限取1/片段数。片段不跨rank：每个rank只交换本地最大的ceil(1/cap)+1个片段质量
+    （被削的片段不会更多），系数用闭式解求出，全程在设备上。返回(削平后的soft, [削平前最大片段份额, 被削平的片段数])。"""
+    dev = soft.device
+    mass = torch.zeros(num_clips, dtype=torch.float64, device=dev).index_add_(0, bin_clip, soft.double())
+    k_max = math.ceil(1 / cap) + 1
+    n_top = min(k_max, num_clips)
+    ordered = mass.sort(descending=True).values
+    local = torch.zeros(k_max, dtype=torch.float64, device=dev)
+    local[:n_top] = ordered[:n_top]
+    total, n_pos, tail = parallel.reduce(torch.stack((mass.sum(), (mass > 0).sum().double(), ordered[n_top:].sum())))
+    limit = torch.maximum(torch.as_tensor(cap, dtype=torch.float64, device=dev), 1 / n_pos.clamp(min=1)) * total
+    pool = parallel.all_gather(local).flatten().sort(descending=True).values
+    top = pool[:k_max]  # 全局最大的k_max个片段质量，降序
+    # 最大的k段削到上限时，其余片段的系数为 s_k = (总和 − k·上限) / 其余片段的质量；取最小的k，使第k+1大的片段乘s_k后不超过上限。
+    # 其余质量直接求和（不用总和减前k段：其余很小时相减会丢掉有效位）
+    k = torch.arange(k_max + 1, device=dev, dtype=torch.float64)
+    rest = torch.cat((top.flip(0).cumsum(0).flip(0), top.new_zeros(1))) + pool[k_max:].sum() + tail
+    scale = (total - k * limit) / rest.clamp(min=1e-300)
+    fits = torch.cat((top, top.new_zeros(1))) * scale <= limit * (1 + 1e-9)
+    capped = fits.int().argmax()
+    factor = torch.where(mass > 0, torch.minimum(scale[capped], limit / mass.clamp(min=1e-300)), 0.0)
+    return (soft.double() * factor[bin_clip]).to(soft.dtype), torch.stack((top[0] / total.clamp(min=1e-300), capped.double()))
+
+
+@torch.no_grad()
+def global_bin_probabilities(returns, ema, maximum_return, num_bins, parallel, visits=None, allowed=None, scored=None,
+                             clip_cap=0.0, bin_clip=None, num_clips=0, cap_stats=None):
     """计算全局 50/40/10 重置权重，实际采样限定在本地分片。
 
     提供 visits 时，未完成回合的分箱使用已访问分箱的全局平均分。allowed 指定允许重置的分箱；scored 指定参与 softmax 和 EMA 的分箱。无法评分的分箱只获得均匀权重；若所有进程都没有可评分的分箱，则自适应权重也并入均匀分布。
 
-    得分截断到 [0, maximum_return]，避免策略崩溃后大量负分使 softmax 几乎只选择一个失败分箱；正常范围内的得分不变。"""
+    得分截断到 [0, maximum_return]，避免策略崩溃后大量负分使 softmax 几乎只选择一个失败分箱；正常范围内的得分不变。
+
+    clip_cap>0 时困难度部分（及由它累积的EMA）中每个片段的份额不超过clip_cap（见cap_clip_share；bin_clip、num_clips为本分片
+    分箱所属的局部片段与片段数），cap_stats（形状(2,)）原地写入cap_clip_share返回的统计；为0时与论文相同。"""
     returns = torch.nan_to_num(returns, nan=0.0).clamp(0.0, maximum_return)
     if allowed is None:
         allowed = torch.ones_like(returns, dtype=torch.bool)
@@ -79,6 +114,11 @@ def global_bin_probabilities(returns, ema, maximum_return, num_bins, parallel, v
     exp = torch.where(scored, torch.exp(logits.double() - maximum), 0.0)
     norm = parallel.reduce(exp.sum())  # 除无可评分分箱外，结果至少为 1（全局最大值贡献 exp(0)）
     soft = (exp / norm.clamp(min=1e-300)).to(returns.dtype)
+    if clip_cap > 0:
+        soft, stats = cap_clip_share(soft, bin_clip, num_clips, clip_cap, parallel)
+        if cap_stats is not None:
+            cap_stats.copy_(stats)
+    # 混合均匀探索、当前困难度和缓慢变化的历史概率，避免采样只追随近期噪声。
     ema.mul_(0.999).add_(0.001 * soft)
     kept = torch.where(scored, ema, 0.0)
     total_ema = parallel.reduce(kept.double().sum()).clamp(min=1e-300)
@@ -95,15 +135,19 @@ class BinSampler:
     """
 
     def __init__(self, motion, device, gamma: float, parallel=None, clip_end: str = "bootstrap", prior: str = "zero",
-                 skip_steps: int = 50, reset_margin: int = 100, max_steps: int = 500):
+                 skip_steps: int = 50, reset_margin: int = 100, max_steps: int = 500, clip_cap: float = 0.0):
         """配置分箱采样：clip_end 为 bootstrap 时以平均奖励外推片段末尾并按全局最大回报评分；terminal 时在末尾结束并按起点可达的最大回报评分，仅外推步数上限截断。
 
-        prior 控制未访问分箱采用零分或已访问分箱的均值；mean 模式首次观测直接替换先验。skip_steps 跳过重置瞬态；reset_margin 排除片段末尾附近的起点，短片段仅允许首帧。无法越过瞬态的分箱及这些首帧只获得均匀权重。两者均为零时恢复旧评分方式。parallel 为 None 时使用单进程 LocalContext。"""
-        if clip_end not in CLIP_END_MODES or prior not in PRIORS or skip_steps < 0 or reset_margin < 0:
+        prior 控制未访问分箱采用零分或已访问分箱的均值；mean 模式首次观测直接替换先验。skip_steps 跳过重置瞬态；reset_margin 排除片段末尾附近的起点，短片段仅允许首帧。无法越过瞬态的分箱及这些首帧只获得均匀权重。两者均为零时恢复旧评分方式。parallel 为 None 时使用单进程 LocalContext。
+
+        clip_cap>0 时限制困难度部分中单个片段的份额（不是论文的设置，见cap_clip_share），0为论文原版。"""
+        if clip_end not in CLIP_END_MODES or prior not in PRIORS or skip_steps < 0 or reset_margin < 0 or not 0 <= clip_cap < 1:
             raise ValueError(f"bin_clip_end must be one of {CLIP_END_MODES}, bin_prior one of {PRIORS}, "
-                             "and bin_skip_steps and reset_margin non-negative")
+                             "bin_skip_steps and reset_margin non-negative, and bin_clip_cap in [0, 1)")
         self.motion, self.device, self.gamma, self.parallel = motion, device, gamma, parallel
         self.clip_end, self.prior, self.skip_steps, self.max_steps = clip_end, prior, skip_steps, max_steps
+        self.clip_cap = clip_cap
+        self.cap_stats = torch.zeros(2, dtype=torch.float64, device=device)  # 最近一次：削平前最大片段份额、被削平的片段数
         # 分箱得分为折扣回报除以最大回报（全局最大值或起始帧可达到的最大值）
         self.scores = torch.full((motion.num_bins,), 0.0, device=device)
         self.visits = torch.zeros(motion.num_bins, dtype=torch.long, device=device)
@@ -129,7 +173,8 @@ class BinSampler:
         """根据当前分箱得分、访问数和概率 EMA 计算全局重置概率。"""
         visits = self.visits if self.prior == "mean" else None
         return global_bin_probabilities(self.scores, self.ema, 1.0, self.motion.global_num_bins, context,
-                                        visits, self.allowed, self.scored)
+                                        visits, self.allowed, self.scored, self.clip_cap, self.motion.bin_clip,
+                                        self.motion.clip_start.numel(), self.cap_stats)
 
     def prepare(self, active):
         """多卡时每个仿真步都调用：有任一rank结束了回合就在所有rank上更新全局概率；单进程时不做事。"""
@@ -203,6 +248,14 @@ class BinSampler:
         self.window_ends.zero_()
         self.window_starts.zero_()
         return report
+
+    @torch.no_grad()
+    def clip_stats(self) -> torch.Tensor:
+        """[本分片中最大的片段重置概率（各分箱之和）, 削平前困难度部分的最大片段份额, 被削平的片段数]。
+        片段不跨rank且概率是全局分布，各项跨进程取最大值即为全局值（后两项各rank相同）。"""
+        clip_p = torch.zeros(self.motion.clip_start.numel(), dtype=torch.float64, device=self.device)
+        clip_p.index_add_(0, self.motion.bin_clip, self.probs.double())
+        return torch.cat((clip_p.max().reshape(1), self.cap_stats))
 
     @torch.no_grad()
     def stats(self) -> torch.Tensor:

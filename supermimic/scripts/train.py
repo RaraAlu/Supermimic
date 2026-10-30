@@ -96,6 +96,10 @@ parser.add_argument("--bin_skip_steps", type=int, default=50,
 parser.add_argument("--reset_margin", type=int, default=100,
                     help="no reset starts within this many steps of a clip's end (a shorter clip starts only at its "
                          "first frame), so every scored episode outlasts the transient; 0 allows every start")
+parser.add_argument("--bin_clip_cap", type=float, default=0.0,
+                    help="cap each clip's share of the 40%% difficulty term of the reset distribution (and of the history "
+                         "term built from it); the excess goes to the other clips in proportion (not in the paper; 0 keeps "
+                         "the paper's behavior, 0.01 is LaoYang1994's --env.hard-clip-cap). Also writes clipcap_log.csv")
 parser.add_argument("--device", type=str, default="cuda:0")
 parser.add_argument("--batch_scope", type=str, default="global", choices=["global", "per_gpu"],
                     help="--num_envs/--wm_batch/--pi_batch are global totals split across ranks, or per-GPU sizes; "
@@ -180,13 +184,13 @@ def setup(argv: list[str] | None = None):
 def main(argv: list[str] | None = None):
     """初始化训练状态，循环执行训练、记录日志并保存检查点。"""
     args, parallel, trainer = setup(argv)
-    from supermimic.tasks.tracking.rl.trainer import CLEAN_TABLE, LOG_TABLES
+    from supermimic.tasks.tracking.rl.trainer import CLEAN_TABLE, CLIPCAP_TABLE, LOG_TABLES
     from supermimic.utils.run_log import RunLog
 
     # train/sampling/diag各一份CSV，后两者单独成文件，恢复旧run时train_log.csv的列不变；TensorBoard用purge_step
     # 隐藏上次运行在恢复点之后写下的事件（恢复点及之前的行仍有效）
     start_it = trainer.start_it
-    tables = LOG_TABLES | (CLEAN_TABLE if args.clean_action_frac > 0 else {})
+    tables = LOG_TABLES | (CLEAN_TABLE if args.clean_action_frac > 0 else {}) | (CLIPCAP_TABLE if args.bin_clip_cap > 0 else {})
     log = RunLog(args.log_dir, tables, tensorboard=tensorboard_enabled(args),
                  purge_step=start_it + 1 if start_it else None) if parallel.primary else None
     trainer.start_clock()
@@ -203,6 +207,9 @@ def main(argv: list[str] | None = None):
                     c = rows["clean"]
                     print(f"   clean sim_r {c[1]:.3f} ep_ret {c[4]:.3f} term {c[5]:.2f} | noisy sim_r {c[2]:.3f} ep_ret {c[7]:.3f} "
                           f"term {c[8]:.2f}", flush=True)
+                if "clipcap" in rows:
+                    c = rows["clipcap"]
+                    print(f"   clip_top1 {c[1]:.4f} | hard top clip before cap {c[2]:.4f}, {c[3]} clips capped", flush=True)
         if args.term_log_every and (it + 1) % args.term_log_every == 0:
             summary, lines = trainer.term_rows(it)  # 集合通信，所有rank都调用
             if log:

@@ -86,6 +86,11 @@ class LocalContext:
         """单进程归约：将输入转换为双精度张量。"""
         return values.double() if torch.is_tensor(values) else torch.as_tensor(values, dtype=torch.float64)
 
+    @staticmethod
+    def all_gather(tensor):
+        """单进程：只在前面加一维。"""
+        return tensor.unsqueeze(0)
+
 
 class DistributedContext:
     """管理分布式进程组、集合通信及跨进程错误协调。"""
@@ -133,6 +138,14 @@ class DistributedContext:
         if self.enabled:
             dist.all_reduce(tensor, op=op)
         return tensor
+
+    def all_gather(self, tensor):
+        """把各进程形状相同的张量沿新的第0维按rank拼起来，留在设备上，不经过主机。"""
+        if not self.enabled:
+            return tensor.unsqueeze(0)
+        parts = [torch.empty_like(tensor) for _ in range(self.world_size)]
+        dist.all_gather(parts, tensor.contiguous())
+        return torch.stack(parts)
 
     def gather(self, value):
         """收集所有进程的 Python 对象；单进程时返回单元素列表。"""

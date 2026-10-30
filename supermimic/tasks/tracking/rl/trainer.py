@@ -53,6 +53,10 @@ LOG_TABLES = {"train": ("train_log.csv", TRAIN_COLUMNS), "sampling": ("sampling_
 CLEAN_COLUMNS = ("iteration", "sim_rew_clean", "sim_rew_noisy", "ep_len_clean", "ep_ret_clean", "term_frac_clean",
                  "ep_len_noisy", "ep_ret_noisy", "term_frac_noisy")
 CLEAN_TABLE = {"clean": ("clean_log.csv", CLEAN_COLUMNS)}
+# --bin_clip_cap > 0 时另写：clip_top1为单个片段（各分箱之和）最大的重置概率，hard_clip_top1_raw为削平前困难度部分（占重置的40%）
+# 中最大的片段份额，capped_clips为被削到上限的片段数。都是记日志那一刻的快照。
+CLIPCAP_COLUMNS = ("iteration", "clip_top1", "hard_clip_top1_raw", "capped_clips")
+CLIPCAP_TABLE = {"clipcap": ("clipcap_log.csv", CLIPCAP_COLUMNS)}
 
 
 @dataclass(frozen=True)
@@ -213,7 +217,7 @@ class Trainer:
         self.env = TrackingSim(layout.local_envs, motion, self.mdp, dev, gamma=args.gamma, parallel=parallel,
                                graph_reward=self.use_graph and args.cuda_graph_env == "on",
                                bin_clip_end=args.bin_clip_end, bin_prior=args.bin_prior, bin_skip_steps=args.bin_skip_steps,
-                               reset_margin=args.reset_margin)
+                               reset_margin=args.reset_margin, bin_clip_cap=args.bin_clip_cap)
         if resume:
             self._restore_bins(resume)
         # 回放数据与观测历史属于当前仿真会话，不从检查点恢复；外层 setup 会重新预热。
@@ -640,6 +644,9 @@ class Trainer:
         rows = {"train": row, "sampling": samp_row, "diag": diag_row}
         if self.clean_envs is not None:
             rows["clean"] = self._clean_row(it, stats, episodes)
+        if sampler.clip_cap > 0:
+            cap = parallel.reduce(sampler.clip_stats(), torch.distributed.ReduceOp.MAX).cpu()
+            rows["clipcap"] = [it + 1, float(cap[0]), float(cap[1]), int(cap[2])]
         # 本次日志已消费累计量，清空窗口，避免下次重复统计；模型与课程长期状态不在此处清除。
         self.stats = {k: [] for k in stats}
         self.agg = {k: [] for k in agg}

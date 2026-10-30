@@ -260,6 +260,8 @@ uv run --frozen tensorboard --logdir logs
 说明确定性策略在真实仿真里已不如加噪声时，原因与判读见[训练指标第12节](docs/troubleshooting/training_metrics.md)。
 F为0时训练日志里没有确定性表现，用`evaluate.py --watch`或`scripts/diag_first_step.py`在固定子集上评估检查点。
 
+`--bin_clip_cap C`（默认0，与论文相同；不是论文的设置）限制重置分布40%困难度部分中单个片段的份额不超过C（例如0.01），超出部分按比例分给其他片段，做法见[重置采样分析](docs/analysis/reset_sampling.md)第4节。并另写`clipcap_log.csv`（TensorBoard标签`clipcap/<列名>`），与`train_log.csv`同频，记日志那一刻的快照：单个片段最大的重置概率`clip_top1`（含50%均匀部分，长片段本来就较大）、削平前困难度部分中最大的片段份额`hard_clip_top1_raw`、被削到上限的片段数`capped_clips`。
+
 `--keep_states N`（默认3）保留`last.pt`与前N−1次保存`last_prev1.pt`、`last_prev2.pt`……（硬链接，不额外占写入），
 崩溃前的完整状态不会被紧接着的下一次保存覆盖；都是可直接`--resume`的完整状态。
 
