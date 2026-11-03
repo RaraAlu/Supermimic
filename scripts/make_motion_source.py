@@ -1,8 +1,9 @@
 """把动作数据整理成一个合并源HDF5（teleopit_motion_hdf5 v1，50 Hz），训练与评估用--motion_source直接读取。
 
-输入三选一：
+输入四选一：
     --csv_dir DIR          每个文件一段动作的G1 CSV（与LAFAN1相同的36列：根位置xyz、根四元数xyzw、29个关节角），
                            按--csv_fps重采样到50 Hz，做法与--motion_dir相同
+    --npz_dir DIR          每个文件一段50 Hz的G1动作npz（root_pos、root_quat_wxyz、joint_pos，可带fps与joint_names），不重采样
     --motion_index INDEX   配对索引选入的源片段（需要同目录的run.json，--motion_root可覆盖源根），按索引行顺序
     --motion_source SRC    另一个合并源文件，用于再过滤
 过滤：--exclude按片段名或文件名（不含扩展名）去掉片段；--max_start_height去掉首帧根高度超过该值的片段
@@ -41,14 +42,35 @@ def clips_from_args(args):
         if not files:
             sys.exit(f"no *.csv in {args.csv_dir}")
         return [Path(f).stem for f in files], (tuple(x.numpy() for x in load_csv(f, args.csv_fps)) for f in files)
-    dataset = IndexedG1Dataset(args.motion_index, args.motion_root) if args.motion_index else MergedG1Dataset(args.motion_source)
+    if args.npz_dir:
+        files = sorted(glob.glob(os.path.join(args.npz_dir, "*.npz")))
+        if not files:
+            sys.exit(f"no *.npz in {args.npz_dir}")
+        return [Path(f).stem for f in files], (load_npz(f) for f in files)
+    dataset =IndexedG1Dataset(args.motion_index, args.motion_root) if args.motion_index else MergedG1Dataset(args.motion_source)
     return [c.name for c in dataset.clips], dataset.iter_clips()
+
+
+def load_npz(path):
+    """读一段npz动作，返回(根位置, 根四元数wxyz, 关节角)；带fps或joint_names时须为50 Hz与G1_JOINT_NAMES的顺序。"""
+    from supermimic.tasks.tracking.constants import G1_JOINT_NAMES
+    from supermimic.tasks.tracking.motion_hdf5 import validate_pose_arrays
+
+    with np.load(path, allow_pickle=False) as z:
+        if "fps" in z.files and float(z["fps"]) != FPS:
+            sys.exit(f"{path}: fps {float(z['fps'])}, expected {FPS} (no resampling for npz)")
+        if "joint_names" in z.files and z["joint_names"].tolist() != G1_JOINT_NAMES:
+            sys.exit(f"{path}: joint_names differ from G1_JOINT_NAMES")
+        arrays = tuple(np.asarray(z[k], dtype=np.float32) for k in ("root_pos", "root_quat_wxyz", "joint_pos"))
+    validate_pose_arrays(*arrays, path)
+    return arrays
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--csv_dir", help="directory of G1 motion CSVs (one clip per file)")
+    source.add_argument("--npz_dir", help="directory of 50 Hz G1 motion .npz files (one clip per file)")
     source.add_argument("--motion_index", help="paired index whose selected source clips are merged")
     source.add_argument("--motion_source", help="another merged source to filter")
     parser.add_argument("--motion_root", default=None, help="source root overriding run.json (with --motion_index)")
@@ -108,7 +130,7 @@ def write(args, tmp, names, arrays_iter, exclude):
         group = f.create_group("clips")
         group["source_relative_path"] = np.array(kept, dtype=h5py.string_dtype("utf-8"))
         group["input_index"] = np.asarray(inputs, dtype=np.int64)
-        made_by = {"input": {k: getattr(args, k) for k in ("csv_dir", "csv_fps", "motion_index", "motion_root", "motion_source")
+        made_by = {"input": {k: getattr(args, k) for k in ("csv_dir", "csv_fps", "npz_dir", "motion_index", "motion_root", "motion_source")
                              if getattr(args, k) is not None},
                    "exclude": sorted(exclude), "max_start_height": args.max_start_height,
                    "input_clips": len(names), "dropped": dropped}

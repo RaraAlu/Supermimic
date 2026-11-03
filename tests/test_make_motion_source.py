@@ -80,6 +80,24 @@ class MakeMotionSourceTests(unittest.TestCase):
         for u, v in zip(next(x.iter_clips()), next(y.iter_clips())):
             np.testing.assert_array_equal(u, v)
 
+    def test_npz_kept_at_50hz_and_checked(self):
+        npz = self.root / "npz"
+        npz.mkdir()
+        p, quat, j = (x.numpy() for x in load_csv(str(self.csv / "a_walk.csv")))
+        arrays = {"root_pos": p, "root_quat_wxyz": quat, "joint_pos": j}
+        np.savez(npz / "dance.npz", fps=np.float32(50), joint_names=np.array(G1_JOINT_NAMES), **arrays)
+        out = self.root / "npz.h5"
+        self.assertEqual(run("--npz_dir", npz, "--out", out)["clips"], 1)
+        ds = MergedG1Dataset(out)
+        self.assertEqual([c.name for c in ds.clips], ["dance"])
+        for got, want in zip(next(ds.iter_clips()), (p, quat, j)):
+            np.testing.assert_array_equal(got, want)
+        for bad in ({"fps": np.float32(30)}, {"joint_names": np.array(G1_JOINT_NAMES[::-1])}):
+            np.savez(npz / "dance.npz", **arrays, **bad)
+            with self.assertRaises(SystemExit):
+                run("--npz_dir", npz, "--out", self.root / "bad.h5")
+        self.assertFalse((self.root / "bad.h5.partial").exists())
+
     def test_refuses_existing_output_and_empty_result(self):
         out = self.root / "x.h5"
         out.write_bytes(b"")

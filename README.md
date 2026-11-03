@@ -153,7 +153,7 @@ uv run --frozen python -m supermimic.scripts.evaluate --run_dir logs/smoke --wat
 ## 准备训练数据
 
 训练、评估和诊断都读同一种文件：单个合并源HDF5（`--motion_source`，格式`teleopit_motion_hdf5` v1，50 Hz）。
-`scripts/make_motion_source.py`把三种输入转成它，只用CPU、逐段读写，不修改输入：
+`scripts/make_motion_source.py`把四种输入转成它，只用CPU、逐段读写，不修改输入：
 
 ```bash
 # 1) 每个文件一段动作的G1 CSV（36列：根位置xyz、根四元数xyzw、29个关节角），按--csv_fps重采样到50 Hz
@@ -166,6 +166,9 @@ uv run --frozen python scripts/make_motion_source.py --motion_index paired_50hz/
 # 3) 对已有文件再过滤：按片段名或文件名去掉若干段
 uv run --frozen python scripts/make_motion_source.py --motion_source data/boneseed.h5 --out data/boneseed_v2.h5 \
   --exclude jump_to_shoulder_roll_R_003__A304_M
+
+# 4) 每个文件一段50 Hz的G1动作npz（root_pos、root_quat_wxyz、joint_pos；带fps、joint_names时检查为50与G1关节顺序），不重采样
+uv run --frozen python scripts/make_motion_source.py --npz_dir data/dance_npz --out data/dance.h5
 ```
 
 文件内容：
