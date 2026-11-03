@@ -4,6 +4,7 @@
 每个动作从首帧播放一次，摩擦系数为 1.0，不使用域随机化、观测噪声或动作噪声；触发训练终止条件即视为失败。归一化回报为未折扣奖励之和除以可达到的最大值。
 另报告不计目标截断的失败数：触发终止的动作若由已截断在段末的未来参考算出（f + K 超过段末），这类失败只计入论文口径。
 --goal_tail默认沿用检查点的设置（旧检查点为clamp）；不为clamp时越过段末的目标换成虚拟帧，上面的“目标截断”仍按f + K超过段末计数。
+--other_data在训练数据以外的动作上评估单个检查点（例如微调前先看原检查点能否跟上某段舞蹈），结果另存，不覆盖原评估。
 
 监听运行：python -m supermimic.scripts.evaluate --run_dir logs/<run> --watch。"""
 
@@ -35,10 +36,15 @@ parser.add_argument("--eval_batch_size", type=int, default=4096, help="parallel 
 parser.add_argument("--every", type=int, default=1, help="evaluate every n-th checkpoint")
 parser.add_argument("--goal_tail", type=str, default=None, choices=["clamp", "hold", "stand", "auto"],
                     help="goal frames past a clip's end (see train.py); default: the run's setting, clamp for older runs")
+parser.add_argument("--other_data", action="store_true",
+                    help="evaluate --ckpt on an explicitly given data source other than its training data (no fingerprint "
+                         "check); writes CKPT_eval_<data name>.json instead of CKPT_eval.json")
 parser.add_argument("--device", type=str, default="cuda:0")
 args = parser.parse_args()
 if int(os.environ.get("WORLD_SIZE", "1")) > 1:
     parser.error("evaluation is single-process and batched; run without torchrun")
+if args.other_data and not (args.ckpt and (args.motion_dir or args.motion_index or args.motion_source)):
+    parser.error("--other_data needs --ckpt and an explicit --motion_dir, --motion_index or --motion_source")
 
 import numpy as np
 import torch
@@ -68,9 +74,10 @@ if args.record and C > args.eval_batch_size:
 
 
 @torch.no_grad()
-def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
-    """从参考片段首帧评估策略，汇总各片段回报和成功情况，并按需记录轨迹。"""
-    check_reference(motion.description, ck.get("reference"))
+def evaluate(env: TrackingSim, ck: dict, record: str | None = None, check_data: bool = True) -> dict:
+    """从参考片段首帧评估策略，汇总各片段回报和成功情况，并按需记录轨迹。check_data=False（--other_data）时不比对数据指纹。"""
+    if check_data:
+        check_reference(motion.description, ck.get("reference"))
     a_ = ck["args"]
     K, Hh = a_["goal_frames"], a_["hist"]
     networks.AMP_DTYPE = torch.bfloat16 if a_.get("amp", "none") == "bf16" else None
@@ -154,10 +161,12 @@ def make_env() -> TrackingSim:
 env = None
 if args.ckpt:
     ck = initial_ck
-    check_reference(motion.description, ck.get("reference"))
+    if not args.other_data:
+        check_reference(motion.description, ck.get("reference"))
     env = make_env()
-    res = evaluate(env, ck, args.record)
-    result_path = str(Path(args.ckpt).with_suffix("")) + "_eval.json"
+    res = evaluate(env, ck, args.record, check_data=not args.other_data)
+    data_name = Path(args.motion_source or args.motion_index or args.motion_dir).stem
+    result_path = str(Path(args.ckpt).with_suffix("")) + (f"_eval_{data_name}.json" if args.other_data else "_eval.json")
     Path(result_path).write_text(json.dumps(res, indent=1, ensure_ascii=False), encoding="utf-8")
     print(json.dumps({k: v for k, v in res.items() if k != "per_clip"}, indent=1))
     sys.exit(0)

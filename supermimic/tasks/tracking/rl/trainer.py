@@ -147,11 +147,19 @@ def set_requires_grad(m: nn.Module, flag: bool):
         p.requires_grad_(flag)
 
 
+def reset_adam(opt: torch.optim.Optimizer):
+    """原位清零Adam的步数与一二阶矩，下一步等同于新建的优化器；捕获的图仍引用同一批张量。"""
+    for state in opt.state.values():
+        for value in state.values():
+            if torch.is_tensor(value):
+                value.zero_()
+
+
 class Trainer:
     """一个rank上的训练状态与各更新步骤。构造后调用collect(warmup_steps)预热，再逐次调用iteration(it)。"""
 
-    def __init__(self, args, parallel, layout: Layout, kin, motion, resume: dict | None = None):
-        """建立环境、回放缓冲区、模型、优化器与训练状态，并按需恢复检查点。"""
+    def __init__(self, args, parallel, layout: Layout, kin, motion, resume: dict | None = None, init: dict | None = None):
+        """建立环境、回放缓冲区、模型、优化器与训练状态，并按需恢复检查点（resume）或只载入其权重（init，--init_from）。"""
         self.args, self.parallel, self.layout, self.motion = args, parallel, layout, motion
         dev = self.device = parallel.device
         self.mdp = MDP(kin, motion, kin.default_q)
@@ -185,6 +193,8 @@ class Trainer:
         self.start_it, self.wall_offset, self.sim_steps = 0, 0.0, 0
         if resume:
             self._resume(resume)
+        elif init:
+            self._init_weights(init)
         # 先同步模型与归一化缓冲区，再按进程切换随机种子。
         # 这样各卡从同一组参数出发，但后续环境随机化和采样不会重复。
         for model in (self.wm, self.pi, self.critic):
@@ -261,6 +271,15 @@ class Trainer:
                         state["step"] = torch.as_tensor(state["step"], dtype=torch.float32,
                                                         device=p.device if on_device else "cpu").clone()
         self.start_it, self.wall_offset, self.sim_steps = ck["iteration"], ck["wall_time"], ck["sim_steps"]
+
+    def _init_weights(self, ck: dict):
+        """--init_from：载入策略与世界模型（含输入归一化），检查点有critic时一并载入；优化器、迭代数与课程从头开始。"""
+        self.pi.load_state_dict(ck["pi"]), self.wm.load_state_dict(ck["wm"])
+        if "critic" in ck:
+            self.critic.load_state_dict(ck["critic"])
+        if self.parallel.primary:
+            print(f"initialized from {self.args.init_from} (iteration {ck['iteration']}): policy, world model"
+                  f"{', critic' if 'critic' in ck else '; critic from scratch'}", flush=True)
 
     def _restore_bins(self, ck: dict):
         """恢复重置课程（分箱得分、访问数、概率EMA）。分片取决于数据划分，世界大小或分片形状不同就不恢复，课程从零开始。
@@ -554,20 +573,33 @@ class Trainer:
                                                           (out["term"] & self.clean_envs).float().sum(), ended.sum())))
 
     # ---------------- 一次迭代 ----------------
-    def set_lr(self, lr: float):
-        """更新各优化器的学习率，兼容设备张量与普通数值。"""
-        for o in (self.opt_wm, self.opt_pi, self.opt_v):
+    def set_lr(self, lr: float, opts=None):
+        """更新优化器的学习率（默认三个都更新），兼容设备张量与普通数值。"""
+        for o in opts or (self.opt_wm, self.opt_pi, self.opt_v):
             for gparam in o.param_groups:
                 if torch.is_tensor(gparam["lr"]):
                     gparam["lr"].fill_(lr)
                 else:
                     gparam["lr"] = lr
 
-    def iteration(self, it: int) -> float:
-        """采样、世界模型更新，过了--wm_only_iters后再更新策略与critic；返回本次学习率。梯度非有限时中止。"""
+    def schedule_lr(self, it: int) -> float:
+        """设置并返回本次迭代的学习率。--critic_warmup_iters期间策略学习率为0，critic先拟合；期满那次迭代
+        清零策略Adam的步数与动量，丢掉预热期按未拟合的critic累积的梯度。"""
         args = self.args
         lr = lr_at(it, self.layout.base_lr, args.lr_decay_iters)
         self.set_lr(lr)
+        if args.critic_warmup_iters:
+            warm_end = args.wm_only_iters + args.critic_warmup_iters
+            if it < warm_end:
+                self.set_lr(0.0, (self.opt_pi,))
+            elif it == warm_end:
+                reset_adam(self.opt_pi)
+        return lr
+
+    def iteration(self, it: int) -> float:
+        """采样、世界模型更新，过了--wm_only_iters后再更新策略与critic；返回本次学习率。梯度非有限时中止。"""
+        args = self.args
+        lr = self.schedule_lr(it)
         # 用小数累加器落实更新/数据比，保留不足一个采集步的余数，避免每轮取整产生长期偏差。
         self.step_acc += 1.0 / args.utd
         n = int(self.step_acc)
@@ -687,7 +719,7 @@ class Trainer:
         return {"termwin": summary}, lines
 
     def checkpoint(self, it: int, bins: dict | None = None) -> dict:
-        """完整训练状态（--resume用）；其中pi、wm与元数据另存为评估用的ckpt_*.pt。bins是gather_bins()的结果。"""
+        """完整训练状态（--resume用）；其中pi、wm、critic与元数据另存为ckpt_*.pt。bins是gather_bins()的结果。"""
         return {"bins": bins, "wm": self.wm.state_dict(), "pi": self.pi.state_dict(), "critic": self.critic.state_dict(),
                 "opt_wm": self.opt_wm.state_dict(), "opt_pi": self.opt_pi.state_dict(), "opt_v": self.opt_v.state_dict(),
                 "iteration": it + 1, "wall_time": time.time() - self.t_start, "sim_steps": self.sim_steps,
@@ -702,8 +734,10 @@ class Trainer:
         rotate_states(last, keep_states)
         torch.save(ck, last + ".tmp")
         os.replace(last + ".tmp", last)
-        # 评估检查点只保留推理模型与溯源信息；last.pt 另包含优化器和课程状态，用于继续训练。
-        small = {k: ck[k] for k in ("pi", "wm", "iteration", "wall_time", "sim_steps", "args", "saved_at", "reference", "distributed")}
+        # ckpt_*.pt保留三个网络与溯源信息，可用于评估，也可作--init_from的起点而不必预热critic（critic约1 MB）；
+        # last.pt另含优化器和课程状态，用于继续训练。
+        small = {k: ck[k] for k in ("pi", "wm", "critic", "iteration", "wall_time", "sim_steps", "args", "saved_at", "reference",
+                                    "distributed")}
         path = os.path.join(log_dir, f"ckpt_{it + 1:06d}.pt")
         torch.save(small, path + ".tmp")
         os.replace(path + ".tmp", path)

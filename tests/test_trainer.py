@@ -8,9 +8,10 @@ import unittest
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 from supermimic.tasks.tracking.rl.trainer import (CLEAN_COLUMNS, LOG_TABLES, Trainer, clean_action_split, gae_targets, lr_at,
-                                                  make_layout, split_sizes, survival)
+                                                  make_layout, reset_adam, split_sizes, survival)
 from supermimic.utils.distributed import DistributedContext
 from supermimic.utils.run_log import RunLog
 
@@ -225,6 +226,92 @@ class RunLogTests(unittest.TestCase):
             tags = set(acc.Tags()["scalars"])
             self.assertEqual(tags, {f"{g}/{c}" for g, (_, columns) in LOG_TABLES.items() if g != self.LINES for c in columns[1:]})
             self.assertEqual([(e.step, e.value) for e in acc.Scalars("train/wall_h")], [(50, 25.0)])
+
+
+class InitFromTests(unittest.TestCase):
+    """--init_from：只载入权重；--critic_warmup_iters期间策略不动，期满清零其Adam动量。"""
+
+    def assert_same(self, a: nn.Module, b: nn.Module):
+        for key, value in a.state_dict().items():
+            torch.testing.assert_close(b.state_dict()[key], value, rtol=0, atol=0)
+
+    def test_reset_adam_in_place_matches_fresh_optimizer(self):
+        torch.manual_seed(0)
+        used, fresh = nn.Linear(3, 2), nn.Linear(3, 2)
+        opt = torch.optim.Adam(used.parameters(), lr=1e-2)
+        for _ in range(3):
+            opt.zero_grad()
+            used(torch.randn(4, 3)).square().sum().backward()
+            opt.step()
+        ptrs = [v.data_ptr() for state in opt.state.values() for v in state.values()]
+        reset_adam(opt)
+        self.assertEqual([v.data_ptr() for state in opt.state.values() for v in state.values()], ptrs)  # 图引用的张量不变
+        fresh.load_state_dict(used.state_dict())
+        opt_fresh = torch.optim.Adam(fresh.parameters(), lr=1e-2)
+        x = torch.randn(4, 3)
+        for model, o in ((used, opt), (fresh, opt_fresh)):
+            o.zero_grad()
+            model(x).square().sum().backward()
+            o.step()
+        self.assert_same(fresh, used)
+
+    def test_warmup_holds_policy_then_clears_its_moments(self):
+        nets = [nn.Linear(2, 1) for _ in range(3)]
+        opts = [torch.optim.Adam(net.parameters(), lr=1.0) for net in nets]
+        fake = SimpleNamespace(args=SimpleNamespace(wm_only_iters=2, critic_warmup_iters=3, lr_decay_iters=100),
+                               layout=SimpleNamespace(base_lr=1e-3), opt_wm=opts[0], opt_pi=opts[1], opt_v=opts[2])
+        fake.set_lr = lambda lr, o=None: Trainer.set_lr(fake, lr, o)
+        nets[1](torch.ones(1, 2)).sum().backward()
+        opts[1].step()  # 预热期按未拟合的critic累积的动量
+        for it in range(7):
+            lr = Trainer.schedule_lr(fake, it)
+            self.assertEqual(lr, lr_at(it, 1e-3, 100))
+            self.assertEqual([o.param_groups[0]["lr"] for o in opts], [lr, 0.0 if it < 5 else lr, lr])
+            cleared = all(not v.any() for state in opts[1].state.values() for v in state.values())
+            self.assertEqual(cleared, it >= 5)
+        fake.args.critic_warmup_iters = 0  # 论文路径：不动策略学习率
+        Trainer.schedule_lr(fake, 0)
+        self.assertEqual(opts[1].param_groups[0]["lr"], 1e-3)
+
+    def test_init_weights_load_critic_only_when_saved(self):
+        torch.manual_seed(0)
+        src, dst = [nn.Linear(2, 2) for _ in range(3)], [nn.Linear(2, 2) for _ in range(3)]
+        critic_before = nn.Linear(2, 2)
+        critic_before.load_state_dict(dst[2].state_dict())
+        fake = SimpleNamespace(pi=dst[0], wm=dst[1], critic=dst[2], parallel=SimpleNamespace(primary=False),
+                               args=SimpleNamespace(init_from="ckpt.pt"))
+        ck = {"pi": src[0].state_dict(), "wm": src[1].state_dict(), "iteration": 98000}  # 旧ckpt_*.pt没有critic
+        Trainer._init_weights(fake, ck)
+        self.assert_same(src[0], dst[0]), self.assert_same(src[1], dst[1]), self.assert_same(critic_before, dst[2])
+        Trainer._init_weights(fake, ck | {"critic": src[2].state_dict()})  # last.pt
+        self.assert_same(src[2], dst[2])
+
+    def test_small_checkpoint_keeps_critic_but_not_optimizers(self):
+        full = {"bins": None, "pi": {"w": torch.ones(1)}, "wm": {"w": torch.ones(2)}, "critic": {"w": torch.zeros(1)},
+                "opt_wm": {}, "opt_pi": {}, "opt_v": {}, "iteration": 2, "wall_time": 1.0, "sim_steps": 3, "args": {},
+                "saved_at": "", "reference": {}, "distributed": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            Trainer.save(SimpleNamespace(checkpoint=lambda it, bins: full), 1, tmp, 1)
+            small = torch.load(Path(tmp) / "ckpt_000002.pt")
+            self.assertEqual(set(small), set(full) - {"bins", "opt_wm", "opt_pi", "opt_v"})  # --init_from从它起步不必预热critic
+            torch.testing.assert_close(small["critic"]["w"], full["critic"]["w"])
+            self.assertEqual(set(torch.load(Path(tmp) / "last.pt")), set(full))
+
+    def test_resolve_init_warmup_and_shapes(self):
+        from supermimic.scripts.train import resolve_init
+
+        def args(**kw):
+            return SimpleNamespace(**({"goal_frames": 10, "hist": 10, "critic_warmup_iters": -1, "no_critic": False} | kw))
+
+        saved = {"args": {"goal_frames": 10, "hist": 10}}
+        cases = [(args(), None, None, 0), (args(), None, saved, 1000), (args(), None, saved | {"critic": {}}, 0),
+                 (args(no_critic=True), None, saved, 0), (args(critic_warmup_iters=200), None, saved, 200),
+                 (args(), {"args": {"critic_warmup_iters": 1000}}, None, 1000), (args(), {"args": {}}, None, 0)]
+        for a, resume, init, want in cases:
+            resolve_init(a, resume, init)
+            self.assertEqual(a.critic_warmup_iters, want)
+        with self.assertRaisesRegex(ValueError, "--hist 10, not 5"):
+            resolve_init(args(hist=5), None, saved)
 
 
 if __name__ == "__main__":

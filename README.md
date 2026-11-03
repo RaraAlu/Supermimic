@@ -262,6 +262,37 @@ uv run --frozen python -m supermimic.scripts.train --motion_source SOURCE.h5 --l
 合并源的指纹绑定文件大小、总帧数和所选段的起点/长度，不计算姿态内容SHA256；
 相同大小且边界不变的姿态替换可能无法被识别。上面的`scripts/check_data.py`只支持索引入口，不能传`--motion_source`。
 
+## 微调特定动作
+
+只想让某几段动作（例如一段舞蹈）做好、不在乎其余动作退步时，可以从训好的检查点出发，只在这些动作上继续训练（不是论文的设置）：
+
+```bash
+# 1) 重定向到G1的动作放进一个目录，转成合并源（50 Hz npz用--npz_dir，CSV用--csv_dir）
+uv run --frozen python scripts/make_motion_source.py --npz_dir data/dance_npz --out data/dance.h5
+
+# 2) 先看原检查点能否跟上；结果写到ckpt_098000_eval_dance.json，不覆盖全库评估
+uv run --frozen python -m supermimic.scripts.evaluate --run_dir logs/a100 --ckpt logs/a100/ckpt_098000.pt \
+  --motion_source data/dance.h5 --other_data --goal_tail auto
+
+# 3) 从该检查点起步，只在舞蹈上训练（单卡）
+uv run --frozen python -m supermimic.scripts.train --init_from logs/a100/ckpt_098000.pt --motion_source data/dance.h5 \
+  --num_envs 4096 --iterations 20000 --lr 0.0001 --lr_decay_iters 20000 --wm_only_iters 0 --amp none \
+  --goal_tail auto --ckpt_every 1000 --log_dir logs/dance_ft
+
+# 4) 逐检查点评估（数据随检查点继承），挑分数最高的
+uv run --frozen python -m supermimic.scripts.evaluate --run_dir logs/dance_ft --watch
+```
+
+- `--init_from`只载入权重：策略、世界模型及它们的输入归一化，文件里有critic（`last.pt`）时也载入。
+  优化器、迭代数、学习率调度和重置课程都从头开始，数据可以与检查点不同，不比对数据指纹；中断后用新run的`last.pt`照常`--resume`。
+- 2026-11-03起`ckpt_*.pt`也保存critic（约1 MB），从它起步默认不预热。此前的`ckpt_*.pt`没有critic，从它起步时critic从零训练：
+  默认前1000次迭代（`--critic_warmup_iters`）策略学习率为0，只练世界模型和critic，期满清零策略的Adam动量后再开始更新。
+- 输入归一化在样本数达到2e8后冻结，完整训练过的检查点沿用全库统计，不随新数据变化。
+- 多卡按整段动作分片，片段数少于卡数会报错，只有一段舞时用单卡。片段须长于33帧（32步想象），首帧要能在平地站稳。
+- 只用这几段训练，其余动作会退步，其他动作继续用原run的检查点。
+- 上面的学习率、迭代数和预热长度只是起点，未经实测调整。2026-11-03在Rara上冒烟：4次迭代的LAFAN1小模型从`ckpt_*.pt`起步，
+  在两段舞蹈上训练，预热期内策略权重逐位不变、期满后开始更新；CUDA graph下的动量清零、续训与`--other_data`评估都正常。
+
 ## 双卡A100训练与优化
 
 基线run的完整命令（2×A100 SXM4 80GB，NVLink），也是目前推荐的正式训练配置：
@@ -359,7 +390,7 @@ CUDA 使用 NCCL，CPU 多进程验证使用 Gloo；不更改内置 G1 配置。
 CPU/Gloo 验证不能替代多 GPU NCCL/H100 的吞吐、显存峰值或数值验收。
 
 恢复训练使用`--resume RUN/last.pt`：它包含三类模型、优化器、迭代与计时状态。
-`ckpt_*.pt`只保存策略、世界模型及元数据，用于评估，不能作为训练恢复文件。
+`ckpt_*.pt`只保存策略、世界模型、critic（2026-11-03起）及元数据，用于评估，不能作为训练恢复文件；换数据或只从已有权重重新开始用`--init_from`，见[微调特定动作](#微调特定动作)。
 未显式选择数据入口时，恢复会继承检查点的数据路径、子集与源根；其余训练参数仍取当前命令行或默认值，
 不会自动继承旧run的批量、学习率、精度或采样选项，续训时需明确提供。
 加载后会按当前fused/CUDA graph模式重新设置Adam标志、`step`所在设备和学习率类型，随后按当前调度计算学习率。

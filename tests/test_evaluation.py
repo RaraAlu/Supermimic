@@ -124,6 +124,11 @@ class EvaluationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fingerprint mismatch"):
             self.evaluate(FakeEnv(2, self.motion), self.ck)
 
+    def test_other_data_skips_fingerprint_check(self):
+        self.ck["reference"] = {"fingerprint": "different"}
+        res = self.evaluate(FakeEnv(2, self.motion), self.ck, check_data=False)
+        self.assertEqual(res["reference"], self.motion.description)  # 结果记录实际评估所用的数据
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -71,7 +71,17 @@ parser.add_argument("--motion_root", type=str, default=None)
 parser.add_argument("--motion_limit", type=int, default=None, help="explicit development subset, never an implicit memory fallback")
 parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "run"))
 parser.add_argument("--seed", type=int, default=0)
-parser.add_argument("--resume", type=str, default=None)
+start = parser.add_mutually_exclusive_group()
+start.add_argument("--resume", type=str, default=None)
+start.add_argument("--init_from", type=str, default=None,
+                   help="start a new run from this checkpoint's weights (last.pt or ckpt_*.pt), e.g. to fine-tune on other "
+                        "clips: policy, world model and their input normalizers, plus the critic when the file has one; "
+                        "optimizers, iterations, learning-rate schedule and reset curriculum start fresh, and the data may "
+                        "differ from the checkpoint's (not in the paper)")
+parser.add_argument("--critic_warmup_iters", type=int, default=-1,
+                    help="after --wm_only_iters, hold the policy (learning rate 0) for this many iterations while the critic "
+                         "fits, then clear the policy's Adam moments; -1: 1000 with --init_from a file without a critic "
+                         "(ckpt_*.pt saved before 2026-11-03), the resumed run's value with --resume, else 0")
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 parser.add_argument("--fused_adam", type=str, default="on", choices=["on", "off"],
                     help="fused CUDA Adam kernels for all three optimizers (same update up to float rounding)")
@@ -120,6 +130,19 @@ def tensorboard_enabled(args) -> bool:
     return args.tensorboard == "on" or (args.tensorboard == "auto" and importlib.util.find_spec("tensorboard") is not None)
 
 
+def resolve_init(args, resume_ck: dict | None, init_ck: dict | None):
+    """--init_from的网络形状须与检查点一致；解析--critic_warmup_iters的-1（规则见其帮助），解析后的值随args写入检查点。"""
+    if init_ck:
+        for key in ("goal_frames", "hist"):
+            if init_ck["args"][key] != getattr(args, key):
+                raise ValueError(f"--init_from checkpoint was trained with --{key} {init_ck['args'][key]}, not {getattr(args, key)}")
+    if args.critic_warmup_iters < 0:
+        if resume_ck:
+            args.critic_warmup_iters = resume_ck["args"].get("critic_warmup_iters", 0)
+        else:
+            args.critic_warmup_iters = 1000 if init_ck and "critic" not in init_ck and not args.no_critic else 0
+
+
 def setup(argv: list[str] | None = None):
     """解析参数、建立进程组、加载参考数据并写运行元数据，返回(args, parallel, 预热后的Trainer)。
 
@@ -143,7 +166,10 @@ def setup(argv: list[str] | None = None):
     dev = parallel.device
     with parallel.coordinated("argument validation"):
         resume_ck = torch.load(args.resume, map_location="cpu") if args.resume else None
-        resolve_motion_args(args, resume_ck["args"] if resume_ck else None)
+        init_ck = torch.load(args.init_from, map_location="cpu") if args.init_from else None
+        # 未指定数据入口时沿用检查点的数据；--init_from只取权重，不比对数据指纹
+        resolve_motion_args(args, (resume_ck or init_ck or {}).get("args"))
+        resolve_init(args, resume_ck, init_ck)
         layout = make_layout(args, parallel)
     parallel.require_equal({k: v for k, v in vars(args).items() if k != "local_rank"}, "training arguments")
 
@@ -179,7 +205,7 @@ def setup(argv: list[str] | None = None):
     if tensorboard_enabled(args):
         from torch.utils.tensorboard import SummaryWriter  # noqa: F401  （启用时若缺少依赖，在预热前就报错）
 
-    trainer = Trainer(args, parallel, layout, kin, motion, resume_ck)
+    trainer = Trainer(args, parallel, layout, kin, motion, resume_ck, init_ck)
     # 经验回放缓冲区不写入检查点，因此恢复训练后也需要采集新的转移。
     trainer.collect(args.warmup_steps)
     return args, parallel, trainer
