@@ -293,6 +293,23 @@ uv run --frozen python -m supermimic.scripts.evaluate --run_dir logs/dance_ft --
 - 上面的学习率、迭代数和预热长度只是起点，未经实测调整。2026-11-03在Rara上冒烟：4次迭代的LAFAN1小模型从`ckpt_*.pt`起步，
   在两段舞蹈上训练，预热期内策略权重逐位不变、期满后开始更新；CUDA graph下的动量清零、续训与`--other_data`评估都正常。
 
+## 导出ONNX
+
+把检查点里的策略导出为ONNX，部署所需的信息写进元数据（onnx与onnxscript不在项目依赖里，用`--with`临时装）：
+
+```bash
+uv run --frozen --with onnx --with onnxscript python scripts/export_onnx.py logs/dance_ft/ckpt_020000.pt logs/dance_ft/policy.onnx
+```
+
+- 输入是未归一化的`obs_hist`（批量×10×99，最旧在前）和`goal`（批量×`goal_frames`×73，按帧拼接），归一化统计量已打包进图；
+  输出`action`（训练时的动作语义）和`joint_pos_target = default_joint_pos + action_scale * action`。批量维可变。
+- 元数据在ONNX的`metadata_props`里（列表与字典为JSON字符串），同时另存同名`.json`：关节顺序、默认姿态、动作尺度、PD增益、力矩上限、
+  电枢惯量、控制周期、观测与目标各段的起点和含义（`obs_layout`、`goal_layout`）、六维旋转的约定、检查点哈希与参考数据指纹，
+  检查点旁有`*_eval.json`时一并写入评估结果。
+- 导出后用`onnx.reference`在换了批量的随机输入上核对，与PyTorch的最大差超过`--tol`（默认1e-4）就报错退出。
+- 部署端要按元数据自己构造输入：观测历史在回合第一步用当前观测重复填满；`ref_root_rot_rel`要求机器人与参考的偏航先对齐；
+  `goal`只依赖参考动作，可以对整段动作预先算好。
+
 ## 双卡A100训练与优化
 
 基线run的完整命令（2×A100 SXM4 80GB，NVLink），也是目前推荐的正式训练配置：
