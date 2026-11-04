@@ -16,14 +16,14 @@ rara与本地Supermimic的`networks.py`、`motion.py`、`mdp.py`、`env.py`相�
 
 “Teleopit训练也很快、跟踪精度较差”是用户提供的使用观察。本次在所检查的rara标准日志目录中未找到可配对的完整训练记录，也没有启动训练或实机控制。因此不能从本次检查得出速度倍率、MPJPE差值，或把精度差归因于某一个模块。
 
-Teleopit论文给出其自身协议下的背景数字：8块A800约50 h、40k iteration（所检查代码的默认值为`max_iterations=30_000`）；mocap验证集成功率91.7%、MPJPE 0.040 m，同表SONIC为0.037 m、HoloMotion为0.034 m（[Teleopit论文§4.1](https://arxiv.org/html/2608.01834v1#S4.SS1)）。即成功率最高而MPJPE并非最低，方向与上述观察一致。这些数字来自论文的数据、硬件和指标定义，不能与本仓库结果直接换算。
+Teleopit论文给出其自身协议下的背景数字：8块A800约50 h、40k iteration（所检查代码的默认值为`max_iterations=30_000`）；mocap验证集成功率91.7%、MPJPE 0.040 m，同表SONIC为75.7%、0.037 m，HoloMotion为64.6%、0.034 m（[Teleopit论文§4.1](https://arxiv.org/html/2608.01834v1#S4.SS1)）。论文在相同窗口上评测，但误差只计跑满10 s的回合，各方法计入误差的回合集合不同，因此这些MPJPE不能比较相同动作上的精度，也不能佐证上述观察。这些数字来自论文的数据、硬件和指标定义，不能与本仓库结果直接换算。
 
 ## 2. 已确认的实现差异
 
 | 项目 | Teleopit | Supermimic | 对当前目标的意义 |
 | --- | --- | --- | --- |
 | 策略学习 | RSL-RL PPO；每轮每环境采集24步，5个epoch、4个minibatch | 拟合可微世界模型；默认32步想象推演，经回报反传更新策略 | PPO与解析梯度都需要进入相同条件下的速度—精度对照 |
-| 参考输入 | `window_steps=(0,)`；当前参考显式进入观测 | `f+1…f+10`，73维/帧，共730维目标 | 现有Supermimic不能直接用于零前瞻遥操作 |
+| 参考输入 | `window_steps=(0,)`；“当前”参考显式进入观测，相对重置状态提前一帧（见4.3节） | `f+1…f+10`，73维/帧，共730维目标 | 现有Supermimic不能直接用于零前瞻遥操作 |
 | actor结构 | 当前167维观测直通；10帧观测经Conv1d压到64维；MLP头 | 未来目标编码为32维；与10×99维观测展平拼接后解码 | Teleopit的当前帧直通应优先借鉴，避免当前目标也被迫通过小潜变量 |
 | 隐藏层 | actor/critic主干`2048,1024,512,256,128`；CNN通道`256,128,64` | 目标编码器/动作解码器`2048,1024,512,256`；另训练世界模型与critic | 网络和更新工作量不同，不能按iteration直接比较 |
 | 失败采样 | 失败后以0.8概率回到同片段，向前回退25–75个控制步，即0.5–1.5 s | 按分箱回报自适应采样；有尾箱、重置过渡期等修正 | rewind可作为低成本难段课程候选；它本身不是物理恢复 |
@@ -55,7 +55,7 @@ Supermimic的不同之处是：采集到的转移可反复训练共享动力学�
 
 ### 4.1 参考信息量不同
 
-Supermimic看到未来10帧，Teleopit主路径只有当前参考和历史；前者可以提前准备突发动作。要比较优化器能力，应让PPO与世界模型策略使用相同的因果输入。原版未来帧Supermimic保留为信息更充分的参照，不把它称作因果策略必然能达到的上限。
+Supermimic看到`f+1…f+10`，Teleopit主路径只有一帧参考和历史，这一帧在时序上相当于`f+1`（见4.3节）；前者可以提前准备突发动作。要比较优化器能力，应让PPO与世界模型策略使用相同的因果输入。原版未来帧Supermimic保留为信息更充分的参照，不把它称作因果策略必然能达到的上限。
 
 ### 4.2 名义当前帧不等于全链路严格因果
 
@@ -63,11 +63,13 @@ Teleopit预计算`joint_vel`、刚体线速度和角速度时使用中心差分�
 
 因此，两份实现都需要为因果actor单独建立与线上一致的参考特征：后向差分、时间戳、因果滤波、段首补齐。干净中心差分可以保留给训练奖励与critic，不能混进部署actor。`window_steps=(0,)`只证明没有显式未来帧窗口，不能证明离线训练输入没有未来信息。
 
-### 4.3 奖励时间相位不同
+### 4.3 奖励时间相位与actor可见帧
 
-Teleopit按mjlab管理器顺序先推进物理，再计算奖励/终止，之后推进motion command，故其训练奖励比较`state[t+1]`与`reference[t]`；该顺序也写在仓库训练文档中。Teleopit的`pyproject.toml`锁定`mjlab==1.4.0`；其上游`src/mjlab/envs/manager_based_rl_env.py`的`step`依次为物理子步、termination、reward、reset、`sim.forward()`、command更新、事件与观测，与上述文档一致。2026-11-04复核时，rara上Teleopit的`.venv`已不可用（解释器路径失效，site-packages中没有mjlab），无法读取实际安装版本；复现原生基线前需重建环境，并在实验manifest中锁定版本、复核顺序。
+Teleopit按mjlab管理器顺序先推进物理，再计算奖励/终止，之后推进motion command，故奖励比较后继状态与产生该动作的那一帧参考；该顺序也写在仓库训练文档中。Teleopit的`pyproject.toml`锁定`mjlab==1.4.0`；其上游`src/mjlab/envs/manager_based_rl_env.py`的`step`依次为物理子步、termination、reward、reset、`sim.forward()`、command更新、事件与观测，与上述文档一致。2026-11-04复核时，rara上Teleopit的`.venv`已不可用（解释器路径失效，site-packages中没有mjlab），无法读取实际安装版本；复现原生基线前需重建环境，并在实验manifest中锁定版本、复核顺序。
 
-Supermimic的`TrackingSim.step`明确用`f1=f+1`计算后继状态的奖励。在50 Hz下，两种约定差一个20 ms控制步。这是需要对齐的设计差异，不是已经证明的精度损失原因。现有Supermimic actor的目标输入含`f+1`，所以该约定对它不构成外推；改为只读当前参考的因果actor后，同一约定要求额外外推一步，见[设计稿§2.3](causal_intent_encoder.md#23-奖励与评测时间约定)。统一实验采用真实时间戳和同一奖励相位，保留原生配置对照；离线平移轨迹只能作为延迟诊断，不能替换主精度指标。
+重置发生在command更新之前：`_resample_command`把机器人写到`reference[t]`，随后`_update_command`无条件推进一个控制步，观测才读取参考；mjlab首次`reset()`虽传`dt=0`，该函数仍按`_step_dt`推进。因此相对重置时对齐的状态时钟，actor在`s[t]`读到`reference[t+1]`，`s[t+1]`也对这一帧计分。“当前帧”是相对command时钟的说法。
+
+Supermimic的`TrackingSim.step`明确用`f1=f+1`计算后继状态的奖励，也是`s[t+1]`比较`reference[t+1]`，所以两者奖励相位相同，差别只在actor可见范围：Teleopit的那一帧相当于Supermimic目标的第一帧`f+1`。改为只读到`t`的因果actor后，同一奖励要求额外外推一步，见[设计稿§2.3](causal_intent_encoder.md#23-奖励与评测时间约定)。线上把最新到达帧当作这一帧时，后继状态相对实时参考滞后一个控制步（50 Hz下20 ms）；这是部署含义，尚未实测，也不是已经证明的精度损失原因。统一实验采用真实时间戳和同一奖励相位，保留原生配置对照；离线平移轨迹只能作为延迟诊断，不能替换主精度指标。
 
 ### 4.4 目标权衡、采样与指标不同
 
@@ -103,7 +105,7 @@ Teleopit的存活奖励、较强动作变化惩罚和额外末端终止可能影
 | 速度预计算 | `train_mimic/data/motion_fk.py:36–48,104,220`；`dataset_lib.py:804` |
 | 在线参考速度 | `teleopit/controllers/reference_processing.py:152`起；`teleopit/sim/reference_timeline.py` |
 | 奖励、推扰、终止 | `train_mimic/tasks/tracking/tracking_env_cfg.py:168–305`；自碰撞、脚部加速度与手腕点奖励在`config/env.py:162–210`；`mdp/terminations.py:27–86` |
-| 奖励与参考推进顺序 | `docs/docs/tutorials/training.md:556–575`；mjlab 1.4.0 `src/mjlab/envs/manager_based_rl_env.py`的`ManagerBasedRlEnv.step`（`pyproject.toml`锁定版本） |
+| 奖励与参考推进顺序 | `docs/docs/tutorials/training.md:556–575`；`train_mimic/tasks/tracking/mdp/commands.py:953–968,1023–1027,1108–1110`；mjlab 1.4.0 `src/mjlab/envs/manager_based_rl_env.py`的`ManagerBasedRlEnv.reset`与`step`（`pyproject.toml`锁定版本） |
 | Teleopit误差汇总 | `train_mimic/benchmarking.py:185–279`；`mdp/metrics.py` |
 | Supermimic输入、模型与更新 | [motion.py](../../supermimic/tasks/tracking/motion.py)、[networks.py](../../supermimic/tasks/tracking/rl/networks.py)、[trainer.py](../../supermimic/tasks/tracking/rl/trainer.py) |
 | Supermimic奖励、终止与时序 | [mdp.py](../../supermimic/tasks/tracking/mdp.py)、[env.py](../../supermimic/tasks/tracking/env.py) |

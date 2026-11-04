@@ -36,7 +36,7 @@
 
 源码入口：[motion.py](../../supermimic/tasks/tracking/motion.py)、[networks.py](../../supermimic/tasks/tracking/rl/networks.py)、[trainer.py](../../supermimic/tasks/tracking/rl/trainer.py)、[env.py](../../supermimic/tasks/tracking/env.py)、[mdp.py](../../supermimic/tasks/tracking/mdp.py)。
 
-Teleopit的rewind会在失败回合结束后重置机器人到更早的参考状态，不能代替不中断的物理恢复。其当前帧配置也不能直接作为严格因果保证：离线预计算速度使用了中心差分，需要与线上特征生成一起修改或重算。
+Teleopit的rewind会在失败回合结束后重置机器人到更早的参考状态，不能代替不中断的物理恢复。其当前帧配置也不能直接作为严格因果保证：这一帧相对重置状态提前一个控制步（见2.3节），离线预计算速度也使用了中心差分，需要与线上特征生成一起修改或重算。
 
 ## 2. 信息边界与参考时间线
 
@@ -66,9 +66,13 @@ Teleopit的rewind会在失败回合结束后重置机器人到更早的参考状
 
 统一实验采用：actor在`t`输出动作，物理或模型推进到`t+1`，奖励比较后继状态与`target_reference[t+1]`。奖励一侧与当前Supermimic约定一致；但当前Supermimic actor的目标输入含`f+1`，因果actor只读到`t`，所以该约定要求actor额外外推一个控制步（50 Hz下20 ms）。用`t+1`计算训练损失不意味着actor可读取该参考。
 
-这一约定比两个借鉴来源都严格一步。Teleopit的actor看到`reference[t]`，奖励也比较`reference[t]`；Any2Track（OpenTrack）在参考推进后才构建观测，actor看到的正是随后被计分的那一帧（论文称next-frame target）。两者都相当于接受一个控制步的固有滞后。选择`t+1`是为了让主指标不含这段滞后；由此产生的误差差距属于任务定义，不能归因于优化器或网络结构，奖励相位先按8.1节单独消融。
+这里的`t`按状态时钟计，即重置时`s[t]`与`reference[t]`对齐。按此计时，Supermimic、OpenTrack与Teleopit的奖励相位相同，差别在actor读到哪一帧。OpenTrack重置时先用`reference[t]`初始化机器人，再推进参考并构建观测，actor在`s[t]`读到`reference[t+1]`（论文称next-frame target），后继状态也对这一帧计分。Teleopit同样如此：mjlab在重置后先更新command再计算观测，`_update_command`无条件推进一个控制步，所以`window_steps=(0,)`的“当前帧”相对`s[t]`也是`reference[t+1]`。两者的训练流程都含一帧前瞻，不能据此认定存在一帧滞后。
 
-Teleopit原生流程在command推进前计算奖励，单独保留原生配置作为复现对照；标准化PPO对照使用上述统一时序。全部主指标按真实时间戳对齐当前参考，延迟补偿后的误差只能作为附加诊断。
+本设计取消这一帧前瞻，任务变难来自这里；选择`t+1`奖励本身合理。由此产生的误差差距属于任务定义，不能归因于优化器或网络结构，这一帧前瞻的影响先按8.1节单独消融。
+
+线上只有已到达的参考。若把最新到达帧当作训练中的这一帧，后继状态要到下一控制步才到达它，相对实时参考滞后一个控制步（不含传输和处理延迟）。这是从训练结构推出的部署含义，尚未实测，也不是OpenTrack论文的结论。
+
+Teleopit原生流程单独保留作为复现对照，其actor读到的帧相对状态时钟提前一帧；标准化PPO对照使用上述统一时序，actor只读到`t`。全部主指标按真实时间戳对齐当前参考，延迟补偿后的误差只能作为附加诊断。
 
 ## 3. 主要actor候选
 
@@ -262,7 +266,7 @@ Teleopit接入优先复用PICO/GMR、reference timeline、传感器、部署边�
 | R0/R1 | C0/C1分别加入同一恢复课程 | 两种训练方法达到完整目标的成本 |
 | R2（按需） | R1加入历史adapter（Any2Track式冻结基座、零初始化注入）或软专家 | 结构是否改善恢复与正常精度的兼顾 |
 
-特征因果化、奖励相位、采样与奖励权重先分别消融，再冻结共同配置。不能把同时改变actor、奖励和数据所得的差异全归因于优化器。原生组与标准化组分开报告。
+特征因果化、actor可见帧相对计分帧的偏移（是否保留一帧前瞻）、采样与奖励权重先分别消融，再冻结共同配置。不能把同时改变actor、奖励和数据所得的差异全归因于优化器。原生组与标准化组分开报告。
 
 ### 8.2 精度、恢复与时间
 
