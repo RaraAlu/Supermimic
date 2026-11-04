@@ -1,12 +1,7 @@
-"""Compare collection optimizations in paired training runs, swapping GPUs on the second round.
+"""成对比较采集优化组合，并在第二轮交换 GPU 以降低设备差异的影响。
 
-    python scripts/benchmark_collect.py --gpus 0 1 2 3 --output_dir logs/collect_ab \
-        --motion_source SOURCE --motion_limit 5000
-
-Runs the four combinations of --collect_overlap/--cuda_graph_collect with otherwise identical
-paper-sized batches. Extra arguments override training defaults. Uses the fixed duplicate-bin
-update for every variant, excludes startup iterations, and records the source diff fingerprint.
-"""
+对 --collect_overlap 与 --cuda_graph_collect 的四种组合使用相同的论文规模批量；额外参数覆盖训练默认值。
+所有组合均使用修复后的重复分箱更新，计时排除启动阶段，并记录源码差异指纹。"""
 
 import argparse
 import csv
@@ -24,6 +19,7 @@ VARIANTS = [("baseline", "off", "off"), ("post", "on", "off"),
 
 
 def main():
+    """解析比较配置，分轮运行采集优化组合，保存源码指纹和计时结果。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpus", nargs="+", type=int, required=True)
     parser.add_argument("--output_dir", type=Path, required=True)
@@ -37,6 +33,7 @@ def main():
         parser.error("iterations must be a multiple of 10 and skip must be nonnegative")
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=False)
+    # 保存提交及工作区差异摘要，避免仅记录 Git 提交而遗漏尚未提交的被测优化。
     diff = subprocess.check_output(["git", "diff", "HEAD"], cwd=ROOT)
     (output / "source.patch").write_bytes(diff)
     metadata = {"head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
@@ -45,6 +42,7 @@ def main():
     (output / "metadata.json").write_text(json.dumps(metadata, indent=2))
     results = []
     for round_index in range(args.rounds):
+        # 奇偶轮反转设备分配，减少某块 GPU 固有速度差对优化组合排名的影响。
         devices = args.gpus if round_index % 2 == 0 else args.gpus[::-1]
         for offset in range(0, len(VARIANTS), len(devices)):
             running = []
@@ -74,11 +72,13 @@ def main():
                         rows = [r for r in csv.DictReader(stream) if int(r["iteration"]) > args.skip]
                     if not rows or int(rows[-1]["iteration"]) != args.iterations:
                         raise RuntimeError(f"{path}: incomplete timed interval (iterations must be a multiple of 10)")
+                    # 先将每段吞吐倒数转换为单次迭代耗时再平均，避免直接平均吞吐造成统计口径偏差。
                     seconds = statistics.mean(1 / float(row["it_per_s"]) for row in rows)
                     record = {"round": round_index, "variant": name, "gpu": gpu, "seconds_per_iteration": seconds,
                               "last_wm_loss": float(rows[-1]["wm_loss"]), "last_sim_reward": float(rows[-1]["sim_rew"])}
                     results.append(record)
                     print("RESULT " + json.dumps(record), flush=True)
+            # 任一运行失败时清理该批仍在运行的子进程，并关闭日志，避免遗留任务继续占用 GPU。
             finally:
                 for process, log, *_ in running:
                     if process.poll() is None:

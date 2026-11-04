@@ -1,9 +1,8 @@
-"""Download the 40 G1-retargeted LAFAN1 clips (30 fps CSV) into data/lafan1_g1.
+"""下载 40 个重定向到 G1 的 LAFAN1 片段（30 fps CSV），保存到 data/lafan1_g1。
 
-Source: Hugging Face dataset lvhaidong/LAFAN1_Retargeting_Dataset, folder g1/.
-LAFAN1 (Ubisoft La Forge) is CC BY-NC-ND 4.0; the data is not tracked by this repository.
-The robot model comes from mjlab's asset zoo, so no URDF is downloaded.
-"""
+来源为 Hugging Face 的 lvhaidong/LAFAN1_Retargeting_Dataset 数据集 g1/ 目录。
+LAFAN1（Ubisoft La Forge）采用 CC BY-NC-ND 4.0 许可，数据不纳入本仓库版本控制。
+机器人模型由 mjlab 资源库提供，无需下载 URDF。"""
 
 from __future__ import annotations
 
@@ -17,6 +16,7 @@ API = "https://huggingface.co/api/datasets/lvhaidong/LAFAN1_Retargeting_Dataset/
 
 
 def main():
+    """创建数据目录，跳过已有片段；下载到临时文件后原子替换目标文件。"""
     out = os.path.join(REPO, "data", "lafan1_g1")
     os.makedirs(out, exist_ok=True)
     with urllib.request.urlopen(API) as r:

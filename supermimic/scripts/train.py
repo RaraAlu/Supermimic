@@ -1,9 +1,7 @@
-# Ported from zita-ch/supermimic_vibed (MIT, Copyright (c) 2026 ETH Zurich, Chong Zhang); see THIRD_PARTY_NOTICES.md.
-"""SuperMimic training (Algorithm A.1): collect -> fit world model -> BPTT policy + critic update.
+# 移植自 zita-ch/supermimic_vibed（MIT，Copyright (c) 2026 ETH Zurich, Chong Zhang）；详见 THIRD_PARTY_NOTICES.md。
+"""SuperMimic 训练（算法 A.1）：采样、拟合世界模型，再通过 BPTT 更新策略和价值网络。
 
-本文件只负责命令行、分布式进程、数据加载与运行目录；训练状态与各更新步骤在
-supermimic/tasks/tracking/rl/trainer.py。检查脚本用setup()得到预热后的Trainer，不必运行训练循环。
-"""
+本模块负责命令行、分布式进程、数据加载和运行目录；训练状态与更新步骤位于 supermimic.tasks.tracking.rl.trainer。检查脚本可通过 setup() 获取预热后的 Trainer，无需运行训练循环。"""
 
 from __future__ import annotations
 
@@ -23,6 +21,10 @@ parser.add_argument("--buffer_steps", type=int, default=1000)
 parser.add_argument("--utd", type=float, default=0.4, help="updates per vectorized simulator step")
 parser.add_argument("--horizon", type=int, default=32)
 parser.add_argument("--goal_frames", type=int, default=10)
+parser.add_argument("--goal_tail", type=str, default="clamp", choices=["clamp", "hold", "stand", "auto"],
+                    help="future goal frames past a clip's last frame: clamped to it (clamp, the paper), the last frame held "
+                         "at rest (hold), standing in place (stand), or hold/stand chosen per clip by a capture-point test "
+                         "(auto); not in the paper except clamp. Episodes still end at the clip's last frame")
 parser.add_argument("--hist", type=int, default=10)
 parser.add_argument("--wm_window", type=int, default=8)
 parser.add_argument("--wm_batches", type=int, default=10)
@@ -36,6 +38,10 @@ parser.add_argument("--lr", type=float, default=2e-4)
 parser.add_argument("--gamma", type=float, default=0.99)
 parser.add_argument("--lam", type=float, default=0.95)
 parser.add_argument("--action_noise", type=float, default=0.1)
+parser.add_argument("--clean_action_frac", type=float, default=0.0,
+                    help="fraction of each rank's environments collected without action noise (not in the paper; 0 keeps "
+                         "the paper's behavior). The policy imagines with its deterministic actions, while a buffer of only "
+                         "noisy actions leaves the world model without data along them; also writes clean_log.csv")
 parser.add_argument("--critic_epochs", type=int, default=5)
 parser.add_argument("--critic_minibatches", type=int, default=4)
 parser.add_argument("--no_critic", action="store_true")
@@ -65,7 +71,17 @@ parser.add_argument("--motion_root", type=str, default=None)
 parser.add_argument("--motion_limit", type=int, default=None, help="explicit development subset, never an implicit memory fallback")
 parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "run"))
 parser.add_argument("--seed", type=int, default=0)
-parser.add_argument("--resume", type=str, default=None)
+start = parser.add_mutually_exclusive_group()
+start.add_argument("--resume", type=str, default=None)
+start.add_argument("--init_from", type=str, default=None,
+                   help="start a new run from this checkpoint's weights (last.pt or ckpt_*.pt), e.g. to fine-tune on other "
+                        "clips: policy, world model and their input normalizers, plus the critic when the file has one; "
+                        "optimizers, iterations, learning-rate schedule and reset curriculum start fresh, and the data may "
+                        "differ from the checkpoint's (not in the paper)")
+parser.add_argument("--critic_warmup_iters", type=int, default=-1,
+                    help="after --wm_only_iters, hold the policy (learning rate 0) for this many iterations while the critic "
+                         "fits, then clear the policy's Adam moments; -1: 1000 with --init_from a file without a critic "
+                         "(ckpt_*.pt saved before 2026-11-03), the resumed run's value with --resume, else 0")
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 parser.add_argument("--fused_adam", type=str, default="on", choices=["on", "off"],
                     help="fused CUDA Adam kernels for all three optimizers (same update up to float rounding)")
@@ -94,6 +110,10 @@ parser.add_argument("--bin_skip_steps", type=int, default=50,
 parser.add_argument("--reset_margin", type=int, default=100,
                     help="no reset starts within this many steps of a clip's end (a shorter clip starts only at its "
                          "first frame), so every scored episode outlasts the transient; 0 allows every start")
+parser.add_argument("--bin_clip_cap", type=float, default=0.0,
+                    help="cap each clip's share of the 40%% difficulty term of the reset distribution (and of the history "
+                         "term built from it); the excess goes to the other clips in proportion (not in the paper; 0 keeps "
+                         "the paper's behavior, 0.01 is LaoYang1994's --env.hard-clip-cap). Also writes clipcap_log.csv")
 parser.add_argument("--device", type=str, default="cuda:0")
 parser.add_argument("--batch_scope", type=str, default="global", choices=["global", "per_gpu"],
                     help="--num_envs/--wm_batch/--pi_batch are global totals split across ranks, or per-GPU sizes; "
@@ -104,9 +124,23 @@ parser.add_argument("--local-rank", "--local_rank", type=int, default=None, help
 
 
 def tensorboard_enabled(args) -> bool:
+    """根据命令行设置及 TensorBoard 是否可用决定是否启用日志。"""
     import importlib.util
 
     return args.tensorboard == "on" or (args.tensorboard == "auto" and importlib.util.find_spec("tensorboard") is not None)
+
+
+def resolve_init(args, resume_ck: dict | None, init_ck: dict | None):
+    """--init_from的网络形状须与检查点一致；解析--critic_warmup_iters的-1（规则见其帮助），解析后的值随args写入检查点。"""
+    if init_ck:
+        for key in ("goal_frames", "hist"):
+            if init_ck["args"][key] != getattr(args, key):
+                raise ValueError(f"--init_from checkpoint was trained with --{key} {init_ck['args'][key]}, not {getattr(args, key)}")
+    if args.critic_warmup_iters < 0:
+        if resume_ck:
+            args.critic_warmup_iters = resume_ck["args"].get("critic_warmup_iters", 0)
+        else:
+            args.critic_warmup_iters = 1000 if init_ck and "critic" not in init_ck and not args.no_critic else 0
 
 
 def setup(argv: list[str] | None = None):
@@ -132,18 +166,23 @@ def setup(argv: list[str] | None = None):
     dev = parallel.device
     with parallel.coordinated("argument validation"):
         resume_ck = torch.load(args.resume, map_location="cpu") if args.resume else None
-        resolve_motion_args(args, resume_ck["args"] if resume_ck else None)
+        init_ck = torch.load(args.init_from, map_location="cpu") if args.init_from else None
+        # 未指定数据入口时沿用检查点的数据；--init_from只取权重，不比对数据指纹
+        resolve_motion_args(args, (resume_ck or init_ck or {}).get("args"))
+        resolve_init(args, resume_ck, init_ck)
         layout = make_layout(args, parallel)
     parallel.require_equal({k: v for k, v in vars(args).items() if k != "local_rank"}, "training arguments")
 
+    # 每卡载入自己的完整片段分片；先确认存在足够长的片段，再进入需要固定时域的训练。
     with parallel.coordinated("reference loading"):
         kin = G1Kinematics(dev)
-        motion = MotionLib.from_args(args, kin, dev, parallel.rank, parallel.world_size)
+        motion = MotionLib.from_args(args, kin, dev, parallel.rank, parallel.world_size, args.goal_tail, args.goal_frames)
         if resume_ck:
             check_reference(motion.global_description, resume_ck.get("reference"))
         if not bool((motion.clip_len > args.horizon).any()):
             raise ValueError("this reference shard has no complete imagination horizon; use fewer ranks or a larger selection")
     parallel.require_equal(motion.global_description["fingerprint"], "global reference fingerprint")
+    # 主进程写全局运行信息，各卡随后单独记录本地分片和实际批量，便于复现实验资源配置。
     with parallel.coordinated("run metadata"):
         if parallel.primary:
             os.makedirs(args.log_dir, exist_ok=True)
@@ -164,23 +203,25 @@ def setup(argv: list[str] | None = None):
     print(f"rank {parallel.rank}/{parallel.world_size} on {dev}: {len(motion.names)} full clips, "
           f"{motion.num_frames} local frames, reference {motion.description['reference_tensor_bytes'] / 1024**3:.3f} GiB", flush=True)
     if tensorboard_enabled(args):
-        from torch.utils.tensorboard import SummaryWriter  # noqa: F401  (fails here, before warmup, when "on" lacks the package)
+        from torch.utils.tensorboard import SummaryWriter  # noqa: F401  （启用时若缺少依赖，在预热前就报错）
 
-    trainer = Trainer(args, parallel, layout, kin, motion, resume_ck)
-    # The replay buffer is not checkpointed, so resumed runs also need fresh transitions.
+    trainer = Trainer(args, parallel, layout, kin, motion, resume_ck, init_ck)
+    # 经验回放缓冲区不写入检查点，因此恢复训练后也需要采集新的转移。
     trainer.collect(args.warmup_steps)
     return args, parallel, trainer
 
 
 def main(argv: list[str] | None = None):
+    """初始化训练状态，循环执行训练、记录日志并保存检查点。"""
     args, parallel, trainer = setup(argv)
-    from supermimic.tasks.tracking.rl.trainer import LOG_TABLES
+    from supermimic.tasks.tracking.rl.trainer import CLEAN_TABLE, CLIPCAP_TABLE, LOG_TABLES
     from supermimic.utils.run_log import RunLog
 
     # train/sampling/diag各一份CSV，后两者单独成文件，恢复旧run时train_log.csv的列不变；TensorBoard用purge_step
     # 隐藏上次运行在恢复点之后写下的事件（恢复点及之前的行仍有效）
     start_it = trainer.start_it
-    log = RunLog(args.log_dir, LOG_TABLES, tensorboard=tensorboard_enabled(args),
+    tables = LOG_TABLES | (CLEAN_TABLE if args.clean_action_frac > 0 else {}) | (CLIPCAP_TABLE if args.bin_clip_cap > 0 else {})
+    log = RunLog(args.log_dir, tables, tensorboard=tensorboard_enabled(args),
                  purge_step=start_it + 1 if start_it else None) if parallel.primary else None
     trainer.start_clock()
     for it in range(start_it, args.iterations):
@@ -192,6 +233,13 @@ def main(argv: list[str] | None = None):
                 r = rows["train"]
                 print(f"it {it + 1} | {r[1]:.3f} h | wm {r[3]:.4f} e8 {r[4]:.4f} | pi {r[5]:.3f} v {r[6]:.4f} imag_r {r[7]:.3f} surv {r[9]:.3f} "
                       f"| sim_r {r[10]:.3f} ep_len {r[11]:.1f} ep_ret {r[12]:.3f} term {r[13]:.2f} | {r[14]:.2f} it/s", flush=True)  # fmt: skip
+                if "clean" in rows:
+                    c = rows["clean"]
+                    print(f"   clean sim_r {c[1]:.3f} ep_ret {c[4]:.3f} term {c[5]:.2f} | noisy sim_r {c[2]:.3f} ep_ret {c[7]:.3f} "
+                          f"term {c[8]:.2f}", flush=True)
+                if "clipcap" in rows:
+                    c = rows["clipcap"]
+                    print(f"   clip_top1 {c[1]:.4f} | hard top clip before cap {c[2]:.4f}, {c[3]} clips capped", flush=True)
         if args.term_log_every and (it + 1) % args.term_log_every == 0:
             summary, lines = trainer.term_rows(it)  # 集合通信，所有rank都调用
             if log:
@@ -204,6 +252,7 @@ def main(argv: list[str] | None = None):
                     trainer.save(it, args.log_dir, args.keep_states, bins)
     if log:
         log.close()
+    # 先释放可能包含 NCCL 操作的捕获图，再销毁进程组，保持资源依赖的释放顺序。
     trainer.close()
     parallel.close()
 

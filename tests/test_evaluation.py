@@ -98,10 +98,36 @@ class EvaluationTests(unittest.TestCase):
         self.evaluate(batched, self.ck)
         self.assertEqual(batched.batches, [[1, 4], [2, 3], [0, 0]])
 
+    def test_failure_with_truncated_goal_counted_separately(self):
+        class EndFailEnv(FakeEnv):
+            # Clip 4 terminates on its last transition, when f + K is already past the clip end.
+            def step(self, action):
+                was_done = self.done_eval.clone()
+                out = super().step(action)
+                late = (self.clips == 4) & (self.f >= self.motion.clip_end[self.clips])
+                self.failed_eval |= late & ~was_done
+                return out
+
+        self.ck["args"]["goal_frames"] = 3
+        single = self.evaluate(EndFailEnv(5, self.motion), self.ck)
+        for size in (1, 2, 3):
+            with self.subTest(batch_size=size):
+                res = self.evaluate(EndFailEnv(size, self.motion), self.ck)
+                self.assertEqual(res, single)
+                self.assertEqual(res["n_failed"], 2)
+                self.assertEqual(res["n_failed_guided"], 1)
+                self.assertEqual(res["failed_goal_truncated"], ["4"])
+                self.assertEqual(res["fail_step"], {"1": [2, 50], "4": [5, 5]})
+
     def test_checkpoint_mismatch_rejected(self):
         self.ck["reference"] = {"fingerprint": "different"}
         with self.assertRaisesRegex(ValueError, "fingerprint mismatch"):
             self.evaluate(FakeEnv(2, self.motion), self.ck)
+
+    def test_other_data_skips_fingerprint_check(self):
+        self.ck["reference"] = {"fingerprint": "different"}
+        res = self.evaluate(FakeEnv(2, self.motion), self.ck, check_data=False)
+        self.assertEqual(res["reference"], self.motion.description)  # 结果记录实际评估所用的数据
 
 
 if __name__ == "__main__":

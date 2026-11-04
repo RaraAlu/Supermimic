@@ -1,10 +1,9 @@
-"""Watch a SuperMimic run's logs; exit when something needs attention or a milestone is reached.
+"""监控训练日志，在异常、里程碑或训练结束时输出状态并退出。
 
-usage: python3 scripts/watch_train.py RUN_DIR [--milestone 10000] [--ref REF_RUN_DIR] [--poll 120]
-exit 10: anomaly, 11: milestone, 0: run finished. Prints a status block either way.
-Thresholds come from the healthy part of the previous 2-GPU run (2.6 it/s, survival ~0.999,
-termination < 1%), except ep_ret_norm, which that run's tail-bin bug drove negative.
-"""
+用法：python3 scripts/watch_train.py RUN_DIR [--milestone 10000] [--ref REF_RUN_DIR] [--poll 120]
+退出码：10 表示异常，11 表示达到里程碑，0 表示训练结束。
+阈值参考此前双卡运行的健康阶段（2.6 次迭代/秒、存活率约 0.999、终止率低于 1%）；
+ep_ret_norm 单独判断，因为该次运行的尾部分箱错误曾使其变为负值。"""
 
 import argparse
 import csv
@@ -23,6 +22,7 @@ a = p.parse_args()
 
 
 def rows(path):
+    """读取数值型 CSV 行；文件不存在或数值尚未写完整时返回空列表。"""
     try:
         with open(path, encoding="utf-8") as f:
             return [{k: float(v) for k, v in r.items()} for r in csv.DictReader(f)]
@@ -31,14 +31,17 @@ def rows(path):
 
 
 def mean(xs):
+    """计算均值；空序列返回 NaN，表示没有可用样本。"""
     return sum(xs) / len(xs) if xs else float("nan")
 
 
 def nearest(ref, it):
+    """查找迭代数最接近目标的参考日志行；没有参考记录时返回 None。"""
     return min(ref, key=lambda r: abs(r["iteration"] - it)) if ref else None
 
 
 def status(tr, sp, ref):
+    """汇总最近十条训练与采样记录，并附上相近迭代的参考运行指标。"""
     last = tr[-1]
     w = tr[-10:]
     lines = [f"iteration {int(last['iteration'])}  wall {last['wall_h']:.2f} h  {mean([r['it_per_s'] for r in w]):.2f} it/s",
@@ -58,6 +61,7 @@ def status(tr, sp, ref):
 
 
 def anomalies(tr, sp):
+    """检查非有限数、吞吐下降及训练和采样指标异常，返回所有触发项。"""
     out = []
     last = tr[-1]
     it = last["iteration"]
@@ -67,6 +71,7 @@ def anomalies(tr, sp):
             out.append(f"non-finite {bad} at it {int(r['iteration'])}")
     if len(tr) >= 3 and all(r["it_per_s"] < 2.0 for r in tr[-3:]):
         out.append(f"throughput below 2.0 it/s for 3 logs ({tr[-1]['it_per_s']:.2f})")
+    # 长期趋势判断等训练和日志样本充分后才启用；使用十条记录的滚动均值降低单次波动影响。
     if it >= 2000 and len(tr) >= 30:
         roll = [mean([r["wm_err8"] for r in tr[i - 10:i]]) for i in range(10, len(tr) + 1)]
         if roll[-1] > 1.5 * min(roll):
@@ -81,6 +86,7 @@ def anomalies(tr, sp):
             out.append("termination fraction above 5%")
         if mean([r["ep_ret_norm"] for r in w]) < 0.3:
             out.append("ep_ret_norm rolling mean below 0.3 (tail-bin symptom)")
+    # 单独检查采样是否集中到片段尾部或某个分箱，这类偏置可能先于整体回报恶化出现。
     if sp and it >= 2000:
         s = sp[-10:]
         if mean([r["reset_tail_frac"] for r in s]) > 0.6:
@@ -96,6 +102,7 @@ while True:
     exit_json = os.path.join(a.run, "exit.json")
     tr = rows(os.path.join(a.run, "train_log.csv"))
     sp = rows(os.path.join(a.run, "sampling_log.csv"))
+    # 退出标记优先于异常和里程碑，避免训练已结束却继续轮询或误报旧日志。
     if os.path.exists(exit_json):
         print("RUN ENDED:", open(exit_json).read().strip())
         if tr:

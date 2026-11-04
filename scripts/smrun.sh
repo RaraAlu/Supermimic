@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
-# smrun — run every remote command inside a named tmux session, with a log.
+# smrun：在命名的 tmux 会话中执行远程命令，并保存日志。
 #
-# Usage:  smrun <session-name> <command...>
-#   - refuses to reuse an existing session name
-#   - appends a row to tmux/registry.tsv: time, session, cwd, git HEAD, command
-#   - pipes stdout+stderr to tmux/<session>.log and records EXIT=<code>
-#   - the session stays alive afterwards (window remains attachable)
-#
-# Inspect:  tmux ls | tmux attach -t <session> | tmux capture-pane -pt <session> -S -200
+# 用法：smrun <session-name> <command...>
+# 会话名已存在时拒绝启动；在 tmux/registry.tsv 追加时间、会话、目录、Git 提交和命令。
+# 标准输出与错误写入 tmux/<session>.log，并记录 EXIT=<退出码>。
+# 命令结束后保留会话 20 秒，便于连接查看。
+# 查看：tmux ls | tmux attach -t <session> | tmux capture-pane -pt <session> -S -200
 set -u
 ROOT="${SMRUN_ROOT:-/train_result/log/supermimic}"
 SESS="${1:?usage: smrun <session> <command...>}"; shift

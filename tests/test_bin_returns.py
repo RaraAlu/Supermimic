@@ -6,7 +6,8 @@ import torch
 
 from types import SimpleNamespace
 
-from supermimic.tasks.tracking.reset_sampling import BinSampler, episode_bin_scores, global_bin_probabilities, update_bin_returns
+from supermimic.tasks.tracking.reset_sampling import (BinSampler, cap_clip_share, episode_bin_scores, global_bin_probabilities,
+                                                     update_bin_returns)
 from supermimic.utils.distributed import DistributedContext, LocalContext
 
 GAMMA, STEP_MAX = 0.99, 0.1
@@ -104,6 +105,94 @@ class BinScoreTests(unittest.TestCase):
                                          LocalContext)
         self.assertTrue(bool(torch.isfinite(probs).all()))
         torch.testing.assert_close(probs.sum(), torch.tensor(1.0))
+
+
+def water_fill(mass, cap):
+    """逐轮削平的参考实现：反复把超过上限的片段固定在上限，其余片段按比例放大补足总和。"""
+    total, capped = mass.sum(), torch.zeros_like(mass, dtype=torch.bool)
+    while True:
+        scale = (total - cap * total * capped.sum()) / mass[~capped].sum()
+        over = ~capped & (mass * scale > cap * total)
+        if not over.any():
+            return torch.where(capped, cap * total, mass * scale), int(capped.sum())
+        capped |= over
+
+
+class ClipCapTests(unittest.TestCase):
+    def setUp(self):
+        # 40段片段、每段1–5个分箱，困难度高度集中在前几段
+        torch.manual_seed(0)
+        self.bin_clip = torch.repeat_interleave(torch.arange(40), torch.randint(1, 6, (40,)))
+        logits = torch.randn(len(self.bin_clip)) * 3
+        logits[self.bin_clip < 3] += 6
+        self.soft = torch.softmax(logits.double(), 0)
+
+    def clip_mass(self, soft):
+        return torch.zeros(40, dtype=torch.float64).index_add_(0, self.bin_clip, soft.double())
+
+    def test_matches_iterative_water_filling(self):
+        for cap in (0.05, 0.1, 0.3):
+            capped, stats = cap_clip_share(self.soft, self.bin_clip, 40, cap, LocalContext)
+            mass = self.clip_mass(capped)
+            expected, n_capped = water_fill(self.clip_mass(self.soft), cap)
+            torch.testing.assert_close(mass, expected)
+            self.assertAlmostEqual(float(capped.sum()), 1.0, places=12)
+            self.assertLessEqual(float(mass.max()), cap * (1 + 1e-9))
+            self.assertGreater(n_capped, 0)
+            self.assertEqual(int(stats[1]), n_capped)
+            self.assertAlmostEqual(float(stats[0]), float(self.clip_mass(self.soft).max()), places=12)
+            # 片段内各分箱的相对比例不变
+            ratio = capped / self.soft
+            for c in range(40):
+                r = ratio[self.bin_clip == c]
+                torch.testing.assert_close(r, r[:1].expand_as(r))
+
+    def test_no_clip_over_the_cap_is_unchanged(self):
+        capped, stats = cap_clip_share(self.soft, self.bin_clip, 40, 0.9, LocalContext)
+        torch.testing.assert_close(capped, self.soft, rtol=1e-12, atol=0)
+        self.assertEqual(int(stats[1]), 0)
+
+    def test_cap_below_one_over_clips_shares_equally(self):
+        capped, _ = cap_clip_share(self.soft, self.bin_clip, 40, 0.01, LocalContext)  # 40段时上限取1/40
+        torch.testing.assert_close(self.clip_mass(capped), torch.full((40,), 1 / 40, dtype=torch.float64))
+
+    def test_probabilities_use_the_capped_difficulty_term(self):
+        n = len(self.bin_clip)
+        scores = torch.rand(n)
+        kw = dict(bin_clip=self.bin_clip, num_clips=40)
+        ema = torch.full((n,), 1.0 / n)
+        paper = global_bin_probabilities(scores, ema.clone(), 1.0, n, LocalContext)
+        torch.testing.assert_close(global_bin_probabilities(scores, ema.clone(), 1.0, n, LocalContext, clip_cap=0.0, **kw),
+                                   paper, rtol=0, atol=0)
+        stats = torch.zeros(2, dtype=torch.float64)
+        ema_capped = ema.clone()
+        probs = global_bin_probabilities(scores, ema_capped, 1.0, n, LocalContext, clip_cap=0.05, cap_stats=stats, **kw)
+        soft = torch.softmax(-25.0 * scores.double(), 0).float()
+        hard, _ = cap_clip_share(soft, self.bin_clip, 40, 0.05, LocalContext)
+        kept = 0.999 * ema + 0.001 * hard  # 历史部分也由削平后的困难度累积
+        torch.testing.assert_close(ema_capped, kept)
+        torch.testing.assert_close(probs, 0.5 / n + 0.4 * hard + 0.1 * kept / kept.sum(), atol=1e-7, rtol=1e-5)
+        self.assertAlmostEqual(float(probs.sum()), 1.0, places=5)
+        self.assertGreater(float(stats[0]), 0.05)
+
+    def test_sampler_option_and_clip_stats(self):
+        lengths = torch.tensor([300, 300])
+        clip_start = torch.tensor([0, 300])
+        motion = SimpleNamespace(num_bins=4, global_num_bins=4, bin_clip=torch.tensor([0, 0, 1, 1]), clip_start=clip_start,
+                                 clip_end=clip_start + lengths - 1, clip_id=torch.repeat_interleave(torch.arange(2), lengths),
+                                 bin_start=torch.tensor([0, 100, 300, 400]), bin_end=torch.tensor([100, 200, 400, 500]))
+        for bad in (-0.1, 1.0):
+            with self.assertRaisesRegex(ValueError, "bin_clip_cap"):
+                BinSampler(motion, "cpu", GAMMA, clip_cap=bad)
+        sampler = BinSampler(motion, "cpu", GAMMA, clip_cap=0.5, reset_margin=0)
+        sampler.scores = torch.tensor([0.0, 0.0, 0.9, 0.9])  # 片段0远比片段1难
+        sampler.sample(4)
+        stats = sampler.clip_stats()
+        clip_p = torch.stack((sampler.probs[:2].sum(), sampler.probs[2:].sum())).double()
+        self.assertAlmostEqual(float(stats[0]), float(clip_p.max()), places=6)
+        self.assertGreater(float(stats[1]), 0.99)  # 削平前困难度几乎全在片段0
+        self.assertEqual(int(stats[2]), 1)
+        self.assertLess(float(clip_p.max()), 0.5 * 0.5 + 0.4 * 0.5 + 0.1 + 1e-6)
 
 
 class BinReturnTests(unittest.TestCase):

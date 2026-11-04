@@ -1,10 +1,7 @@
-# Ported from zita-ch/supermimic_vibed (MIT, Copyright (c) 2026 ETH Zurich, Chong Zhang); see THIRD_PARTY_NOTICES.md.
-"""Differentiable forward kinematics of the G1 in torch, built from mjlab's compiled G1 model.
+# 移植自 zita-ch/supermimic_vibed（MIT，Copyright (c) 2026 ETH Zurich, Chong Zhang）；详见 THIRD_PARTY_NOTICES.md。
+"""基于 mjlab 编译后的 G1 模型，用 PyTorch 实现可微正向运动学。
 
-The same FK computes tracked-body poses and velocities for the reference motion, for logged
-simulator states, and for world-model predictions, so the analytic reward head matches the
-reward the simulator transitions are labeled with.
-"""
+参考动作、记录的模拟器状态和世界模型预测共用这套运动学计算，以保证解析奖励与模拟器转移的奖励标签一致。"""
 
 from __future__ import annotations
 
@@ -20,7 +17,9 @@ from supermimic.utils.rotations import axis_angle_to_mat, quat_to_mat
 
 
 class G1Kinematics:
+    """从 G1 模型构造可微的批量正向运动学计算。"""
     def __init__(self, device: str, tracked: list[str] = TRACKED_BODIES, model: mujoco.MjModel | None = None):
+        """读取模型的刚体树、关节轴、初始关节位置和关节限位，并放到指定设备。"""
         cfg = get_g1_robot_cfg()
         m = Entity(cfg).compile() if model is None else model
         self.device = device
@@ -28,7 +27,7 @@ class G1Kinematics:
         ids, _, values = resolve_matching_names_values(cfg.init_state.joint_pos, G1_JOINT_NAMES)
         self.default_q[ids] = torch.tensor(values, dtype=torch.float32, device=device)
         jname_to_idx = {n: i for i, n in enumerate(G1_JOINT_NAMES)}
-        # bodies in tree order (mujoco orders parents before children); world (id 0) is skipped
+        # 按树顺序处理刚体（MuJoCo 将父节点排在子节点之前），跳过世界节点（编号 0）
         bodies, parent, joint_idx, axes, offs_p, offs_R = [], [], [], [], [], []
         mj_to_local = {}
         for b in range(1, m.nbody):
@@ -46,6 +45,7 @@ class G1Kinematics:
                 if pb not in mj_to_local:
                     raise RuntimeError(f"parent of {name} is not a robot body")
                 parent.append(mj_to_local[pb])
+                # 仅支持原点处的单铰链结构；提前拒绝其他关节，避免后续速度递推使用错误假设。
                 if jid >= 0:
                     if m.jnt_type[jid] != mujoco.mjtJoint.mjJNT_HINGE:
                         raise RuntimeError(f"joint of {name} is not a hinge")
@@ -53,7 +53,7 @@ class G1Kinematics:
                         raise RuntimeError(f"joint of {name} is not at the body origin")
                     joint_idx.append(jname_to_idx[m.joint(jid).name])
                 else:
-                    joint_idx.append(-1)  # fixed body: offset only
+                    joint_idx.append(-1)  # 固定刚体：只有偏移
             axes.append(m.jnt_axis[jid].copy() if jid >= 0 else np.array([0.0, 0.0, 1.0]))
             offs_p.append(m.body_pos[b].copy())
             offs_R.append(m.body_quat[b].copy())
@@ -67,7 +67,7 @@ class G1Kinematics:
         self.off_R = quat_to_mat(torch.tensor(np.array(offs_R), dtype=torch.float32, device=device))
         self.tracked_idx = [bodies.index(n) for n in tracked]
         self.num_bodies = len(bodies)
-        # joint limits (in G1_JOINT_NAMES order)
+        # 关节限位（按 G1_JOINT_NAMES 顺序）
         lo, hi = np.zeros(len(G1_JOINT_NAMES)), np.zeros(len(G1_JOINT_NAMES))
         for j in range(m.njnt):
             n = m.joint(j).name
@@ -77,12 +77,9 @@ class G1Kinematics:
         self.q_hi = torch.tensor(hi, dtype=torch.float32, device=device)
 
     def forward(self, p, R, v, w, q, qd, all_bodies: bool = False):
-        """Tracked-body world positions, rotations, linear (link-origin) and angular velocities.
+        """计算刚体在世界坐标系中的位置、旋转、线速度（连杆原点）和角速度。
 
-        Args:
-            p, R, v, w: root (pelvis) position (B,3), rotation (B,3,3), world lin/ang velocity (B,3).
-            q, qd: joint positions/velocities (B,29) in G1_JOINT_NAMES order.
-        """
+        p、R、v、w 分别是根部（骨盆）位置 (B,3)、旋转 (B,3,3) 及世界系线速度和角速度 (B,3)；q、qd 是按 G1_JOINT_NAMES 排列的关节位置和速度 (B,29)。all_bodies 为真时返回所有刚体，否则只返回跟踪刚体。"""
         P, Rs, V, W = [None] * self.num_bodies, [None] * self.num_bodies, [None] * self.num_bodies, [None] * self.num_bodies
         for i in range(self.num_bodies):
             par = self.parent[i]
@@ -93,10 +90,13 @@ class G1Kinematics:
             Rp = Rs[par]
             pi = P[par] + (Rp @ self.off_p[i].unsqueeze(-1)).squeeze(-1)
             R_off = Rp @ self.off_R[i]
+            # 连杆原点的线速度包含父体平移与父体旋转产生的叉积项；固定连杆也需此项。
             vi = V[par] + torch.cross(W[par], pi - P[par], dim=-1)
             if j < 0:
                 P[i], Rs[i], V[i], W[i] = pi, R_off, vi, W[par]
                 continue
+            # 关节轴先经安装姿态转换到世界系，再叠加关节转速；位置不因该转动改变，
+            # 因为构造时已要求铰链位于连杆原点。
             Ri = R_off @ axis_angle_to_mat(self.axes[i], q[..., j])
             axis_w = (R_off @ self.axes[i].unsqueeze(-1)).squeeze(-1)
             wi = W[par] + axis_w * qd[..., j : j + 1]

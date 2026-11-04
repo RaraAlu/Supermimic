@@ -14,8 +14,8 @@ import torch
 import torch.multiprocessing as mp
 
 from supermimic.tasks.tracking.rl.networks import RunningNorm
-from supermimic.tasks.tracking.reset_sampling import BinSampler, global_bin_probabilities
-from supermimic.utils.distributed import DistributedContext, average_gradients
+from supermimic.tasks.tracking.reset_sampling import BinSampler, cap_clip_share, global_bin_probabilities
+from supermimic.utils.distributed import DistributedContext, LocalContext, average_gradients
 
 
 def collective_worker(rank, root):
@@ -131,6 +131,17 @@ def collective_worker(rank, root):
         assert abs(float(parallel.reduce(one_rank.sum())) - 1) < 1e-6
         none = global_bin_probabilities(returns, torch.full_like(returns, 1 / 5), 1., 5, parallel, None, everything, ~everything)
         torch.testing.assert_close(none, torch.full_like(returns, 1 / 5))
+
+        # 片段份额上限：片段分在两个rank上（rank0两段，rank1一段），与单进程持有全部片段时逐片段一致
+        torch.testing.assert_close(parallel.all_gather(torch.tensor([rank, 10 + rank])), torch.tensor([[0, 10], [1, 11]]))
+        all_soft = torch.softmax(-25 * all_returns.double(), 0)
+        all_clip = torch.tensor([0, 1, 2, 2, 2])  # 第3段跨分箱2–4，整段在rank1
+        local_clip = all_clip[local] - (0 if rank == 0 else 2)
+        capped, stats = cap_clip_share(all_soft[local], local_clip, 2 if rank == 0 else 1, 0.4, parallel)
+        reference, ref_stats = cap_clip_share(all_soft, all_clip, 3, 0.4, LocalContext)
+        torch.testing.assert_close(capped, reference[local])
+        torch.testing.assert_close(stats, ref_stats)
+        assert int(stats[1]) == 2 and abs(float(parallel.reduce(capped.sum())) - 1) < 1e-12
 
         # BinSampler.prepare：每个分箱自成一段长片段，都可重置、可评分
         n = len(returns)

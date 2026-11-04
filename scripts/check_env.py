@@ -1,5 +1,5 @@
-# Ported from zita-ch/supermimic_vibed (MIT, Copyright (c) 2026 ETH Zurich, Chong Zhang); see THIRD_PARTY_NOTICES.md.
-"""Check FK vs simulator, state round-trip, and reward on reference playback."""
+# 移植自 zita-ch/supermimic_vibed（MIT，Copyright (c) 2026 ETH Zurich, Chong Zhang）；详见 THIRD_PARTY_NOTICES.md。
+"""对比正向运动学与模拟器，检查状态读写往返，并测量参考动作回放的奖励。"""
 
 import argparse
 import os
@@ -41,13 +41,14 @@ print(f"sim init {time.time() - t0:.1f}s, cuda graphs: {env.sim.use_cuda_graph}"
 clips = torch.arange(args.num_envs, device=dev) % len(motion.names)
 frames = torch.minimum(motion.clip_start[clips] + 100, motion.clip_end[clips] - 1)
 env.reset(torch.arange(args.num_envs, device=dev), frames)
+# 写入状态后先刷新模拟器派生量，确保下面比较的刚体位姿和速度属于同一时刻。
 env.refresh()
 S = env.state()
 ref = motion.ref_state(frames)
 names = ["p", "R", "v", "w", "q", "qd"]
 for n, a, b in zip(names, S, ref):
     print(f"roundtrip {n}: max err {(a - b).abs().max().item():.2e}")
-# FK vs sim body frames
+# 对比正向运动学与模拟器的刚体坐标系
 d = env.robot.data
 ids = env.robot.find_bodies(TRACKED_BODIES, preserve_order=True)[0]
 sp = d.body_link_pose_w[:, ids, :3]
@@ -58,11 +59,12 @@ print("FK rot err", rot_angle_sq(bR, sR).sqrt().max().item())
 sv = d.body_link_vel_w[:, ids]
 print("FK linvel err", (bv - sv[..., :3]).norm(dim=-1).max().item(), " angvel err", (bw - sv[..., 3:]).norm(dim=-1).max().item())
 print("ref body vs FK(sim) pos err", (motion.body_p[frames] - bp).norm(dim=-1).max().item())
-# open-loop reference playback via joint targets
+# 通过关节目标开环回放参考动作
 rs = []
 t0 = time.time()
 for t in range(150):
     f1 = env.f + 1
+    # 将下一参考关节角反解为策略动作尺度，检查控制接口而非学习策略的跟踪表现。
     a = (motion.q[f1] - env.default_q) / env.alpha
     out = env.step(a)
     env.f = torch.minimum(env.f, motion.clip_end[clips] - 1)

@@ -1,9 +1,7 @@
-"""Bounded, full-data two-GPU timing under both readings of paper Table A.5.
+"""使用全部动作数据，按论文表 A.5 的两种批量解释执行有上限的双卡计时。
 
-Only simulator environments are explicitly labelled per GPU in the paper and its TeX source.
-Both global and per-GPU training batch interpretations are measured, without assuming author confirmation.
-Every run stops after at most 1000 iterations. There is no long-training mode.
-"""
+论文及其 TeX 源码仅明确环境数为每卡数量，因此分别测量全局批量与每卡批量两种解释，
+不视为已获作者确认。每次运行最多 1000 次迭代，不提供长时间训练模式。"""
 
 import argparse
 import csv
@@ -22,8 +20,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def training_arguments(interpretation):
-    # Use explicit global counts for both cases, so environment and optimizer batch scopes
-    # cannot accidentally change together. No motion_limit: use every available clip.
+    # 两种解释均显式传入全局数量，避免环境数与优化器批量的作用范围
+    # 意外一起变化；不设置 motion_limit，以使用全部可用片段。
+    """按全局或每卡批量解释生成显式训练参数，保持环境总数一致。"""
     scale = 1 if interpretation == "global" else 2
     return ["--batch_scope", "global", "--num_envs", "8192",
             "--wm_batch", str(2048 * scale), "--pi_batch", str(4096 * scale),
@@ -37,6 +36,7 @@ def training_arguments(interpretation):
 
 
 def summarize(path, skip, iterations):
+    """汇总采样区间的耗时、内核或训练指标，并生成可供比较的报告。"""
     with (path / "train_log.csv").open() as stream:
         all_rows = list(csv.DictReader(stream))
     rows = [row for row in all_rows if int(row["iteration"]) > skip]
@@ -59,6 +59,7 @@ def summarize(path, skip, iterations):
 
 
 def main():
+    """验证短程计时参数，分配双卡运行组合并保存两种批量解释的比较结果。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--motion_source", required=True)
     parser.add_argument("--output_dir", type=Path, required=True)
@@ -78,6 +79,7 @@ def main():
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         parser.error("run this launcher directly, not inside torchrun")
     output = args.output_dir.resolve()
+    # 先生成完整执行计划；两卡依次运行两种解释，四卡可在独立设备组并行运行。
     plans = []
     for round_index in range(args.rounds):
         pairs = [args.gpus[:2], args.gpus[2:]] if len(args.gpus) == 4 else [args.gpus[:], args.gpus[:]]
@@ -95,6 +97,7 @@ def main():
     batches = ([[p] for p in plans] if len(args.gpus) == 2 else
                [[p for p in plans if p["round"] == r] for r in range(args.rounds)])
     groups = [[p["path"] for p in batch] for batch in batches]
+    # 预览模式只输出命令和并发分组，不创建结果目录或启动训练。
     if args.dry_run:
         print(json.dumps({"plans": plans, "concurrent_groups": groups}, indent=2))
         return
@@ -126,6 +129,7 @@ def main():
                                            stderr=subprocess.STDOUT, start_new_session=True)
                 running.append((process, log, plan, start))
                 print("START " + json.dumps({**plan, "command": "command.json", "pid": process.pid}), flush=True)
+            # 轮询所有并行任务，任一失败即进入清理；每个成功结果立即落盘，保留已完成的测量。
             pending = list(running)
             while pending:
                 for item in pending[:]:
@@ -145,6 +149,7 @@ def main():
                     pending.remove(item)
                 if pending:
                     time.sleep(1)
+        # torchrun 会启动多个工作进程，因此按进程组终止整个任务；超时后强制清理，避免留下 GPU 占用。
         finally:
             for process, log, *_ in running:
                 if process.poll() is None:
@@ -156,6 +161,7 @@ def main():
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait()
                 log.close()
+    # 跨轮次取耗时中位数，再外推长程训练时间；外推仅基于短程稳态吞吐，不包含启动成本。
     summary = {}
     for name in ("global", "per_gpu"):
         seconds = [r["seconds_per_iteration"] for r in records if r["interpretation"] == name]

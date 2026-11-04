@@ -1,1 +1,1 @@
-"""SuperMimic reproduction on mjlab."""
+"""基于 mjlab 复现 SuperMimic。"""

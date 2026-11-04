@@ -1,1 +1,1 @@
-"""Kinematics and rotation utilities."""
+"""运动学与旋转工具。"""

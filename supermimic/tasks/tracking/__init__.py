@@ -1,1 +1,1 @@
-"""World-model motion-tracking task."""
+"""基于世界模型的动作跟踪任务。"""

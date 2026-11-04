@@ -90,6 +90,7 @@ def so3_exp(v: torch.Tensor) -> torch.Tensor:
     theta2 = (v * v).sum(-1, keepdim=True)
     theta = torch.sqrt(theta2 + 1e-12)
     small = theta2 < 1e-8
+    # 小角度处用泰勒展开消除 sin(theta)/theta 和 (1-cos(theta))/theta² 的相消误差。
     a = torch.where(small, 1 - theta2 / 6, torch.sin(theta) / theta)
     b = torch.where(small, 0.5 - theta2 / 24, (1 - torch.cos(theta)) / (theta2 + 1e-12))
     K = skew(v)
@@ -107,7 +108,7 @@ def so3_log(R: torch.Tensor) -> torch.Tensor:
 
 
 def quat_to_rotvec(q: torch.Tensor) -> torch.Tensor:
-    """四元数 (..., 4) -> 旋转向量 (..., 3)（轴角表示，轴乘以角度）。
+    """单位四元数 (..., 4) -> 旋转向量 (..., 3)（轴角表示，轴乘以角度）。
 
     用半角的 atan2 求角度；小角度走泰勒近似，避免除以接近 0 的 sin_half。
     """
@@ -131,7 +132,7 @@ def rot_angle_sq(Ra: torch.Tensor, Rb: torch.Tensor) -> torch.Tensor:
 
     角度由 tr(Ra^T Rb) = 1 + 2cos(t) 反解，acos 前先截断到 (-1, 1) 内以保证定义域与梯度。
     """
-    tr = (Ra * Rb).sum((-1, -2))  # Ra^T Rb 的迹
+    tr = (Ra * Rb).sum((-1, -2))  # 相对旋转矩阵 Ra^T Rb 的迹
     cos = torch.clamp((tr - 1) / 2, -1 + 1e-6, 1 - 1e-6)
     return torch.acos(cos) ** 2
 
@@ -163,7 +164,8 @@ def quat_slerp(q0: torch.Tensor, q1: torch.Tensor, t: torch.Tensor) -> torch.Ten
     dot < 0 时翻转 q1 取短弧；两向量近乎平行（sin(theta) ≈ 0）时退化为线性插值，避免除以 0。
     """
     dot = (q0 * q1).sum(-1, keepdim=True)
-    q1 = torch.where(dot < 0, -q1, q1)  # 取短弧：q 与 -q 表示同一旋转
+    # q 与 -q 表示同一旋转；先统一到同一半球，确保插值沿较短弧进行。
+    q1 = torch.where(dot < 0, -q1, q1)
     dot = dot.abs().clamp(max=1.0)  # acos 定义域保护
     theta = torch.acos(dot)
     s = torch.sin(theta)

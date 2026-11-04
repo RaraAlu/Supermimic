@@ -1,4 +1,4 @@
-"""Validate the indexed full-source G1 view without starting MuJoCo or training."""
+"""验证索引化完整动作源的 G1 数据视图，不启动 MuJoCo 或训练。"""
 
 import argparse
 import json
@@ -24,6 +24,7 @@ from supermimic.tasks.tracking.constants import TRACKED_BODIES
 dataset = IndexedG1Dataset(args.motion_index, args.motion_root, args.motion_limit,
                            verify_hashes=args.verify_hashes)
 result = dataset.summary()
+# 仅用长度元信息规划分片及常驻参考张量大小，不需要真正构造仿真环境。
 groups = partition_clips([c.length for c in dataset.clips], args.num_shards)
 bytes_per_frame = reference_bytes_per_frame(len(TRACKED_BODIES))
 result["partition_plan"] = {
@@ -32,6 +33,7 @@ result["partition_plan"] = {
     "frames_per_rank": [sum(dataset.clips[i].length for i in group) for group in groups],
     "reference_gib_per_rank": [sum(dataset.clips[i].length for i in group) * bytes_per_frame / 1024**3 for group in groups],
 }
+# 可选完整读取会逐片验证形状、有限性和四元数，并核对总帧数，开销高于仅检查目录元数据。
 if args.verify_frames:
     result["verified_frames"] = sum(len(p) for p, _, _ in dataset.iter_clips())
     if result["verified_frames"] != result["selected_frames"]:

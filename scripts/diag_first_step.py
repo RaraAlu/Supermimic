@@ -1,12 +1,8 @@
-"""First-step penalty diagnostic for a SuperMimic checkpoint (Appendix F.1 rollout, read-only).
+"""诊断检查点的首步惩罚，按论文附录 F.1 从每个片段首帧评估，不修改检查点。
 
-Plays every clip of a motion source once from its first frame, exactly like
-supermimic/scripts/evaluate.py, and additionally records per clip the reward terms of the
-first control step (where a_prev = 0) and the normalized return without that step.
-
-Run from the repository root; --src selects the source tree (default: this repository):
-    python scripts/diag_first_step.py --src <src> --ckpt <ckpt.pt> --motion_source <subset.h5> --out <dir>
-"""
+流程与 evaluate.py 一致，另记录首个控制步（a_prev = 0）的各奖励项及去掉首步后的归一化回报；
+失败的统计口径也与 evaluate.py 相同，并记录触发终止的步数与当时目标是否已截断在段末。
+在仓库根目录运行，--src 指定被测源码树，默认使用本仓库。"""
 
 import argparse
 import csv
@@ -23,6 +19,8 @@ parser.add_argument("--motion_source", required=True)
 parser.add_argument("--out", required=True)
 parser.add_argument("--device", default="cuda:0")
 parser.add_argument("--transient_steps", type=int, default=20)
+parser.add_argument("--goal_tail", default=None, choices=["clamp", "hold", "stand", "auto"],
+                    help="goal frames past a clip's end (see train.py); default: the checkpoint's setting, clamp for older ones")
 args = parser.parse_args()
 subject = _subject.Subject(args.src, args.device)
 
@@ -40,7 +38,7 @@ ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
 a_ = ck["args"]
 K, Hh = a_["goal_frames"], a_["hist"]
 subject.set_amp(a_)
-motion, mdp = subject.reference(args.motion_source)
+motion, mdp = subject.reference(args.motion_source, a_, args.goal_tail)
 C = len(motion.names)
 pi = subject.policy(ck)
 w_rate, w_lim = RewardCfg.w_action_rate, RewardCfg.w_joint_limit
@@ -63,17 +61,21 @@ with torch.no_grad():
     env.reset(ids, motion.clip_start[ids].clone())
     hist = None
     step = 0
+    fail_f = torch.zeros(C, dtype=torch.long, device=dev)  # 触发终止那一步推进前的参考帧
     while not bool(env.done_eval.all()):
         S = env.state()
         o = mdp.obs(S, env.a_prev, env.xi, env.f)
         hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
         a = pi(hist, motion.goal(env.f, K))
         alive = ~env.done_eval.clone()
+        f_prev, failed_prev = env.f.clone(), env.failed_eval.clone()
         out = env.step(a)
+        fail_f = torch.where(env.failed_eval & ~failed_prev, f_prev, fail_f)
         r, terms = out["r"], out["terms"]
         af = alive.float()
         rec["ret"] += r * af
         rec["steps"] += af
+        # 首步的前一动作为零，单独保存其惩罚及动作大小，避免与稳定跟踪阶段混在一起。
         if step == 0:
             rec["r0"] = r * af
             rec["track0"] = terms["track"] * af
@@ -85,6 +87,7 @@ with torch.no_grad():
             rec["rate_rest_sum"] += terms["action_rate"] * af
             rec["lim_rest_sum"] += terms["joint_limit"] * af
             rec["a_norm_rest_sum"] += a.norm(dim=-1) * af
+        # 瞬态曲线每个时间位置只统计仍活跃的片段，分母随片段结束而变化。
         if step < T_tr:
             trans_rate[step] = (terms["action_rate"] * af).sum()
             trans_lim[step] = (terms["joint_limit"] * af).sum()
@@ -96,16 +99,21 @@ elapsed = time.time() - t0
 
 denom = (motion.clip_len - 1).float() * MAX_STEP_REWARD
 failed = env.failed_eval.clone()
+# 目标取f+1..f+K帧并在段末截断；f + K超过段末时策略看到的未来参考已停在末帧。
+truncated = failed & (fail_f + K > clip_end)
+fail_step = torch.where(failed, fail_f - motion.clip_start[ids] + 1, 0)
 norm = rec["ret"] / denom
+# 去掉首步时分子与理论可得回报都减去一步；下面仅移除惩罚的反事实指标仍保留原分母。
 norm_wo_first = (rec["ret"] - rec["r0"]) / ((motion.clip_len - 2).float() * MAX_STEP_REWARD)
-# counterfactual: same rollout, first step's action-smoothness penalty removed
+# 反事实对照：保持同一轨迹，仅去掉首步的动作平滑惩罚
 norm_no_rate0 = (rec["ret"] - w_rate * rec["rate0"] * CONTROL_DT) / denom
 rest = (rec["steps"] - 1).clamp(min=1)
-pen_rate0 = w_rate * rec["rate0"] * CONTROL_DT / MAX_STEP_REWARD  # in normalized-step units
+pen_rate0 = w_rate * rec["rate0"] * CONTROL_DT / MAX_STEP_REWARD  # 以归一化控制步为单位
 pen_lim0 = w_lim * rec["lim0"] * CONTROL_DT / MAX_STEP_REWARD
 
 
 def q(x, ps=(0.0, 0.1, 0.5, 0.9, 1.0)):
+    """计算指定分位数及均值，并将结果舍入为便于 JSON 输出的数值。"""
     x = x.float().cpu()
     return {f"p{int(p * 100)}": round(float(torch.quantile(x, p)), 4) for p in ps} | {"mean": round(float(x.mean()), 4)}
 
@@ -113,6 +121,7 @@ def q(x, ps=(0.0, 0.1, 0.5, 0.9, 1.0)):
 summary = {
     "ckpt": args.ckpt, "iteration": ck.get("iteration"), "subject": subject.provenance(), "clips": C, "frames": int(motion.clip_len.sum()),
     "elapsed_s": round(elapsed, 1), "steps": step, "n_failed": int(failed.sum()),
+    "n_failed_guided": int((failed & ~truncated).sum()), "goal_frames": K,
     "norm_return": round(float(norm.mean()), 4),
     "norm_return_wo_first_step": round(float(norm_wo_first.mean()), 4),
     "norm_return_without_first_step_action_rate": round(float(norm_no_rate0.mean()), 4),
@@ -137,17 +146,17 @@ summary = {
         "joint_limit_raw": [round(float(v), 4) for v in (trans_lim / trans_n.clamp(min=1)).cpu()],
         "reward_normalized": [round(float(v), 4) for v in (trans_r / trans_n.clamp(min=1) / MAX_STEP_REWARD).cpu()],
     },
-    # fraction of the mean shortfall (1 - norm) caused by the first step's two penalties
+    # 首步两项惩罚占平均回报缺口（1 - norm）的比例
     "first_step_share_of_deficit": round(float((-(pen_rate0 + pen_lim0) / (motion.clip_len - 1)).mean() / (1 - norm).mean()), 4),
 }
 (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 with open(out_dir / "per_clip.csv", "w", newline="", encoding="utf-8") as fh:
     w = csv.writer(fh)
     w.writerow(["name", "clip_len", "failed", "norm", "norm_wo_first", "norm_no_rate0", "r0_norm", "rate0_raw", "lim0_raw",
-                "a0_l2", "rate_rest_mean", "a_l2_rest_mean"])
+                "a0_l2", "rate_rest_mean", "a_l2_rest_mean", "fail_step", "goal_truncated"])
     for i in range(C):
         w.writerow([motion.names[i], int(motion.clip_len[i]), int(failed[i]), f"{norm[i]:.4f}", f"{norm_wo_first[i]:.4f}",
                     f"{norm_no_rate0[i]:.4f}", f"{rec['r0'][i] / MAX_STEP_REWARD:.4f}", f"{rec['rate0'][i]:.3f}",
                     f"{rec['lim0'][i]:.4f}", f"{rec['a0_norm'][i]:.3f}", f"{rec['rate_rest_sum'][i] / rest[i]:.4f}",
-                    f"{rec['a_norm_rest_sum'][i] / rest[i]:.3f}"])
+                    f"{rec['a_norm_rest_sum'][i] / rest[i]:.3f}", int(fail_step[i]), int(truncated[i])])
 print(json.dumps(summary, indent=2, ensure_ascii=False))
