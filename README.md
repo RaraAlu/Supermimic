@@ -7,6 +7,44 @@
 [zita-ch/supermimic_vibed](https://github.com/zita-ch/supermimic_vibed)（Isaac Lab 3 → mjlab），
 许可与出处见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
+## ONNX 舞蹈示例
+
+G1 在 CPU MuJoCo 中运行导出的 ONNX 策略，闭环跟踪《zhongzhuangyuan1》的 50 Hz 参考动作。
+实体机器人是策略执行结果，青色半透明虚影是参考动作；不是直接回放参考关节角。
+
+[![ONNX 舞蹈跟踪：策略执行与参考动作对照](docs/assets/demos/dance_ckpt20000_preview.png)](docs/assets/demos/dance_ckpt20000_comparison.mp4)
+
+[打开完整对照视频](docs/assets/demos/dance_ckpt20000_comparison.mp4) · 110 秒动作，50 fps，1280×720，末尾停留 1 秒。
+
+2026-11-04 本机实测：第 20,000 次迭代的导出策略跑完 5,500 个控制步，未触发脚本的摔倒判定；
+全程平均关节角绝对误差 1.98°，根部水平位置平均误差 3.32 cm。
+这是单个动作的仿真示例，不代表泛化能力、全库评估或实机验收。
+
+### 一键运行
+
+Linux 桌面已安装 `uv`、并放好下面三个资源文件后，在项目根目录运行：
+
+```bash
+./scripts/run_dance_demo.sh
+```
+
+默认打开 MuJoCo 交互窗口，按实时速度执行，结束后保留最后一帧，关闭窗口退出。
+脚本也可通过绝对路径从其他目录启动；首次运行可能需要下载项目依赖与临时的 `onnxruntime==1.31.1`，
+不会修改 `pyproject.toml` 或 `uv.lock`。无需窗口时运行 `./scripts/run_dance_demo.sh --headless`；
+`--save PATH` 可保存推理轨迹（父目录需已存在），`--xml PATH` 可指定 G1 XML，相对路径均相对于启动时的工作目录。
+
+| 属性 | 项目内位置 |
+| --- | --- |
+| ONNX 策略 | `checkpoints/onnx/dance/dance_ckpt20000.onnx` |
+| 策略元数据 | `checkpoints/onnx/dance/dance_ckpt20000.json` |
+| 参考动作 | `data/motions/dance/zhongzhuangyuan1_umr_50hz.npz` |
+| 对照视频与预览图 | `docs/assets/demos/` |
+| 启动入口 | `scripts/run_dance_demo.sh` |
+
+沿用仓库约定，`checkpoints/` 和 `data/` 内的模型、元数据和动作只保存在本地，不进入 Git；
+重新克隆项目后需自行放入这三个文件，脚本不会自动下载模型或动作。策略参数实际读取自 ONNX 内嵌元数据，
+同名 JSON 作为配套说明，单独修改 JSON 不会改变推理行为。
+
 ## 亮点
 
 - **全库覆盖**：2×A100训练10.4 h（9.8万次迭代）的检查点，按附录F.1协议在114,403段BONES-SEED动作上逐段从首帧播放，
@@ -550,6 +588,7 @@ $`G_b`$ 是从该分箱起步的回合回报的EMA。温度25非常尖锐：评�
 | `scripts/eval_f1_shards.py` | 逐个源分片调用`diag_first_step.py`做全库附录F.1评估（可中断续跑），按`clips.csv`汇总成报告，可只统计训练选入的片段 |
 | `scripts/record_clips.py` | 按附录F.1条件重放指定片段（或某次汇总的失败列表），记录策略与参考的根位姿和关节角，存为npz |
 | `scripts/render_clips.py` | 把`record_clips.py`的npz渲染成机器人与参考并排的MP4 |
+| `scripts/run_dance_demo.sh` | 一键启动项目内的 ONNX 舞蹈示例，默认 MuJoCo 交互窗口，也支持无窗口推理 |
 | `scripts/watch_train.py` | 监督训练日志，出现异常、到达里程碑或训练结束时退出 |
 | `scripts/csv_to_tensorboard.py` | 把run的`train_log.csv`与`sampling_log.csv`写成TensorBoard标量，标签与`--tensorboard`相同 |
 
@@ -616,6 +655,7 @@ scripts/
   eval_f1_shards.py
   record_clips.py
   render_clips.py
+  run_dance_demo.sh
   watch_train.py
   csv_to_tensorboard.py
   smrun.sh
@@ -634,6 +674,7 @@ tests/
   test_tensorboard_log.py
   test_goal_tail.py
   test_make_motion_source.py
+  test_dance_demo.py
 ```
 
 | 路径 | 内容 |
