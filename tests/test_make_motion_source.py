@@ -51,7 +51,7 @@ class MakeMotionSourceTests(unittest.TestCase):
     def test_csv_matches_the_csv_entry_bit_for_bit(self):
         out = self.root / "all.h5"
         summary = run("--csv_dir", self.csv, "--out", out)
-        self.assertEqual((summary["clips"], summary["dropped"]), (3, {"exclude": [], "start_height": []}))
+        self.assertEqual((summary["clips"], summary["dropped"]), (3, {"exclude": [], "start_height": [], "clearance": []}))
         ds = MergedG1Dataset(out)
         self.assertEqual([c.name for c in ds.clips], ["a_walk", "b_turn", "c_high"])
         for clip, arrays, f in zip(ds.clips, ds.iter_clips(), sorted(self.csv.glob("*.csv"))):
@@ -66,7 +66,7 @@ class MakeMotionSourceTests(unittest.TestCase):
     def test_filters_and_provenance(self):
         out = self.root / "filtered.h5"
         summary = run("--csv_dir", self.csv, "--out", out, "--exclude", "b_turn", "missing", "--max_start_height", 1.5)
-        self.assertEqual(summary["dropped"], {"exclude": ["b_turn"], "start_height": ["c_high"]})
+        self.assertEqual(summary["dropped"], {"exclude": ["b_turn"], "start_height": ["c_high"], "clearance": []})
         self.assertEqual(summary["exclude_not_found"], ["missing"])
         with h5py.File(out, "r") as f:
             self.assertEqual(f["clips/source_relative_path"].asstr()[:].tolist(), ["a_walk"])
@@ -97,6 +97,72 @@ class MakeMotionSourceTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 run("--npz_dir", npz, "--out", self.root / "bad.h5")
         self.assertFalse((self.root / "bad.h5.partial").exists())
+
+    def write_shards(self, tamper=False):
+        """两个分片、三段动作的数据集目录；窗口用的clip_*数组故意与源片段不同，只有source_clip_*才对。"""
+        root = self.root / "shards"
+        root.mkdir()
+        names = ("a_walk", "b_turn", "c_high")
+        arrays = [tuple(x.numpy() for x in load_csv(str(self.csv / f"{n}.csv"))) for n in names]
+        lines = ["relative_csv,h5,clip_index,frame_start,frames,padding_frames"]
+        for shard, members in (("shard_000.h5", [0, 1]), ("shard_001.h5", [2])):
+            lengths = np.array([len(arrays[m][0]) for m in members], dtype=np.int64)
+            starts = np.cumsum(lengths) - lengths
+            with h5py.File(root / shard, "w") as f:
+                f["source_clip_starts"], f["source_clip_lengths"] = starts, lengths
+                f["source_clip_fps"] = np.full(len(lengths), 50, dtype=np.int64)
+                f["clip_starts"], f["clip_lengths"] = np.array([0, 1]), np.array([1, 1])
+                for key, column in (("root_pos", 0), ("root_quat_w", 1), ("joint_pos", 2)):
+                    f[key] = np.concatenate([arrays[m][column] for m in members])
+            for local, m in enumerate(members):
+                start = int(starts[local]) + (1 if tamper and m == 1 else 0)
+                lines.append(f"sub/{names[m]}.csv,{shard},{local},{start},{lengths[local]},0")
+        (root / "clips.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return root, arrays
+
+    def test_shard_dir_merges_source_clips_with_names_from_the_table(self):
+        root, arrays = self.write_shards()
+        out = self.root / "merged.h5"
+        self.assertEqual(run("--shard_dir", root, "--out", out)["clips"], 3)
+        ds = MergedG1Dataset(out)
+        self.assertEqual([c.name for c in ds.clips], ["sub/a_walk.csv", "sub/b_turn.csv", "sub/c_high.csv"])
+        for got, want in zip(ds.iter_clips(), arrays):
+            for g, w in zip(got, want):
+                np.testing.assert_array_equal(g, w)
+
+    def test_shard_dir_filters_like_other_inputs(self):
+        root, _ = self.write_shards()
+        out = self.root / "merged.h5"
+        summary = run("--shard_dir", root, "--out", out, "--max_start_height", 1.5, "--exclude", "b_turn")
+        self.assertEqual(summary["clips"], 1)
+        self.assertEqual(summary["dropped"], {"exclude": ["sub/b_turn.csv"], "start_height": ["sub/c_high.csv"], "clearance": []})
+        with h5py.File(out, "r") as f:
+            self.assertEqual(json.loads(f.attrs["made_by"])["input"]["shard_dir"], str(root))
+
+    def test_shard_dir_refuses_a_table_that_disagrees_with_the_shard(self):
+        root, _ = self.write_shards(tamper=True)
+        with self.assertRaises(SystemExit):
+            run("--shard_dir", root, "--out", self.root / "bad.h5")
+        self.assertFalse((self.root / "bad.h5.partial").exists())
+
+    def test_max_clearance_drops_only_clips_floating_for_the_whole_clip(self):
+        # 零关节角时最低身体比根低约0.75 m；grounded全段贴地，airborne中途离地但有帧贴地，floating整段离地0.3 m
+        frames = 30
+        lift = {"grounded": np.zeros(frames), "airborne": np.r_[np.zeros(5), np.full(frames - 5, 0.5)], "floating": np.full(frames, 0.3)}
+        folder = self.root / "npz"
+        folder.mkdir()
+        probe = self.kin.forward(torch.zeros(1, 3), torch.eye(3)[None], torch.zeros(1, 3), torch.zeros(1, 3), torch.zeros(1, 29), torch.zeros(1, 29), all_bodies=True)[0]
+        floor = -float(probe[..., 2].min()) + 0.04  # 让最低身体离地0.04 m的根高度
+        for name, up in lift.items():
+            root = np.zeros((frames, 3))
+            root[:, 2] = floor + up
+            np.savez(folder / f"{name}.npz", root_pos=root, root_quat_wxyz=np.tile([1.0, 0, 0, 0], (frames, 1)), joint_pos=np.zeros((frames, 29)))
+        out = self.root / "grounded.h5"
+        summary = run("--npz_dir", folder, "--out", out, "--max_clearance", 0.1)
+        self.assertEqual(summary["dropped"]["clearance"], ["floating"])
+        self.assertEqual([c.name for c in MergedG1Dataset(out).clips], ["airborne", "grounded"])
+        with h5py.File(out, "r") as f:
+            self.assertEqual(json.loads(f.attrs["made_by"])["max_clearance"], 0.1)
 
     def test_refuses_existing_output_and_empty_result(self):
         out = self.root / "x.h5"
