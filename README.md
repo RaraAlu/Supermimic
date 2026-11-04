@@ -12,7 +12,9 @@
 G1 在 CPU MuJoCo 中运行导出的 ONNX 策略，闭环跟踪《zhongzhuangyuan1》的 50 Hz 参考动作。
 实体机器人是策略执行结果，青色半透明虚影是参考动作；不是直接回放参考关节角。
 
-[![ONNX 舞蹈跟踪：策略执行与参考动作对照](docs/assets/demos/dance_ckpt20000_preview.png)](docs/assets/demos/dance_ckpt20000_comparison.mp4)
+![ONNX 舞蹈跟踪动图：策略执行与参考动作对照，45–60 秒节选](docs/assets/demos/dance_ckpt20000_preview.gif)
+
+上方为原视频第 45–60 秒的循环动图（800×450，15 fps），直接在 README 中展示；完整记录见下方 MP4。
 
 [打开完整对照视频](docs/assets/demos/dance_ckpt20000_comparison.mp4) · 110 秒动作，50 fps，1280×720，末尾停留 1 秒。
 
@@ -38,7 +40,7 @@ Linux 桌面已安装 `uv`、并放好下面三个资源文件后，在项目根
 | ONNX 策略 | `checkpoints/onnx/dance/dance_ckpt20000.onnx` |
 | 策略元数据 | `checkpoints/onnx/dance/dance_ckpt20000.json` |
 | 参考动作 | `data/motions/dance/zhongzhuangyuan1_umr_50hz.npz` |
-| 对照视频与预览图 | `docs/assets/demos/` |
+| 对照视频、动图与静态预览 | `docs/assets/demos/` |
 | 启动入口 | `scripts/run_dance_demo.sh` |
 
 沿用仓库约定，`checkpoints/` 和 `data/` 内的模型、元数据和动作只保存在本地，不进入 Git；
