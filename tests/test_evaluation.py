@@ -43,11 +43,13 @@ class FakeEnv:
         self.failed_eval = torch.zeros(size, dtype=torch.bool)
         self.a_prev = torch.zeros(size, 29)
         self.xi = torch.zeros(size, 1)
+        self.ep_step = torch.zeros(size, dtype=torch.long)
         self.batches = []
 
     def reset(self, ids, frames):
         self.f = frames
         self.clips = self.motion.clip_id[frames]
+        self.ep_step = torch.zeros(self.N, dtype=torch.long)
         self.batches.append(self.clips.tolist())
 
     def state(self):
@@ -55,10 +57,21 @@ class FakeEnv:
 
     def step(self, action):
         self.f = self.f + 1
+        self.ep_step = self.ep_step + 1
         term = (self.clips == 1) & (self.f - self.motion.clip_start[self.clips] >= 2)
         self.failed_eval |= term & ~self.done_eval
         self.done_eval |= term | (self.f >= self.motion.clip_end[self.clips])
         return {"r": torch.full((self.N,), 0.1)}
+
+
+class EndFailEnv(FakeEnv):
+    # Clip 4 terminates on its last transition, when f + K is already past the clip end.
+    def step(self, action):
+        was_done = self.done_eval.clone()
+        out = super().step(action)
+        late = (self.clips == 4) & (self.f >= self.motion.clip_end[self.clips])
+        self.failed_eval |= late & ~was_done
+        return out
 
 
 class EvaluationTests(unittest.TestCase):
@@ -71,9 +84,10 @@ class EvaluationTests(unittest.TestCase):
                                       description={"fingerprint": "test"},
                                       goal=lambda f, k: torch.zeros(len(f), 73 * k))
         ns = {"torch": torch, "TrackingSim": FakeEnv, "motion": self.motion, "C": 5,
-              "check_reference": check_reference, "dev": "cpu", "Policy": FakePolicy,
-              "networks": SimpleNamespace(), "OBS_DIM": 1, "GOAL_FRAME_DIM": 73, "MAX_STEP_REWARD": 0.1,
-              "mdp": SimpleNamespace(obs=lambda s, a, xi, f: torch.zeros(len(f), 1))}
+              "check_reference": check_reference, "dev": "cpu", "build_policy": lambda actor, goal_dim, hist: FakePolicy(),
+              "networks": SimpleNamespace(), "GOAL_FRAME_DIM": 73, "MAX_STEP_REWARD": 0.1,
+              "mdp": SimpleNamespace(actor="future", actor_obs=lambda s, a, xi, f, first: torch.zeros(len(f), 1))}
+        self.ns = ns
         self.evaluate = load_function("supermimic/scripts/evaluate.py", "evaluate", ns)
         self.ck = {"args": {"goal_frames": 1, "hist": 2}, "pi": {},
                    "reference": self.motion.description}
@@ -99,15 +113,6 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(batched.batches, [[1, 4], [2, 3], [0, 0]])
 
     def test_failure_with_truncated_goal_counted_separately(self):
-        class EndFailEnv(FakeEnv):
-            # Clip 4 terminates on its last transition, when f + K is already past the clip end.
-            def step(self, action):
-                was_done = self.done_eval.clone()
-                out = super().step(action)
-                late = (self.clips == 4) & (self.f >= self.motion.clip_end[self.clips])
-                self.failed_eval |= late & ~was_done
-                return out
-
         self.ck["args"]["goal_frames"] = 3
         single = self.evaluate(EndFailEnv(5, self.motion), self.ck)
         for size in (1, 2, 3):
@@ -118,6 +123,30 @@ class EvaluationTests(unittest.TestCase):
                 self.assertEqual(res["n_failed_guided"], 1)
                 self.assertEqual(res["failed_goal_truncated"], ["4"])
                 self.assertEqual(res["fail_step"], {"1": [2, 50], "4": [5, 5]})
+
+    def test_causal_policy_reads_no_goal_and_has_no_truncated_failures(self):
+        def no_future(f, k):
+            raise AssertionError("causal evaluation must not read future goals")
+
+        self.ns["mdp"].actor = "causal"
+        self.motion.goal = no_future
+        self.ck["args"]["goal_frames"] = 3
+        res = self.evaluate(EndFailEnv(2, self.motion), self.ck)
+        self.assertEqual(res["n_failed"], 2)
+        self.assertEqual(res["n_failed_guided"], 2)
+        self.assertEqual(res["failed_goal_truncated"], [])
+
+    def test_observation_marks_first_frame_of_each_episode(self):
+        firsts = []
+
+        def actor_obs(s, a, xi, f, first):
+            firsts.append(first.clone())
+            return torch.zeros(len(f), 1)
+
+        self.ns["mdp"].actor_obs = actor_obs
+        self.evaluate(FakeEnv(5, self.motion), self.ck)
+        self.assertTrue(firsts[0].all())
+        self.assertFalse(any(first.any() for first in firsts[1:]))
 
     def test_checkpoint_mismatch_rejected(self):
         self.ck["reference"] = {"fingerprint": "different"}

@@ -51,9 +51,9 @@ import torch
 
 import supermimic.tasks.tracking.rl.networks as networks
 from supermimic.tasks.tracking.env import TrackingSim
-from supermimic.tasks.tracking.mdp import MAX_STEP_REWARD, OBS_DIM, MDP
+from supermimic.tasks.tracking.mdp import MAX_STEP_REWARD, MDP
 from supermimic.tasks.tracking.motion import GOAL_FRAME_DIM, MotionLib, check_reference, resolve_motion_args
-from supermimic.tasks.tracking.rl.networks import Policy
+from supermimic.tasks.tracking.rl.networks import build_policy
 from supermimic.utils.kinematics import G1Kinematics
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -67,7 +67,7 @@ resolve_motion_args(args, saved_args)
 goal_tail = args.goal_tail or saved_args.get("goal_tail", "clamp")
 kin = G1Kinematics(dev)
 motion = MotionLib.from_args(args, kin, dev, goal_tail=goal_tail, tail_frames=saved_args["goal_frames"])
-mdp = MDP(kin, motion, kin.default_q)
+mdp = MDP(kin, motion, kin.default_q, actor=saved_args.get("actor", "future"), reference_offset=saved_args.get("reference_offset", 0))
 C = len(motion.names)
 if args.record and C > args.eval_batch_size:
     raise ValueError("trajectory recording requires a single evaluation batch; explicitly increase --eval_batch_size")
@@ -81,7 +81,7 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None, check_data: 
     a_ = ck["args"]
     K, Hh = a_["goal_frames"], a_["hist"]
     networks.AMP_DTYPE = torch.bfloat16 if a_.get("amp", "none") == "bf16" else None
-    pi = Policy(OBS_DIM, GOAL_FRAME_DIM * K, hist=Hh).to(dev)
+    pi = build_policy(mdp.actor, GOAL_FRAME_DIM * K, Hh).to(dev)
     pi.load_state_dict(ck["pi"])
     pi.eval()
     ids = torch.arange(env.N, device=dev)
@@ -111,9 +111,9 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None, check_data: 
         hist = None
         while not bool(env.done_eval.all()):
             S = env.state()
-            o = mdp.obs(S, env.a_prev, env.xi, env.f)
+            o = mdp.actor_obs(S, env.a_prev, env.xi, env.f, env.ep_step == 0)
             hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
-            a = pi(hist, motion.goal(env.f, K))
+            a = pi(hist, motion.goal(env.f, K) if mdp.actor == "future" else None)
             # 保存推进前的活跃掩码，使触发终止的当前步奖励仍计入回报，之后各步不再计入。
             alive = ~env.done_eval.clone()
             if record:
@@ -129,8 +129,9 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None, check_data: 
             env.f = torch.minimum(env.f, clip_end - 1)
         ret[selected] = batch_ret[:count]
         failed[selected] = env.failed_eval[:count]
-        # 目标取f+1..f+K帧并在段末截断；f + K超过段末时策略看到的未来参考已停在末帧。
-        truncated[selected] = (env.failed_eval & (fail_f + K > clip_end))[:count]
+        # 目标取f+1..f+K帧并在段末截断；f + K超过段末时策略看到的未来参考已停在末帧。因果策略不读未来帧，没有这种截断。
+        if mdp.actor == "future":
+            truncated[selected] = (env.failed_eval & (fail_f + K > clip_end))[:count]
         fail_step[selected] = (fail_f - motion.clip_start[clips] + 1)[:count]
     # 每片段最多有长度减一条转移；同时报告片段等权均值与按帧数加权的总体回报。
     norm = ret / ((motion.clip_len - 1).float() * MAX_STEP_REWARD)

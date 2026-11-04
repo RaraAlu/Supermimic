@@ -130,7 +130,8 @@ class CleanActionTests(unittest.TestCase):
 
         _, scale = clean_action_split(frac, self.N, 0.1, "cpu")
         fake = SimpleNamespace(args=SimpleNamespace(action_noise=0.1), noise_scale=scale, pi=Pi(), K=1,
-                               mdp=SimpleNamespace(add_noise=lambda o: o, obs=lambda S, a, xi, f: torch.zeros(self.N, 3)),
+                               mdp=SimpleNamespace(add_noise=lambda o: o, actor="future",
+                                                   actor_obs=lambda S, a, xi, f, first: torch.zeros(self.N, 3)),
                                motion=SimpleNamespace(goal=lambda f, k: torch.zeros(self.N, 4)))
         torch.manual_seed(0)
         a, _ = Trainer._collect_action(fake, None, None, None, None, torch.zeros(self.N, dtype=torch.long), torch.zeros(self.N, 2, 3))
@@ -301,7 +302,7 @@ class InitFromTests(unittest.TestCase):
         from supermimic.scripts.train import resolve_init
 
         def args(**kw):
-            return SimpleNamespace(**({"goal_frames": 10, "hist": 10, "critic_warmup_iters": -1, "no_critic": False} | kw))
+            return SimpleNamespace(**({"goal_frames": 10, "hist": 10, "actor": "future", "critic_warmup_iters": -1, "no_critic": False} | kw))
 
         saved = {"args": {"goal_frames": 10, "hist": 10}}
         cases = [(args(), None, None, 0), (args(), None, saved, 1000), (args(), None, saved | {"critic": {}}, 0),

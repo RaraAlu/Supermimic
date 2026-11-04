@@ -6,7 +6,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from supermimic.tasks.tracking.mdp import INV_DIM, NUM_J, XI_DIM, invariant_features
+from supermimic.tasks.tracking.mdp import CAUSAL_OBS_DIM, INV_DIM, NUM_J, OBS_DIM, XI_DIM, invariant_features
 from supermimic.utils.rotations import so3_exp, so3_log, yaw_mat
 from supermimic.utils.distributed import global_moments
 
@@ -155,6 +155,43 @@ class Policy(nn.Module):
         z = torch.tanh(run_mlp(self.enc, self.goal_norm(goal)))
         o = self.obs_norm(obs_hist).flatten(-2)
         return run_mlp(self.dec, torch.cat((z, o), -1))
+
+
+class CausalPolicy(nn.Module):
+    """因果策略 a = D(x_t, E(x_{t-L+1:t}))：当前观测直通动作头，历史经一维卷积与全局平均池化压缩，不读未来参考。
+
+    结构见docs/teleop/causal_intent_encoder.md第3节。forward保留goal参数以沿用Policy的调用方式，但不使用它。"""
+
+    def __init__(self, obs_dim: int, hist: int = 10, channels=(256, 128, 64), kernel: int = 3, head=(2048, 1024, 512, 256, 128)):
+        """创建历史卷积编码器、动作头及观测归一化器。"""
+        super().__init__()
+        self.hist = hist
+        layers, width = [], obs_dim
+        for out_channels in channels:
+            layers += [nn.Conv1d(width, out_channels, kernel, padding="same"), nn.ELU()]
+            width = out_channels
+        self.hist_enc = nn.Sequential(*layers)
+        self.head = mlp(obs_dim + width, list(head), NUM_J)
+        # 与Policy相同：缩小动作输出层的初始权重，让策略初期动作接近默认关节目标。
+        with torch.no_grad():
+            self.head[-1].weight.mul_(0.01)
+            self.head[-1].bias.zero_()
+        self.obs_norm = RunningNorm(obs_dim)
+
+    def forward(self, obs_hist: torch.Tensor, goal: torch.Tensor | None = None) -> torch.Tensor:
+        """根据带噪声的观测历史生成动作；历史形状为（B, hist, obs_dim），最新值在末尾。"""
+        x = self.obs_norm(obs_hist)
+        z = run_mlp(self.hist_enc, x.transpose(-1, -2)).mean(-1)
+        return run_mlp(self.head, torch.cat((x[..., -1, :], z), -1))
+
+
+def build_policy(actor: str, goal_dim: int, hist: int) -> nn.Module:
+    """按--actor建立策略；goal_dim只有未来帧策略使用。"""
+    if actor == "causal":
+        return CausalPolicy(CAUSAL_OBS_DIM, hist=hist)
+    if actor == "future":
+        return Policy(OBS_DIM, goal_dim, hist=hist)
+    raise ValueError(f"unknown actor {actor}")
 
 
 class Critic(nn.Module):

@@ -75,7 +75,6 @@ def main():
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         parser.error("this arithmetic comparison runs on one GPU; use check_cuda_graph.py for multi-GPU replay checks")
     from supermimic.scripts import train
-    from supermimic.tasks.tracking.mdp import unflatten_state
     from supermimic.tasks.tracking.rl.trainer import set_requires_grad
 
     _, parallel, trainer = train.setup(["--num_envs", "512", "--buffer_steps", "100", "--wm_batch", "512",
@@ -127,7 +126,7 @@ def main():
     ok = compare("wm_step", trainer.wm, trainer.opt_wm, (w["s"], w["a"], w["xi"], w["s1"], w["mask"]))
     s, h = trainer.sample_valid_starts(trainer.layout.local_pi_batch)
     with torch.no_grad():
-        history = trainer.mdp.add_noise(trainer.mdp.obs(unflatten_state(h["s"]), h["a_prev"], h["xi"], h["f"]))
+        history = trainer.mdp.add_noise(trainer.replay_obs(h))
     wm, critic = trainer.wm, trainer.critic
     ok &= compare("policy_step", trainer.pi, trainer.opt_pi, (s["s"], s["xi"], s["f"], s["a_prev"], history),
                   pre=lambda: (set_requires_grad(wm, False), set_requires_grad(critic, False)),

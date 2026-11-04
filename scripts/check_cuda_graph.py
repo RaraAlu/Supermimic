@@ -13,7 +13,7 @@ import torch
 from torch.utils._pytree import tree_map
 
 from supermimic.scripts import train
-from supermimic.tasks.tracking.mdp import NUM_J, unflatten_state
+from supermimic.tasks.tracking.mdp import NUM_J
 from supermimic.tasks.tracking.rl.trainer import set_requires_grad
 from supermimic.utils.cuda_graph import GraphedCall
 
@@ -75,7 +75,7 @@ w = trainer.buffer.sample_windows(trainer.layout.local_wm_batch, args.wm_window)
 ok = compare("wm_step", wm, opt_wm, (w["s"], w["a"], w["xi"], w["s1"], w["mask"]))
 s, h = trainer.sample_valid_starts(trainer.layout.local_pi_batch)
 with torch.no_grad():
-    o_hist = trainer.mdp.add_noise(trainer.mdp.obs(unflatten_state(h["s"]), h["a_prev"], h["xi"], h["f"]))
+    o_hist = trainer.mdp.add_noise(trainer.replay_obs(h))
 sr = set_requires_grad
 ok &= compare("policy_step", pi, opt_pi, (s["s"], s["xi"], s["f"], s["a_prev"], o_hist),
               pre=lambda: (sr(wm, False), sr(critic, False)), post=lambda: (sr(wm, True), sr(critic, True)))

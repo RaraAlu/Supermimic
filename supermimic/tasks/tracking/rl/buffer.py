@@ -70,6 +70,7 @@ class ReplayBuffer:
         back = torch.minimum(back, age.unsqueeze(-1))  # 不越过缓冲区中最旧的记录
         hrows = self._row(age.unsqueeze(-1) - back)
         henv = env.unsqueeze(-1).expand_as(hrows)
-        start = {k: self.data[k][row, env] for k in ("s", "a_prev", "xi", "f")}
-        hist_d = {k: self.data[k][hrows, henv] for k in ("s", "a_prev", "xi", "f")}
+        # ep_step随历史一起返回：因果观测要靠它认出回合首帧（首帧速度为0，不能只看帧号）。
+        start = {k: self.data[k][row, env] for k in ("s", "a_prev", "xi", "f", "ep_step")}
+        hist_d = {k: self.data[k][hrows, henv] for k in ("s", "a_prev", "xi", "f", "ep_step")}
         return start, hist_d

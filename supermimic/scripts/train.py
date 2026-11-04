@@ -26,6 +26,14 @@ parser.add_argument("--goal_tail", type=str, default="clamp", choices=["clamp", 
                          "at rest (hold), standing in place (stand), or hold/stand chosen per clip by a capture-point test "
                          "(auto); not in the paper except clamp. Episodes still end at the clip's last frame")
 parser.add_argument("--hist", type=int, default=10)
+parser.add_argument("--actor", type=str, default="future", choices=["future", "causal"],
+                    help="future: the paper's policy, reading future reference frames; causal: reads only the current and "
+                         "past reference, with the current observation passed through and the history compressed by a CNN "
+                         "(docs/teleop/causal_intent_encoder.md section 3). The critic reads the future goal either way")
+parser.add_argument("--reference_offset", type=int, default=0, choices=[0, 1],
+                    help="the frame the causal actor reads relative to the state clock: 0 is frame t, strictly causal; 1 is "
+                         "frame t+1, the one-frame look-ahead of OpenTrack and Teleopit, only for measuring that frame's "
+                         "effect (matrix C1f). The reward phase is the same for both")
 parser.add_argument("--wm_window", type=int, default=8)
 parser.add_argument("--wm_batches", type=int, default=10)
 parser.add_argument("--wm_batch", type=int, default=2048)
@@ -132,6 +140,9 @@ def tensorboard_enabled(args) -> bool:
 
 def resolve_init(args, resume_ck: dict | None, init_ck: dict | None):
     """--init_from的网络形状须与检查点一致；解析--critic_warmup_iters的-1（规则见其帮助），解析后的值随args写入检查点。"""
+    for ck, flag in ((resume_ck, "--resume"), (init_ck, "--init_from")):
+        if ck and ck["args"].get("actor", "future") != args.actor:
+            raise ValueError(f"{flag} checkpoint was trained with --actor {ck['args'].get('actor', 'future')}, not {args.actor}")
     if init_ck:
         for key in ("goal_frames", "hist"):
             if init_ck["args"][key] != getattr(args, key):
@@ -149,6 +160,8 @@ def setup(argv: list[str] | None = None):
     参数解析先于torch等重型导入，--help不必加载它们。
     """
     args = parser.parse_args(argv)
+    if args.reference_offset and args.actor != "causal":
+        parser.error("--reference_offset 1 needs --actor causal")
 
     import torch
 

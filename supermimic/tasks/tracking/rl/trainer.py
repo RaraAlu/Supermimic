@@ -18,10 +18,10 @@ import torch
 import torch.nn as nn
 
 from supermimic.tasks.tracking.env import TrackingSim
-from supermimic.tasks.tracking.mdp import CRITIC_EXTRA, INV_DIM, MAX_STEP_REWARD, MDP, NUM_J, OBS_DIM, normalize_xi, unflatten_state
+from supermimic.tasks.tracking.mdp import CRITIC_EXTRA, INV_DIM, MAX_STEP_REWARD, MDP, NUM_J, normalize_xi, unflatten_state
 from supermimic.tasks.tracking.motion import GOAL_FRAME_DIM
 from supermimic.tasks.tracking.rl.buffer import ReplayBuffer
-from supermimic.tasks.tracking.rl.networks import Critic, Policy, WorldModel
+from supermimic.tasks.tracking.rl.networks import Critic, WorldModel, build_policy
 from supermimic.utils.checkpoints import rotate_states
 from supermimic.utils.cuda_graph import GraphedCall
 from supermimic.utils.distributed import average_gradients
@@ -162,12 +162,13 @@ class Trainer:
         """建立环境、回放缓冲区、模型、优化器与训练状态，并按需恢复检查点（resume）或只载入其权重（init，--init_from）。"""
         self.args, self.parallel, self.layout, self.motion = args, parallel, layout, motion
         dev = self.device = parallel.device
-        self.mdp = MDP(kin, motion, kin.default_q)
+        self.mdp = MDP(kin, motion, kin.default_q, actor=args.actor, reference_offset=args.reference_offset)
         self.K, self.Hh, self.HZ = args.goal_frames, args.hist, args.horizon
         goal_dim = GOAL_FRAME_DIM * self.K
 
         self.wm = WorldModel().to(dev)
-        self.pi = Policy(OBS_DIM, goal_dim, hist=self.Hh).to(dev)
+        self.pi = build_policy(args.actor, goal_dim, self.Hh).to(dev)
+        # 因果actor也不改变critic：训练时critic仍可读未来目标（特权信息，不进入部署）。
         self.critic = Critic(INV_DIM + CRITIC_EXTRA + goal_dim).to(dev)
         cuda = torch.device(dev).type == "cuda"
         self.fused_adam = args.fused_adam == "on" and cuda
@@ -232,7 +233,7 @@ class Trainer:
             self._restore_bins(resume)
         # 回放数据与观测历史属于当前仿真会话，不从检查点恢复；外层 setup 会重新预热。
         self.buffer = ReplayBuffer(args.buffer_steps, layout.local_envs, dev)
-        self.obs_hist = torch.zeros(layout.local_envs, self.Hh, OBS_DIM, device=dev)
+        self.obs_hist = torch.zeros(layout.local_envs, self.Hh, self.mdp.actor_dim, device=dev)
         # 可选（偏离论文）：本rank前clean_action_frac比例的环境采样时不加动作噪声。回放中只有加噪声的动作时，
         # 世界模型在确定性策略的平滑动作上缺少数据，想象推演用的正是确定性策略。为0时与论文完全相同。
         self.clean_envs, self.noise_scale = clean_action_split(args.clean_action_frac, layout.local_envs, args.action_noise, dev)
@@ -333,7 +334,7 @@ class Trainer:
         a = self.pi(o_hist, g)
         S1 = self.wm.step(S, a, xi_n)
         f1 = f + 1
-        o1 = self.mdp.add_noise(self.mdp.obs(S1, a, xi, f1))
+        o1 = self.mdp.add_noise(self.mdp.actor_obs(S1, a, xi, f1))
         o_hist = torch.cat((o_hist[:, 1:], o1.unsqueeze(1)), 1)
         return S1, a, o_hist, f1, self.motion.goal(f1, self.K)
 
@@ -492,12 +493,16 @@ class Trainer:
         diag_mean = torch.cat((diag_mean, torch.stack((value_grad, grad_sum / (args.critic_epochs * args.critic_minibatches)))))
         return v_loss.detach(), diag_mean, diag_max
 
+    def replay_obs(self, h: dict) -> torch.Tensor:
+        """由回放历史重建actor观测（不含噪声），回合首帧的规则与采样相同。"""
+        return self.mdp.actor_obs(unflatten_state(h["s"]), h["a_prev"], h["xi"], h["f"], h["ep_step"] == 0)
+
     def policy_update(self):
         """从回放中采样起点，更新策略，再使用想象转移更新价值网络。"""
         with self.parallel.coordinated("policy replay sampling"):
             s, h = self.sample_valid_starts(self.layout.local_pi_batch)
         with torch.no_grad():
-            o_hist = self.mdp.obs(unflatten_state(h["s"]), h["a_prev"], h["xi"], h["f"])
+            o_hist = self.replay_obs(h)
         o_hist = self.mdp.add_noise(o_hist)
         # 冻结世界模型与价值网络的参数，但保留它们对输入的导数，
         # 让回报梯度仍能穿过动力学和末端价值传到策略。
@@ -521,14 +526,16 @@ class Trainer:
     @torch.no_grad()
     def _collect_action(self, S, a_prev, xi, f, ep_step, history):
         """执行固定形状的采样工作，所有变化的环境张量均显式作为图输入。"""
-        o = self.mdp.add_noise(self.mdp.obs(S, a_prev, xi, f))
-        # 新回合用首帧观测填满历史，避免混入上一回合；其余环境移除最旧观测并追加当前帧。
         fresh = ep_step == 0
+        o = self.mdp.add_noise(self.mdp.actor_obs(S, a_prev, xi, f, fresh))
+        # 新回合用首帧观测填满历史，避免混入上一回合；其余环境移除最旧观测并追加当前帧。
         history = torch.where(fresh[:, None, None], o.unsqueeze(1).expand_as(history),
                               torch.cat((history[:, 1:], o.unsqueeze(1)), 1))
-        g = self.motion.goal(f, self.K)
         self.pi.obs_norm.update(o)
-        self.pi.goal_norm.update(g)
+        g = None
+        if self.mdp.actor == "future":
+            g = self.motion.goal(f, self.K)
+            self.pi.goal_norm.update(g)
         a = self.pi(history, g)
         noise = torch.randn_like(a)
         a = torch.clamp(a + (self.args.action_noise * noise if self.noise_scale is None else self.noise_scale * noise), -20, 20)

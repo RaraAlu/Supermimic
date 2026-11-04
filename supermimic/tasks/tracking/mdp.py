@@ -12,7 +12,7 @@ import torch
 from supermimic.tasks.tracking.constants import TRACKED_BODIES
 from supermimic.tasks.tracking.motion import CONTROL_DT, NUM_J, MotionLib
 from supermimic.utils.kinematics import G1Kinematics
-from supermimic.utils.rotations import mat_to_6d, quat_to_mat, mat_to_quat, rot_angle_sq, yaw_mat
+from supermimic.utils.rotations import mat_to_6d, quat_to_mat, mat_to_quat, rot_angle_sq, so3_log, yaw_mat
 
 STATE_DIM = 3 + 4 + 3 + 3 + NUM_J + NUM_J  # flatten_state的排列：p、四元数、v、w、q、qd
 OBS_DIM = NUM_J + NUM_J + 3 + 3 + NUM_J + 6
@@ -37,6 +37,26 @@ OBS_SCALE = torch.cat(
     (torch.ones(NUM_J), torch.full((NUM_J,), 0.1), torch.full((3,), 0.25), torch.ones(3), torch.ones(NUM_J), torch.ones(6))
 )
 MAX_STEP_REWARD = (4 * 1.0 + 2 * 0.5) * CONTROL_DT
+
+ACTORS = ("future", "causal")
+# 因果actor的观测：只含当前帧和已发布的上一帧。排列与Teleopit的VelCmdObservationBuilder一致，
+# 定义见docs/teleop/causal_intent_encoder.md第3节；每项为(名称, 维数, 均匀噪声半宽)。
+CAUSAL_OBS_LAYOUT = (
+    ("ref_joint_pos", NUM_J, 0.0),
+    ("ref_joint_vel", NUM_J, 0.0),
+    ("ref_anchor_ori_b", 6, 0.05),
+    ("base_ang_vel_b", 3, 0.2),
+    ("joint_pos_rel", NUM_J, 0.01),
+    ("joint_vel", NUM_J, 0.5),
+    ("prev_action", NUM_J, 0.0),
+    ("projected_gravity_b", 3, 0.05),
+    ("ref_anchor_lin_vel_b", 3, 0.0),
+    ("ref_anchor_ang_vel_b", 3, 0.0),
+    ("ref_projected_gravity_b", 3, 0.0),
+    ("ref_anchor_height", 1, 0.0),
+)
+CAUSAL_OBS_DIM = sum(dim for _, dim, _ in CAUSAL_OBS_LAYOUT)
+CAUSAL_OBS_NOISE = torch.cat([torch.full((dim,), noise) for _, dim, noise in CAUSAL_OBS_LAYOUT])
 
 
 @dataclass
@@ -90,15 +110,23 @@ INV_DIM = 1 + 6 + 3 + 3 + NUM_J + NUM_J
 
 class MDP:
     """为真实模拟与想象推演提供一致的观测、奖励、终止和价值特征。"""
-    def __init__(self, kin: G1Kinematics, motion: MotionLib, default_q: torch.Tensor, cfg: RewardCfg = RewardCfg()):
-        """保存运动学模型、参考动作、默认关节位置和奖励配置。"""
+    def __init__(self, kin: G1Kinematics, motion: MotionLib, default_q: torch.Tensor, cfg: RewardCfg = RewardCfg(),
+                 actor: str = "future", reference_offset: int = 0):
+        """保存运动学模型、参考动作、默认关节位置和奖励配置；actor决定actor_obs给策略哪种观测。"""
+        if actor not in ACTORS:
+            raise ValueError(f"actor must be one of {ACTORS}")
+        if reference_offset not in (0, 1) or (reference_offset and actor != "causal"):
+            raise ValueError("reference_offset must be 0 or 1, and 1 needs the causal actor")
         self.kin, self.motion, self.cfg = kin, motion, cfg
+        self.actor, self.reference_offset = actor, reference_offset
+        self.actor_dim = CAUSAL_OBS_DIM if actor == "causal" else OBS_DIM
         self.default_q = default_q
         mid, half = (kin.q_lo + kin.q_hi) / 2, (kin.q_hi - kin.q_lo) / 2
         self.soft_lo, self.soft_hi = mid - half * cfg.soft_limit_factor, mid + half * cfg.soft_limit_factor
         dev = default_q.device
         self.obs_noise = OBS_NOISE.to(dev)
         self.obs_scale = OBS_SCALE.to(dev)
+        self.causal_noise = CAUSAL_OBS_NOISE.to(dev)
 
     # ---------------- 观测 ----------------
     def obs(self, S, a_prev, xi, f) -> torch.Tensor:
@@ -110,9 +138,47 @@ class MDP:
         rel = mat_to_6d(Rt @ self.motion.root_R[f])
         return torch.cat((q - self.default_q - dq0, qd, (Rt @ w.unsqueeze(-1)).squeeze(-1), g_b, a_prev, rel), -1)
 
+    def causal_obs(self, S, a_prev, xi, f, first=None) -> torch.Tensor:
+        """生成因果actor的无噪声观测，排列见CAUSAL_OBS_LAYOUT。
+
+        只读actor可见的帧v（f，reference_offset=1时为f+1，截断在段末）及其上一帧。速度是纯后向差分；first标出回合首帧，
+        此时上一帧对本回合从未发布，速度取0，即使v在片段中途。first为None表示都不是首帧，想象推演中新生成的帧如此。"""
+        m = self.motion
+        p, R, v, w, q, qd = S
+        Rt = R.transpose(-1, -2)
+        seen = torch.minimum(f + self.reference_offset, m.clip_end[m.clip_id[f]]) if self.reference_offset else f
+        prev = seen - 1 if first is None else torch.where(first, seen, seen - 1)
+        rp, rR = m.root_p[seen], m.root_R[seen]
+        ref_v = (rp - m.root_p[prev]) / CONTROL_DT
+        ref_w = so3_log(rR @ m.root_R[prev].transpose(-1, -2)) / CONTROL_DT
+        return torch.cat(
+            (
+                m.q[seen],
+                (m.q[seen] - m.q[prev]) / CONTROL_DT,
+                mat_to_6d(Rt @ rR),
+                (Rt @ w.unsqueeze(-1)).squeeze(-1),
+                q - self.default_q - xi[..., XI_JOINT],
+                qd,
+                a_prev,
+                -R[..., 2, :],
+                (Rt @ ref_v.unsqueeze(-1)).squeeze(-1),
+                (Rt @ ref_w.unsqueeze(-1)).squeeze(-1),
+                -rR[..., 2, :],
+                rp[..., 2:3],
+            ),
+            -1,
+        )
+
+    def actor_obs(self, S, a_prev, xi, f, first=None) -> torch.Tensor:
+        """按actor选择无噪声观测；未来帧actor的观测不依赖回合首帧。"""
+        if self.actor == "causal":
+            return self.causal_obs(S, a_prev, xi, f, first)
+        return self.obs(S, a_prev, xi, f)
+
     def add_noise(self, o: torch.Tensor) -> torch.Tensor:
-        """按观测各分量的噪声尺度添加均匀随机噪声。"""
-        return o + (2 * torch.rand_like(o) - 1) * self.obs_noise
+        """按观测各分量的噪声尺度添加均匀随机噪声；观测维数决定用哪种actor的噪声表。"""
+        noise = self.causal_noise if o.shape[-1] == CAUSAL_OBS_DIM else self.obs_noise
+        return o + (2 * torch.rand_like(o) - 1) * noise
 
     # ---------------- 奖励与终止 ----------------
     def _anchored_ref_bodies(self, p, R, rp, rR, f):
