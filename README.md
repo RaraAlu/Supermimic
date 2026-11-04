@@ -86,6 +86,8 @@
 | `--clean_action_frac F` | 部分环境采样不加动作噪声，让回放里有确定性策略自己的转移，并分组记录确定性表现 |
 | `--bin_clip_cap C` | 限制单个片段在40%困难度部分中的份额，防止少数片段长期占掉重置 |
 | `--goal_tail {hold, stand, auto}` | 段末之后的未来目标改为保持末帧或原地站立，不再截断在末帧 |
+| `--actor causal` | actor不读未来帧：167维因果观测（排列与Teleopit相同），当前观测直通加历史CNN；critic仍读未来目标。设计见[实时跟踪设计](docs/teleop/causal_intent_encoder.md) |
+| `--reference_offset 1` | 只用于`--actor causal`：actor读到`t+1`帧，奖励不变，用来单独衡量这一帧前瞻的影响 |
 
 另外：命令行默认`--amp bf16`、前500次迭代只练世界模型（实现时的选择，理由见[训练流程第11节](docs/analysis/training_pipeline.md)）；基线run按论文用`--amp none`
 （FP32，矩阵乘法TF32）与`--wm_only_iters 0`。仿真用mjlab与MuJoCo Warp，部分模块移植自zita-ch/supermimic_vibed；推力扰动与论文一样删除。
@@ -153,7 +155,7 @@ uv run --frozen python -m supermimic.scripts.evaluate --run_dir logs/smoke --wat
 ## 准备训练数据
 
 训练、评估和诊断都读同一种文件：单个合并源HDF5（`--motion_source`，格式`teleopit_motion_hdf5` v1，50 Hz）。
-`scripts/make_motion_source.py`把四种输入转成它，只用CPU、逐段读写，不修改输入：
+`scripts/make_motion_source.py`把五种输入转成它，只用CPU、逐段读写，不修改输入：
 
 ```bash
 # 1) 每个文件一段动作的G1 CSV（36列：根位置xyz、根四元数xyzw、29个关节角），按--csv_fps重采样到50 Hz
@@ -169,6 +171,10 @@ uv run --frozen python scripts/make_motion_source.py --motion_source data/bonese
 
 # 4) 每个文件一段50 Hz的G1动作npz（root_pos、root_quat_wxyz、joint_pos；带fps、joint_names时检查为50与G1关节顺序），不重采样
 uv run --frozen python scripts/make_motion_source.py --npz_dir data/dance_npz --out data/dance.h5
+
+# 5) Teleopit发布包的分片目录（clips.csv加shard_*.h5），用于库外验证与测试集；片段名取clips.csv的relative_csv
+#    --max_clearance去掉全段最低身体都高于0.1 m的片段：AMASS发布包有23%的片段整段悬空，机器人从首帧起自由落体
+uv run --frozen python scripts/make_motion_source.py --shard_dir datasets/pass_hdf5_source/amass --out data/amass.h5 --max_clearance 0.1
 ```
 
 文件内容：
@@ -185,7 +191,7 @@ uv run --frozen python scripts/make_motion_source.py --npz_dir data/dance_npz --
 
 - 每段动作保持完整，不按窗口裁短；速度、角速度与正向运动学在载入时逐段计算，差分不跨段。
 - 训练把数据指纹（文件大小、帧数、各段边界）写入`reference.json`与检查点，续训与评估时校验；换了片段选择要新开run。
-- 开发用小子集：`python scripts/make_motion_subset.py SOURCE.h5 subset_512.h5 512 0`随机抽512段。
+- 开发用小子集：`python scripts/make_motion_subset.py SOURCE.h5 subset_512.h5 512 0`随机抽512段；加`--by_group`时512指组数，同组片段不分开。
 - 全量参考张量常驻显存，每帧约1 KB：114,403段约3,965万帧共约39 GiB，双卡时每卡约19 GiB（另加仿真、回放与模型）；载入前会检查显存。
 - 2026-10-30在Rara上用第2条命令转换全库：输入114,406段，高度过滤正好去掉三段从2 m高台起步的片段，得到114,403段、39,652,331帧（220.3 h）。
   基线run用的文件由Teleopit的配对流程生成，片段相同，但为与人体数据对齐把其中21,956段各去掉了最后1帧（共少21,956帧）；
@@ -535,8 +541,9 @@ $`G_b`$ 是从该分箱起步的回合回报的EMA。温度25非常尖锐：评�
 
 | 脚本 | 用途 |
 | --- | --- |
-| `scripts/make_motion_source.py` | 把G1 CSV、配对索引或另一个合并源转成合并源HDF5，可按片段名与首帧高度过滤（CPU） |
-| `scripts/make_motion_subset.py` | 从HDF5源随机抽取完整片段，生成小规模子集（CPU） |
+| `scripts/make_motion_source.py` | 把G1 CSV、50 Hz npz、配对索引、发布包分片或另一个合并源转成合并源HDF5，可按片段名、首帧高度与悬空过滤（CPU） |
+| `scripts/make_motion_subset.py` | 从HDF5源随机抽取完整片段或整组生成子集（CPU） |
+| `scripts/diag_recovery_probe.py` | 推倒采集，按状态类别报告世界模型误差、回传到动作的梯度，以及模型优化的动作在物理中是否改善回报（M1b） |
 | `scripts/_subject.py` | 诊断脚本的被测源码树（`--src`）：载入校验、策略/世界模型/critic加载、按源码树支持的选项建环境 |
 | `scripts/diag_first_step.py` | 附录F.1评估，并记录每段首步的平滑与限位惩罚、去掉首步后的归一化回报 |
 | `scripts/diag_train_episodes.py` | 按训练条件重放，记录每个回合的长度、`ep_ret_norm`及其奖励/惩罚分解，导出分箱状态 |
@@ -634,6 +641,9 @@ tests/
   test_tensorboard_log.py
   test_goal_tail.py
   test_make_motion_source.py
+  test_make_motion_subset.py
+  test_recovery_probe.py
+  test_causal_actor.py
 ```
 
 | 路径 | 内容 |
